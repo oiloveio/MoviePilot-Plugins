@@ -11,6 +11,21 @@
 
 本插件按 [MoviePilot 插件开发指南（V3）](https://github.com/jxxghp/MoviePilot-Plugins/blob/main/docs/Plugin_Development.md) 组织：插件目录 `plugins.v3/anistrmhub/`，导入统一走 `app.sdk.*` 稳定出口（`app.sdk.config`/`app.sdk.logging`/`app.sdk.network`），不使用 `app.core.*`/`app.utils.*`/`app.log` 等旧路径。索引信息见仓库根目录 `package.v3.json`。
 
+同时按 [V2 插件开发指南](https://github.com/jxxghp/MoviePilot-Plugins/blob/main/docs/V2_Plugin_Development.md) 在 `plugins.v2/anistrmhub/` 提供了 V2 兼容实现（索引 `package.v2.json`）——V2宿主没有 `app.sdk.*`，只能用 `app.core.config`/`app.log`/`app.utils.http` 这几个旧路径，业务逻辑跟这份V3版本逐字节一致，只有import不同。
+
+## 借鉴同类 fork
+
+调研过另外两个同样 fork 自 honue ANi-Strm 的项目——[ANiStrmPlus](https://github.com/MangMax/MoviePilot-Plugins)（MangMax）和 [ANiStrmPro](https://github.com/shanhai2333/MoviePilot-Plugins)（shanhai2333），对比后把有价值的能力吸收了进来：
+
+- **文件名删除字符串**（借鉴 ANiStrmPro）：`filename_remove` 配置项，`@`分隔多个子串，从生成的strm文件名里删掉，不影响标题匹配/一键换源的内部逻辑
+- **文件名黑名单**（借鉴 ANiStrmPro）：`filename_blacklist` 配置项，`@`分隔关键词，命中则跳过不生成，例如过滤预告/PV/NCOP
+- **字幕文件过滤**（借鉴 ANiStrmPro）：自动跳过 `.srt`/`.vtt`/`.ass`/`.ssa` 后缀的条目
+- **按季度分子目录**（借鉴 ANiStrmPlus）：`season_dir` 开关，从直链里提取季度（如 `2026-7`），strm 按季度分子目录存放而不是全部拍平
+
+调研中还发现 ANiStrmPro 的默认"全量补季度"依赖的目录扫描接口（`openani.an-i.workers.dev`）跟我们之前实测的一样是 429 限流死的，实测我们现有的能用镜像（pili/op5）也都没有实现这套老协议——纯视频透传代理，POST目录接口返回的是普通网页不是JSON。所以"全量补季度"这个能力目前没有可用的接口基础，暂不实现。
+
+另外还发现 ANiStrmPro 的默认非镜像模式下有一段 `_convert_url_format`，逻辑跟我们最早踩过的 `?d=mp4`→`.mp4` 后缀改写bug几乎一样——实测在官方 `resources.ani.rip` 域名上同样会导致404。这不是我们瞎猜的边缘case，是独立项目里踩过的同一个坑。
+
 ## 2023-10秋 刮削效果
 
 <div align="center">

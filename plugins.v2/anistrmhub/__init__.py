@@ -1,3 +1,7 @@
+# 本文件是 plugins.v3/anistrmhub/__init__.py 的V2兼容副本。
+# V2宿主没有app.sdk.*稳定出口，只能用app.core.config/app.log/app.utils.http这几个旧路径，
+# 所以业务逻辑没法跨版本共用同一份源码，只能保留两份——这里除了下面4行import外，
+# 其余代码必须和V3版本保持一致。改动业务逻辑时两个文件都要同步改。
 import re
 import time
 import xml.etree.ElementTree as ET
@@ -10,10 +14,10 @@ import pytz
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.cron import CronTrigger
 
+from app.core.config import settings
+from app.log import logger
 from app.plugins import _PluginBase
-from app.sdk.config import settings
-from app.sdk.logging import logger
-from app.sdk.network import RequestUtils
+from app.utils.http import RequestUtils
 
 DEFAULT_RSS_SOURCES = """https://api.pili.cc.cd/ani-download.xml
 https://aniapi.op5.de5.net/ani-download.xml

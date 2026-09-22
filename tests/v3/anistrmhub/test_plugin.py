@@ -145,6 +145,38 @@ class TestTouchStrmFile:
         service.touch_strm_file(str(tmp_path), "含/斜杠.mp4", "https://a.example/ep.mp4?d=mp4")
         assert (tmp_path / "含_斜杠.mp4.strm").exists()
 
+    def test_relative_dir_organizes_into_season_subfolder(self, tmp_path):
+        # 借鉴MangMax/ANiStrm Plus的按季度分子目录能力
+        service = StrmFileService()
+        status = service.touch_strm_file(
+            str(tmp_path), "ep.mp4", "https://a.example/ep.mp4?d=mp4", relative_dir="2026-7"
+        )
+        assert status == "created"
+        assert (tmp_path / "2026-7" / "ep.mp4.strm").exists()
+
+
+class TestFilenameHelpers:
+    # 借鉴shanhai2333/ANiStrmPro的文件名清洗/黑名单/字幕过滤
+
+    def test_is_subtitle_file(self):
+        assert StrmFileService.is_subtitle_file("[ANi] 示例 - 01.srt") is True
+        assert StrmFileService.is_subtitle_file("[ANi] 示例 - 01.ASS") is True
+        assert StrmFileService.is_subtitle_file("[ANi] 示例 - 01.mp4") is False
+
+    def test_is_blacklisted(self):
+        assert StrmFileService.is_blacklisted("[ANi] 示例 PV [1080P].mp4", "预告@PV@NCOP") is True
+        assert StrmFileService.is_blacklisted("[ANi] 示例 - 01 [1080P].mp4", "预告@PV@NCOP") is False
+
+    def test_is_blacklisted_empty_config_never_matches(self):
+        assert StrmFileService.is_blacklisted("随便什么标题", "") is False
+
+    def test_clean_file_name_removes_configured_tokens(self):
+        result = StrmFileService.clean_file_name("[ANSUB][ANi] 示例 - 01.mp4", "[ANSUB]@NC-Raw")
+        assert result == "[ANi] 示例 - 01.mp4"
+
+    def test_clean_file_name_empty_config_returns_original(self):
+        assert StrmFileService.clean_file_name("原样标题.mp4", "") == "原样标题.mp4"
+
 
 class TestScanDomainDistribution:
     def test_counts_by_netloc(self, tmp_path):

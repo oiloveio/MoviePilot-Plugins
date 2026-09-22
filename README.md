@@ -12,21 +12,27 @@
 
 ### 仓库结构
 
-按 [MoviePilot 插件开发指南（V3）](https://github.com/jxxghp/MoviePilot-Plugins/blob/main/docs/Plugin_Development.md) 组织：
+按 [MoviePilot 插件开发指南（V3）](https://github.com/jxxghp/MoviePilot-Plugins/blob/main/docs/Plugin_Development.md) 组织，同时按 [V2 插件开发指南](https://github.com/jxxghp/MoviePilot-Plugins/blob/main/docs/V2_Plugin_Development.md) 提供 V2 兼容实现：
 
 ```text
 MoviePilot-Plugins/
 ├── plugins.v3/
-│   └── anistrmhub/
+│   └── anistrmhub/          # V3实现，用app.sdk.*稳定出口
 │       ├── __init__.py
 │       ├── README.md
 │       └── img/
+├── plugins.v2/
+│   └── anistrmhub/          # V2兼容实现，只有import路径不同，业务逻辑与V3版本逐字节一致
+│       └── __init__.py
 ├── tests/
 │   └── v3/
 │       └── anistrmhub/
 │           └── test_plugin.py
-└── package.v3.json
+├── package.v3.json
+└── package.v2.json
 ```
+
+V2宿主没有`app.sdk.*`这套V3才有的稳定出口，两份实现没法共用同一份源码，只能各自维护——改业务逻辑时两个`__init__.py`要同步改，`plugins.v2/anistrmhub/__init__.py`开头写了这条约束。
 
 ### 与上游的区别
 
@@ -35,7 +41,8 @@ MoviePilot-Plugins/
 - 跨镜像按标题去重，避免同一集重复生成 strm
 - 新增「修复本地失效链接」：数据源失效后，一键批量修复本地已经生成的 strm 文件（标题匹配 + 路径迁移兜底），不用删了重生成
 - 新增「探测数据源健康度」「按来源统计本地strm分布」「一键切换到指定来源」
-- 插件按 V3 标准迁移到 `plugins.v3/`，导入统一走 `app.sdk.*`，不再使用 `app.core.*`/`app.utils.*`/`app.log` 等旧路径
+- 借鉴 [ANiStrmPlus](https://github.com/MangMax/MoviePilot-Plugins)（按季度分子目录）和 [ANiStrmPro](https://github.com/shanhai2333/MoviePilot-Plugins)（文件名清洗、黑名单过滤、字幕文件过滤）两个同类 fork 的可取之处
+- 插件按 V3 标准迁移到 `plugins.v3/`，导入统一走 `app.sdk.*`；同时提供 `plugins.v2/` 兼容实现覆盖仍在用 V2 宿主的用户
 
 ### 如果对你有所帮助⭐
 
