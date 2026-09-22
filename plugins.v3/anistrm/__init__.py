@@ -10,10 +10,10 @@ import pytz
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.cron import CronTrigger
 
-from app.core.config import settings
-from app.log import logger
 from app.plugins import _PluginBase
-from app.utils.http import RequestUtils
+from app.sdk.config import settings
+from app.sdk.logging import logger
+from app.sdk.network import RequestUtils
 
 DEFAULT_RSS_SOURCES = """https://api.pili.cc.cd/ani-download.xml
 https://aniapi.op5.de5.net/ani-download.xml
@@ -27,8 +27,8 @@ https://api.ani.rip/ani-download.xml
 class ANiStrm(_PluginBase):
     plugin_name = "ANiStrm"
     plugin_desc = "多源聚合抓取ANi新番资源，自动去重轮询多个镜像，生成strm文件，mp刮削入库，媒体服务器直连播放"
-    plugin_icon = "https://raw.githubusercontent.com/honue/MoviePilot-Plugins/main/icons/anistrm.png"
-    plugin_version = "3.2.0"
+    plugin_icon = "https://raw.githubusercontent.com/oiloveio/MoviePilot-Plugins/main/icons/anistrm.png"
+    plugin_version = "3.3.0"
     plugin_author = "honue,oiloveio"
     author_url = "https://github.com/honue"
     plugin_config_prefix = "anistrm_"
@@ -282,10 +282,12 @@ class ANiStrm(_PluginBase):
 
     @staticmethod
     def get_command() -> List[Dict[str, Any]]:
-        pass
+        """当前插件不注册远程命令"""
+        return []
 
     def get_api(self) -> List[Dict[str, Any]]:
-        pass
+        """当前插件不注册后端API，探测/换源都走配置开关+详情页缓存展示"""
+        return []
 
     def get_form(self) -> Tuple[List[dict], Dict[str, Any]]:
         return [

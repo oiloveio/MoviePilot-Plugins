@@ -2,6 +2,11 @@
     - [2023-10秋 刮削效果](#2023-10秋-刮削效果)
     - [注意事项](#注意事项)
     - [Todo](#Todo)
+
+## V3 插件规范说明
+
+本插件按 [MoviePilot 插件开发指南（V3）](https://github.com/jxxghp/MoviePilot-Plugins/blob/main/docs/Plugin_Development.md) 组织：插件目录 `plugins.v3/anistrm/`，导入统一走 `app.sdk.*` 稳定出口（`app.sdk.config`/`app.sdk.logging`/`app.sdk.network`），不使用 `app.core.*`/`app.utils.*`/`app.log` 等旧路径。索引信息见仓库根目录 `package.v3.json`。
+
 ## 2023-10秋 刮削效果
 
 <div align="center">
