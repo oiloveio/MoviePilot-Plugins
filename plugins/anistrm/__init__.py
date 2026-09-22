@@ -4,6 +4,7 @@ import xml.etree.ElementTree as ET
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
+from urllib.parse import urlparse
 
 import pytz
 from apscheduler.schedulers.background import BackgroundScheduler
@@ -27,7 +28,7 @@ class ANiStrm(_PluginBase):
     plugin_name = "ANiStrm"
     plugin_desc = "多源聚合抓取ANi新番资源，自动去重轮询多个镜像，生成strm文件，mp刮削入库，媒体服务器直连播放"
     plugin_icon = "https://raw.githubusercontent.com/honue/MoviePilot-Plugins/main/icons/anistrm.png"
-    plugin_version = "3.1.0"
+    plugin_version = "3.2.0"
     plugin_author = "honue,oiloveio"
     author_url = "https://github.com/honue"
     plugin_config_prefix = "anistrm_"
@@ -39,6 +40,9 @@ class ANiStrm(_PluginBase):
     _cron = None
     _onlyonce = False
     _relink_once = False
+    _detect_once = False
+    _migrate_once = False
+    _migrate_target_source = None
     _storageplace = None
     _rss_sources = DEFAULT_RSS_SOURCES
     _scheduler: Optional[BackgroundScheduler] = None
@@ -59,6 +63,9 @@ class ANiStrm(_PluginBase):
         self._cron = config.get("cron") or "20 22,23,0,1 * * *"
         self._onlyonce = config.get("onlyonce", False)
         self._relink_once = config.get("relink_once", False)
+        self._detect_once = config.get("detect_once", False)
+        self._migrate_once = config.get("migrate_once", False)
+        self._migrate_target_source = config.get("migrate_target_source")
         self._storageplace = config.get("storageplace") or "/downloads/strm"
         self._rss_sources = config.get("rss_sources")
         if not self._rss_sources:
@@ -71,7 +78,7 @@ class ANiStrm(_PluginBase):
             f"数据源数={len(self._client.get_source_urls())}"
         )
 
-        if not (self._enabled or self._onlyonce or self._relink_once):
+        if not (self._enabled or self._onlyonce or self._relink_once or self._detect_once or self._migrate_once):
             logger.info("ANi-Strm未启用且未触发立即运行，跳过任务注册")
             return
 
@@ -107,6 +114,26 @@ class ANiStrm(_PluginBase):
                 name="ANiStrm修复失效链接",
             )
             self._relink_once = False
+
+        if self._detect_once:
+            logger.info("ANi-Strm服务启动，立即探测各数据源播放健康度")
+            self._scheduler.add_job(
+                func=self.__detect_task,
+                trigger="date",
+                run_date=datetime.now(tz=pytz.timezone(settings.TZ)) + timedelta(seconds=3),
+                name="ANiStrm探测数据源",
+            )
+            self._detect_once = False
+
+        if self._migrate_once:
+            logger.info(f"ANi-Strm服务启动，立即将本地strm一键切换到指定来源：{self._migrate_target_source}")
+            self._scheduler.add_job(
+                func=self.__migrate_task,
+                trigger="date",
+                run_date=datetime.now(tz=pytz.timezone(settings.TZ)) + timedelta(seconds=3),
+                name="ANiStrm一键切换来源",
+            )
+            self._migrate_once = False
 
         self.__update_config()
 
@@ -176,6 +203,80 @@ class ANiStrm(_PluginBase):
             + "，".join(f"{k}={v}" for k, v in stats.items())
         )
 
+    def __detect_task(self):
+        """探测每个已启用数据源当前是否真的能播（RSS可拉 + 视频直链域名可连），
+        顺带统计本地已生成strm按域名的分布，结果存起来给详情页展示"""
+        source_urls = self._client.get_source_urls()
+        health_results = []
+        for url in source_urls:
+            probe = {"source": url, "rss_ok": False, "video_ok": False, "sample_domain": None, "error": None}
+            try:
+                entries = self._client.fetch_one_source(url)
+            except Exception as err:
+                probe["error"] = str(err)
+                health_results.append(probe)
+                logger.warning(f"ANi-Strm探测：{url} RSS抓取失败 - {err}")
+                continue
+
+            probe["rss_ok"] = True
+            if not entries:
+                probe["error"] = "RSS无条目"
+                health_results.append(probe)
+                continue
+
+            sample_link = entries[0]["link"]
+            probe["sample_domain"] = urlparse(sample_link).netloc
+            time.sleep(0.3)
+            probe["video_ok"] = self._relink_service._verify_reachable(sample_link)
+            health_results.append(probe)
+            logger.info(
+                f"ANi-Strm探测：{url} -> RSS正常，样本域名={probe['sample_domain']}，"
+                f"视频直链{'可播放' if probe['video_ok'] else '连不通'}"
+            )
+
+        domain_stats = self._relink_service.scan_domain_distribution(self._storageplace)
+
+        checked_at = datetime.now(tz=pytz.timezone(settings.TZ)).strftime("%Y-%m-%d %H:%M:%S")
+        self.save_data(
+            "source_health",
+            {"checked_at": checked_at, "results": health_results},
+        )
+        self.save_data(
+            "domain_stats",
+            {"checked_at": checked_at, "total": domain_stats.get("__total__", 0), "by_domain": domain_stats.get("by_domain", {})},
+        )
+        logger.info(f"ANi-Strm探测完成：{len(health_results)}个源，本地strm按域名分布={domain_stats}")
+
+    def __migrate_task(self):
+        """不管当前是否已经能播，强制把本地全部strm按标题匹配/路径迁移的方式
+        统一改写成用户指定的目标数据源，路径迁移分支同样会实际探测确认可达才覆盖"""
+        target = self._migrate_target_source
+        if not target:
+            logger.warning("ANi-Strm一键换源：未选择目标数据源，任务结束")
+            return
+
+        try:
+            entries = self._client.fetch_one_source(target)
+        except Exception as err:
+            logger.warning(f"ANi-Strm一键换源：目标源抓取失败，任务结束：{target} - {err}")
+            return
+        if not entries:
+            logger.warning(f"ANi-Strm一键换源：目标源RSS无内容，任务结束：{target}")
+            return
+
+        title_map = {entry["title"]: entry["link"] for entry in entries}
+        reference_link = entries[0]["link"]
+
+        stats = self._relink_service.relink_existing(
+            storage_path=self._storageplace,
+            title_map=title_map,
+            reference_link=reference_link,
+        )
+        logger.info(
+            f"ANi-Strm一键换源完成(目标={target})："
+            + "，".join(f"{k}={v}" for k, v in stats.items())
+        )
+
     def get_state(self) -> bool:
         return self._enabled
 
@@ -233,6 +334,56 @@ class ANiStrm(_PluginBase):
                                         "props": {
                                             "model": "relink_once",
                                             "label": "修复本地失效链接",
+                                        },
+                                    }
+                                ],
+                            },
+                        ],
+                    },
+                    {
+                        "component": "VRow",
+                        "content": [
+                            {
+                                "component": "VCol",
+                                "props": {"cols": 12, "md": 3},
+                                "content": [
+                                    {
+                                        "component": "VSwitch",
+                                        "props": {
+                                            "model": "detect_once",
+                                            "label": "探测各数据源播放健康度",
+                                        },
+                                    }
+                                ],
+                            },
+                            {
+                                "component": "VCol",
+                                "props": {"cols": 12, "md": 6},
+                                "content": [
+                                    {
+                                        "component": "VSelect",
+                                        "props": {
+                                            "model": "migrate_target_source",
+                                            "label": "一键切换到指定来源（配合下方开关使用）",
+                                            "items": self.__build_source_options(),
+                                            "clearable": True,
+                                            "hint": "选中后勾选右侧「立即切换到指定来源」，会把本地所有strm"
+                                            "（无论现在能不能播）强制统一改写成这个源，标题能匹配的直接换，"
+                                            "匹配不到的老集数走路径迁移，实测探测确认能连通才覆盖",
+                                            "persistent-hint": True,
+                                        },
+                                    }
+                                ],
+                            },
+                            {
+                                "component": "VCol",
+                                "props": {"cols": 12, "md": 3},
+                                "content": [
+                                    {
+                                        "component": "VSwitch",
+                                        "props": {
+                                            "model": "migrate_once",
+                                            "label": "立即切换到指定来源",
                                         },
                                     }
                                 ],
@@ -350,16 +501,25 @@ class ANiStrm(_PluginBase):
             "use_proxy": True,
             "onlyonce": False,
             "relink_once": False,
+            "detect_once": False,
+            "migrate_once": False,
+            "migrate_target_source": None,
             "storageplace": "/downloads/strm",
             "rss_sources": DEFAULT_RSS_SOURCES,
             "cron": "20 22,23,0,1 * * *",
         }
+
+    def __build_source_options(self) -> List[Dict[str, str]]:
+        return [{"title": url, "value": url} for url in self._client.get_source_urls()]
 
     def __update_config(self):
         self.update_config(
             {
                 "onlyonce": self._onlyonce,
                 "relink_once": self._relink_once,
+                "detect_once": self._detect_once,
+                "migrate_once": self._migrate_once,
+                "migrate_target_source": self._migrate_target_source,
                 "cron": self._cron,
                 "enabled": self._enabled,
                 "use_proxy": self._use_proxy,
@@ -369,7 +529,119 @@ class ANiStrm(_PluginBase):
         )
 
     def get_page(self) -> List[dict]:
-        pass
+        health = self.get_data("source_health") or {}
+        domain_stats = self.get_data("domain_stats") or {}
+
+        if not health and not domain_stats:
+            return [
+                {
+                    "component": "VAlert",
+                    "props": {
+                        "type": "info",
+                        "variant": "tonal",
+                        "text": "还没有探测数据。去插件配置页勾选「探测各数据源播放健康度」跑一次，"
+                        "这里会显示每个数据源当前能不能连、以及本地已生成的strm都在用哪些域名。",
+                    },
+                }
+            ]
+
+        content: List[dict] = []
+
+        if health:
+            rows = []
+            for probe in health.get("results", []):
+                if probe.get("video_ok"):
+                    status_text, status_color = "✅ 可播放", "success"
+                elif probe.get("rss_ok"):
+                    status_text, status_color = "⚠️ RSS通但视频连不上", "warning"
+                else:
+                    status_text, status_color = "❌ 不可用", "error"
+                detail = probe.get("sample_domain") or probe.get("error") or ""
+                rows.append(
+                    {
+                        "component": "VRow",
+                        "props": {"class": "align-center"},
+                        "content": [
+                            {
+                                "component": "VCol",
+                                "props": {"cols": 12, "md": 6},
+                                "content": [{"component": "span", "text": probe.get("source")}],
+                            },
+                            {
+                                "component": "VCol",
+                                "props": {"cols": 12, "md": 3},
+                                "content": [
+                                    {
+                                        "component": "VChip",
+                                        "props": {"color": status_color, "size": "small"},
+                                        "text": status_text,
+                                    }
+                                ],
+                            },
+                            {
+                                "component": "VCol",
+                                "props": {"cols": 12, "md": 3},
+                                "content": [{"component": "span", "props": {"class": "text-caption"}, "text": detail}],
+                            },
+                        ],
+                    }
+                )
+            content.append(
+                {
+                    "component": "VCard",
+                    "props": {"class": "mb-4"},
+                    "content": [
+                        {
+                            "component": "VCardTitle",
+                            "text": f"数据源健康度（探测于 {health.get('checked_at', '未知时间')}）",
+                        },
+                        {"component": "VCardText", "content": rows or [{"component": "span", "text": "无数据"}]},
+                    ],
+                }
+            )
+
+        if domain_stats:
+            by_domain = domain_stats.get("by_domain", {})
+            total = domain_stats.get("total", 0)
+            rows = []
+            for domain, count in sorted(by_domain.items(), key=lambda kv: kv[1], reverse=True):
+                percent = f"{count / total * 100:.1f}%" if total else "0%"
+                rows.append(
+                    {
+                        "component": "VRow",
+                        "content": [
+                            {
+                                "component": "VCol",
+                                "props": {"cols": 12, "md": 6},
+                                "content": [{"component": "span", "text": domain}],
+                            },
+                            {
+                                "component": "VCol",
+                                "props": {"cols": 12, "md": 3},
+                                "content": [{"component": "span", "text": f"{count} 个"}],
+                            },
+                            {
+                                "component": "VCol",
+                                "props": {"cols": 12, "md": 3},
+                                "content": [{"component": "span", "text": percent}],
+                            },
+                        ],
+                    }
+                )
+            content.append(
+                {
+                    "component": "VCard",
+                    "content": [
+                        {
+                            "component": "VCardTitle",
+                            "text": f"本地strm来源分布（共{total}个，统计于 {domain_stats.get('checked_at', '未知时间')}）",
+                        },
+                        {"component": "VCardText", "content": rows or [{"component": "span", "text": "storageplace目录下没有strm文件"}]},
+                    ],
+                }
+            )
+
+        return content
 
     def stop_service(self):
         try:
@@ -432,6 +704,12 @@ class AniRssAggregator:
                 merged.append(entry)
 
         return merged, source_stats
+
+    def fetch_one_source(self, url: str) -> List[Dict[str, str]]:
+        """只抓单个数据源，探测和一键换源用——不跟其他源合并去重。
+        跟_fetch_all_entries()不同，这里不吞异常，抓取失败会直接抛出，
+        由调用方决定要不要区分"RSS连不上"和"RSS通了但没内容"两种情况"""
+        return self._fetch_one(url)
 
     def _fetch_one(self, url: str) -> List[Dict[str, str]]:
         def operation():
@@ -560,6 +838,26 @@ class StrmRelinkService:
             return bool(response) and response.status_code in (200, 206)
         except Exception:
             return False
+
+    @staticmethod
+    def scan_domain_distribution(storage_path: str) -> Dict[str, Any]:
+        """统计本地已生成的strm当前各自指向哪个域名，用于详情页展示分布"""
+        directory = Path(storage_path)
+        by_domain: Dict[str, int] = {}
+        total = 0
+        if not directory.exists():
+            return {"__total__": 0, "by_domain": {}}
+
+        for strm_file in directory.rglob("*.strm"):
+            try:
+                content = strm_file.read_text(encoding="utf-8").strip()
+            except Exception:
+                continue
+            total += 1
+            domain = urlparse(content).netloc or "无法识别"
+            by_domain[domain] = by_domain.get(domain, 0) + 1
+
+        return {"__total__": total, "by_domain": by_domain}
 
     def relink_existing(
         self,
