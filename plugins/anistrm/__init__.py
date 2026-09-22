@@ -1,8 +1,8 @@
 import time
+import xml.etree.ElementTree as ET
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
-from urllib.parse import quote, urlparse, urlunparse
 
 import pytz
 from apscheduler.schedulers.background import BackgroundScheduler
@@ -13,13 +13,21 @@ from app.log import logger
 from app.plugins import _PluginBase
 from app.utils.http import RequestUtils
 
+DEFAULT_RSS_SOURCES = """https://api.pili.cc.cd/ani-download.xml
+https://aniapi.op5.de5.net/ani-download.xml
+https://api.ani.rip/ani-download.xml
+# https://aniapi.v300.eu.org/ani-download.xml  RSS能拉到,但视频直链域名proi.v300.eu.org被Cloudflare挑战拦截,实测无法取到视频数据,已禁用
+# https://aniapi.td.ee/ani-download.xml  RSS能拉到,但视频直链域名ani.td.ee返回"temporarily rate limited",实测无法取到视频数据,已禁用
+# http://open.ani.rip/ani-download.xml  当前403(Cloudflare拦截)，恢复后可去掉#启用
+# https://openani.an-i.workers.dev/ani-download.xml  当前429(限流)，恢复后可去掉#启用"""
+
 
 class ANiStrm(_PluginBase):
     plugin_name = "ANiStrm"
-    plugin_desc = "自动获取当季所有番剧，免去下载，轻松拥有一个番剧媒体库"
+    plugin_desc = "多源聚合抓取ANi新番资源，自动去重轮询多个镜像，生成strm文件，mp刮削入库，媒体服务器直连播放"
     plugin_icon = "https://raw.githubusercontent.com/honue/MoviePilot-Plugins/main/icons/anistrm.png"
-    plugin_version = "2.5.1"
-    plugin_author = "honue"
+    plugin_version = "3.0.0"
+    plugin_author = "honue,oiloveio"
     author_url = "https://github.com/honue"
     plugin_config_prefix = "anistrm_"
     plugin_order = 15
@@ -30,13 +38,12 @@ class ANiStrm(_PluginBase):
     _cron = None
     _onlyonce = False
     _storageplace = None
-    _selected_seasons: List[str] = []
-    _proxy_base = None
+    _rss_sources = DEFAULT_RSS_SOURCES
     _scheduler: Optional[BackgroundScheduler] = None
 
     def __init__(self):
         super().__init__()
-        self._client = AniStrmClient()
+        self._client = AniRssAggregator()
         self._strm_service = StrmFileService()
 
     def init_plugin(self, config: dict = None):
@@ -49,17 +56,15 @@ class ANiStrm(_PluginBase):
         self._cron = config.get("cron") or "20 22,23,0,1 * * *"
         self._onlyonce = config.get("onlyonce", False)
         self._storageplace = config.get("storageplace") or "/downloads/strm"
-        if "selected_seasons" in config:
-            self._selected_seasons = config.get("selected_seasons") or []
-        else:
-            self._selected_seasons = ["latest"]
-        self._proxy_base = config.get("proxy_base") or "https://openani.an-i.workers.dev"
+        self._rss_sources = config.get("rss_sources")
+        if not self._rss_sources:
+            self._rss_sources = DEFAULT_RSS_SOURCES
         self._client.set_use_proxy(self._use_proxy)
-        self._client.set_proxy_base(self._proxy_base)
+        self._client.set_sources(self._rss_sources)
         logger.info(
             f"ANi-Strm配置加载：enabled={self._enabled}, onlyonce={self._onlyonce}, "
-            f"use_proxy={self._use_proxy}, proxy_base={self._proxy_base}, "
-            f"seasons={self._selected_seasons or []}, storage={self._storageplace}"
+            f"use_proxy={self._use_proxy}, storage={self._storageplace}, "
+            f"数据源数={len(self._client.get_source_urls())}"
         )
 
         if not (self._enabled or self._onlyonce):
@@ -96,71 +101,43 @@ class ANiStrm(_PluginBase):
             self._scheduler.start()
 
     def __task(self):
-        seasons = self.__get_target_seasons()
-        if not seasons:
-            logger.info("未选择任何季度，任务结束")
+        source_urls = self._client.get_source_urls()
+        if not source_urls:
+            logger.info("未配置任何数据源，任务结束")
             return
 
+        logger.info(f"ANi-Strm任务开始：数据源数={len(source_urls)}，storage={self._storageplace}")
+
+        entries, source_stats = self._client.fetch_all_entries()
         logger.info(
-            f"ANi-Strm任务开始：seasons={seasons}, storage={self._storageplace}, "
-            f"proxy={self._client._get_openani_base()}, use_proxy={self._use_proxy}"
+            "ANi-Strm数据源抓取结果："
+            + "; ".join(f"{url}={stat}" for url, stat in source_stats.items())
         )
 
-        total_files = 0
+        if not entries:
+            logger.warning("ANi-Strm所有数据源均不可用或无内容，本次任务结束")
+            return
+
         total_created = 0
         total_exists = 0
         total_failed = 0
-
-        for season in seasons:
-            file_entries = self._client.get_season_entries(season)
-            season_total = len(file_entries)
-            season_created = 0
-            season_exists = 0
-            season_failed = 0
-            logger.info(f"ANi-Strm开始处理季度：{season}，文件数={season_total}")
-            for file_entry in file_entries:
-                status = self._strm_service.touch_strm_file(
-                    storage_path=self._storageplace,
-                    file_name=file_entry["name"],
-                    file_url=file_entry["url"],
-                    relative_dir=file_entry.get("relative_dir"),
-                )
-                if status == "created":
-                    season_created += 1
-                elif status == "exists":
-                    season_exists += 1
-                else:
-                    season_failed += 1
-
-            total_files += season_total
-            total_created += season_created
-            total_exists += season_exists
-            total_failed += season_failed
-            logger.info(
-                f"ANi-Strm季度处理完成：{season}，总数={season_total}，"
-                f"新增={season_created}，跳过={season_exists}，失败={season_failed}"
+        for entry in entries:
+            status = self._strm_service.touch_strm_file(
+                storage_path=self._storageplace,
+                file_name=entry["title"],
+                file_url=entry["link"],
             )
+            if status == "created":
+                total_created += 1
+            elif status == "exists":
+                total_exists += 1
+            else:
+                total_failed += 1
 
         logger.info(
-            f"ANi-Strm任务完成：季度数={len(seasons)}，文件总数={total_files}，"
+            f"ANi-Strm任务完成：去重后条目数={len(entries)}，"
             f"新增={total_created}，跳过={total_exists}，失败={total_failed}"
         )
-
-    def __get_target_seasons(self) -> List[str]:
-        if self._selected_seasons:
-            seasons: List[str] = []
-            for season in self._selected_seasons:
-                if season == "latest":
-                    latest = self._client.get_current_season()
-                    if latest:
-                        seasons.append(latest)
-                else:
-                    seasons.append(season)
-            return list(dict.fromkeys(seasons))
-        return []
-
-    def get_current_season_list(self) -> List[str]:
-        return self._client.get_current_season_list()
 
     def get_state(self) -> bool:
         return self._enabled
@@ -173,7 +150,6 @@ class ANiStrm(_PluginBase):
         pass
 
     def get_form(self) -> Tuple[List[dict], Dict[str, Any]]:
-        season_options = self.__build_season_options()
         return [
             {
                 "component": "VForm",
@@ -183,49 +159,31 @@ class ANiStrm(_PluginBase):
                         "content": [
                             {
                                 "component": "VCol",
-                                "props": {
-                                    "cols": 12,
-                                    "md": 4,
-                                },
+                                "props": {"cols": 12, "md": 4},
                                 "content": [
                                     {
                                         "component": "VSwitch",
-                                        "props": {
-                                            "model": "enabled",
-                                            "label": "启用插件",
-                                        },
+                                        "props": {"model": "enabled", "label": "启用插件"},
                                     }
                                 ],
                             },
                             {
                                 "component": "VCol",
-                                "props": {
-                                    "cols": 12,
-                                    "md": 4,
-                                },
+                                "props": {"cols": 12, "md": 4},
                                 "content": [
                                     {
                                         "component": "VSwitch",
-                                        "props": {
-                                            "model": "use_proxy",
-                                            "label": "使用代理",
-                                        },
+                                        "props": {"model": "use_proxy", "label": "使用代理"},
                                     }
                                 ],
                             },
                             {
                                 "component": "VCol",
-                                "props": {
-                                    "cols": 12,
-                                    "md": 4,
-                                },
+                                "props": {"cols": 12, "md": 4},
                                 "content": [
                                     {
                                         "component": "VSwitch",
-                                        "props": {
-                                            "model": "onlyonce",
-                                            "label": "立即运行一次",
-                                        },
+                                        "props": {"model": "onlyonce", "label": "立即运行一次"},
                                     }
                                 ],
                             },
@@ -236,73 +194,21 @@ class ANiStrm(_PluginBase):
                         "content": [
                             {
                                 "component": "VCol",
-                                "props": {
-                                    "cols": 12,
-                                    "md": 6,
-                                },
+                                "props": {"cols": 12, "md": 6},
                                 "content": [
                                     {
                                         "component": "VTextField",
                                         "props": {
                                             "model": "cron",
                                             "label": "执行周期",
-                                            "placeholder": "0 0 ? ? ?",
+                                            "placeholder": "20 22,23,0,1 * * *",
                                         },
                                     }
                                 ],
                             },
                             {
                                 "component": "VCol",
-                                "props": {
-                                    "cols": 12,
-                                    "md": 6,
-                                },
-                                "content": [
-                                    {
-                                        "component": "VTextField",
-                                        "props": {
-                                            "model": "proxy_base",
-                                            "label": "反代地址",
-                                            "placeholder": "https://openani.an-i.workers.dev",
-                                            "hint": "用于季度目录读取和strm源地址生成，留空则使用官方默认地址",
-                                            "persistent-hint": True,
-                                        },
-                                    }
-                                ],
-                            },
-                        ],
-                    },
-                    {
-                        "component": "VRow",
-                        "content": [
-                            {
-                                "component": "VCol",
-                                "props": {
-                                    "cols": 12,
-                                    "md": 6,
-                                },
-                                "content": [
-                                    {
-                                        "component": "VSelect",
-                                        "props": {
-                                            "model": "selected_seasons",
-                                            "label": "拉取季度",
-                                            "items": season_options,
-                                            "multiple": True,
-                                            "chips": True,
-                                            "clearable": True,
-                                            "hint": "按所选季度检查并补齐strm；已存在文件会自动跳过。留空则本次不执行",
-                                            "persistent-hint": True,
-                                        },
-                                    }
-                                ],
-                            },
-                            {
-                                "component": "VCol",
-                                "props": {
-                                    "cols": 12,
-                                    "md": 6,
-                                },
+                                "props": {"cols": 12, "md": 6},
                                 "content": [
                                     {
                                         "component": "VTextField",
@@ -321,17 +227,40 @@ class ANiStrm(_PluginBase):
                         "content": [
                             {
                                 "component": "VCol",
-                                "props": {
-                                    "cols": 12,
-                                },
+                                "props": {"cols": 12},
+                                "content": [
+                                    {
+                                        "component": "VTextarea",
+                                        "props": {
+                                            "model": "rss_sources",
+                                            "label": "数据源列表（一行一个RSS地址）",
+                                            "rows": 8,
+                                            "placeholder": DEFAULT_RSS_SOURCES,
+                                            "hint": "按行顺序依次轮询抓取，抓取失败的源自动跳过不影响其他源；"
+                                            "多个源抓到同一集时，strm里写入排序靠前的源给出的直链地址，"
+                                            "所以顺序也是直链域名的优先级——国内能直连的镜像建议放前面，"
+                                            "官方裸域名(api.ani.rip/open.ani.rip)不走代理很可能连不通，建议放最后兜底；"
+                                            "行首加 # 可临时禁用某个源而不删除",
+                                            "persistent-hint": True,
+                                        },
+                                    }
+                                ],
+                            }
+                        ],
+                    },
+                    {
+                        "component": "VRow",
+                        "content": [
+                            {
+                                "component": "VCol",
+                                "props": {"cols": 12},
                                 "content": [
                                     {
                                         "component": "VAlert",
                                         "props": {
                                             "type": "info",
                                             "variant": "tonal",
-                                            "text": "自动从open ANi抓取下载直链生成strm文件\n"
-                                            "默认选择最新季，也支持季度多选，自动补齐所选季度缺失的strm\n"
+                                            "text": "多源聚合抓取ANi的RSS（ani-download.xml），生成strm文件\n"
                                             "配合目录监控使用，strm文件创建在/downloads/strm\n"
                                             "通过目录监控转移到link媒体库文件夹 如/downloads/link/strm mp会完成刮削",
                                             "style": "white-space: pre-line;",
@@ -358,16 +287,9 @@ class ANiStrm(_PluginBase):
             "use_proxy": True,
             "onlyonce": False,
             "storageplace": "/downloads/strm",
-            "selected_seasons": ["latest"],
-            "proxy_base": "https://openani.an-i.workers.dev",
+            "rss_sources": DEFAULT_RSS_SOURCES,
             "cron": "20 22,23,0,1 * * *",
         }
-
-    def __build_season_options(self) -> List[Dict[str, str]]:
-        seasons = self._client.get_available_seasons() or [self._client._get_local_season()]
-        return [{"title": "最新季", "value": "latest"}] + [
-            {"title": season, "value": season} for season in seasons
-        ]
 
     def __update_config(self):
         self.update_config(
@@ -377,8 +299,7 @@ class ANiStrm(_PluginBase):
                 "enabled": self._enabled,
                 "use_proxy": self._use_proxy,
                 "storageplace": self._storageplace,
-                "selected_seasons": self._selected_seasons,
-                "proxy_base": self._proxy_base,
+                "rss_sources": self._rss_sources,
             }
         )
 
@@ -396,189 +317,109 @@ class ANiStrm(_PluginBase):
             logger.error(f"退出插件失败：{err}")
 
 
-class AniStrmClient:
-    FOLDER_MIME_TYPE = "application/vnd.google-apps.folder"
+class AniRssAggregator:
+    """解析rss_sources配置的多个ANi RSS镜像，按顺序轮询抓取并跨源去重"""
 
-    def __init__(self, request_factory=None, proxy_base: Optional[str] = None, use_proxy: bool = False):
-        self._request_factory = request_factory or self._build_request_utils
-        self._proxy_base = self.normalize_proxy_base(proxy_base)
-        self._season_options_cache: List[str] = []
+    def __init__(self, use_proxy: bool = False, sources_text: str = DEFAULT_RSS_SOURCES):
         self._use_proxy = use_proxy
-
-    def set_proxy_base(self, proxy_base: Optional[str]):
-        self._proxy_base = self.normalize_proxy_base(proxy_base)
-        self._season_options_cache = []
+        self._sources_text = sources_text
 
     def set_use_proxy(self, use_proxy: bool):
         self._use_proxy = use_proxy
-        self._season_options_cache = []
 
-    def get_current_season(self, idx_month: Optional[int] = None, now: Optional[datetime] = None) -> str:
-        remote_season = self._get_latest_remote_season()
-        if remote_season:
-            return remote_season
-        return self._get_local_season(idx_month=idx_month, now=now)
+    def set_sources(self, sources_text: str):
+        self._sources_text = sources_text or ""
 
-    def _get_local_season(self, idx_month: Optional[int] = None, now: Optional[datetime] = None) -> str:
-        current = now or datetime.now()
-        current_month = idx_month or current.month
-        season_month = ((current_month - 1) // 3) * 3 + 1
-        return f"{current.year}-{season_month}"
+    def get_source_urls(self) -> List[str]:
+        urls = []
+        for raw_line in (self._sources_text or "").splitlines():
+            line = raw_line.strip()
+            if not line or line.startswith("#"):
+                continue
+            urls.append(line)
+        return list(dict.fromkeys(urls))
 
-    def get_current_season_list(self) -> List[str]:
-        season = self.get_current_season()
-        return self.get_season_list(season)
+    def fetch_all_entries(self) -> Tuple[List[Dict[str, str]], Dict[str, str]]:
+        seen_titles: Dict[str, bool] = {}
+        merged: List[Dict[str, str]] = []
+        source_stats: Dict[str, str] = {}
 
-    def get_season_list(self, season: str) -> List[str]:
-        entries = self.get_season_entries(season)
-        return [entry["name"] for entry in entries if entry.get("name")]
+        for url in self.get_source_urls():
+            try:
+                entries = self._fetch_one(url)
+            except Exception as err:
+                logger.warning(f"ANi-Strm数据源抓取失败，跳过：{url} - {err}")
+                source_stats[url] = "失败"
+                continue
 
-    def get_season_entries(self, season: str) -> List[Dict[str, str]]:
-        def operation():
-            return self._collect_folder_entries(f"{season}/")
-
-        return self._with_retry(operation, default=[])
-
-    def _get_latest_remote_season(self) -> Optional[str]:
-        def operation():
-            payload = self._fetch_folder_payload(f"{self._get_openani_base()}/")
-            return self._extract_latest_season(payload.get("files") or [])
-
-        return self._with_retry(operation, default=None)
-
-    def get_available_seasons(self, use_cache: bool = True) -> List[str]:
-        if use_cache and self._season_options_cache:
-            return list(self._season_options_cache)
-
-        def operation():
-            payload = self._fetch_folder_payload(f"{self._get_openani_base()}/")
-            seasons = []
-            for file_info in payload.get("files") or []:
-                name = file_info.get("name") or ""
-                mime_type = file_info.get("mimeType") or ""
-                if mime_type != self.FOLDER_MIME_TYPE:
+            source_stats[url] = f"{len(entries)}条"
+            for entry in entries:
+                title = entry["title"]
+                if title in seen_titles:
                     continue
-                parts = name.split("-", 1)
-                if len(parts) != 2 or not parts[0].isdigit() or not parts[1].isdigit():
-                    continue
-                seasons.append(name)
-            seasons.sort(key=lambda item: tuple(map(int, item.split("-"))), reverse=True)
-            return seasons
+                seen_titles[title] = True
+                merged.append(entry)
 
-        seasons = self._with_retry(operation, default=[])
-        self._season_options_cache = list(seasons)
-        return seasons
+        return merged, source_stats
 
-    def _fetch_folder_payload(self, url: str) -> Dict[str, Any]:
-        response = self._request_factory().post(
-            url=url,
-            data='{"password":""}',
-        )
-        if not response:
-            raise ValueError(f"目录请求失败：{url}")
+    def _fetch_one(self, url: str) -> List[Dict[str, str]]:
+        def operation():
+            response = RequestUtils(
+                ua=settings.USER_AGENT if settings.USER_AGENT else None,
+                proxies=settings.PROXY if self._use_proxy and settings.PROXY else None,
+            ).get_res(url)
+            if not response or response.status_code != 200:
+                status = response.status_code if response else "无响应"
+                raise ValueError(f"HTTP状态异常：{status}")
+            return self._parse_rss(response.text)
+
+        return self._with_retry(operation, tries=2, delay=3)
+
+    @staticmethod
+    def _parse_rss(xml_text: str) -> List[Dict[str, str]]:
         try:
-            return response.json()
-        finally:
-            response.close()
+            root = ET.fromstring(xml_text)
+        except ET.ParseError as err:
+            raise ValueError(f"RSS解析失败：{err}")
 
-    def _build_request_utils(self) -> RequestUtils:
-        return RequestUtils(
-            ua=settings.USER_AGENT if settings.USER_AGENT else None,
-            proxies=settings.PROXY if self._use_proxy and settings.PROXY else None,
-        )
+        channel = root.find("channel")
+        if channel is None:
+            return []
 
-    def _collect_folder_entries(self, folder_path: str, relative_dir: str = "") -> List[Dict[str, str]]:
-        payload = self._fetch_folder_payload(f"{self._get_openani_base()}/{folder_path}")
         entries: List[Dict[str, str]] = []
-        for file_info in payload.get("files") or []:
-            name = file_info.get("name") or ""
-            if not name:
-                continue
-            mime_type = file_info.get("mimeType") or ""
-            if mime_type == self.FOLDER_MIME_TYPE:
-                child_relative_dir = f"{relative_dir}/{name}".strip("/")
-                child_folder_path = f"{folder_path.rstrip('/')}/{quote(name, safe='')}/"
-                entries.extend(self._collect_folder_entries(child_folder_path, child_relative_dir))
-                continue
-
-            encoded_name = quote(name, safe="")
-            file_url = f"{self._get_openani_base()}/{folder_path.rstrip('/')}/{encoded_name}"
-            entries.append(
-                {
-                    "name": name,
-                    "url": file_url,
-                    "relative_dir": relative_dir,
-                }
-            )
+        for item in channel.findall("item"):
+            data: Dict[str, str] = {}
+            for child in item:
+                tag = child.tag.rsplit("}", 1)[-1]
+                text = (child.text or "").strip()
+                if tag == "title":
+                    data["title"] = text
+                elif tag == "link":
+                    data["link"] = text
+                elif tag == "pubDate":
+                    data["pub_date"] = text
+                elif tag == "size":
+                    data["size"] = text
+            if data.get("title") and data.get("link"):
+                entries.append(data)
         return entries
 
     @staticmethod
-    def normalize_proxy_base(proxy_base: Optional[str]) -> str:
-        if not proxy_base:
-            return "https://openani.an-i.workers.dev"
-        return proxy_base.strip().rstrip("/")
-
-    def _get_openani_base(self) -> str:
-        return self._proxy_base or "https://openani.an-i.workers.dev"
-
-    def normalize_stream_link(self, link: str) -> str:
-        parsed = urlparse(link)
-        if parsed.netloc not in {"resources.ani.rip", "openani.an-i.workers.dev"}:
-            return link
-
-        proxy_parsed = urlparse(self._get_openani_base())
-        return urlunparse(
-            (
-                proxy_parsed.scheme,
-                proxy_parsed.netloc,
-                parsed.path,
-                parsed.params,
-                parsed.query,
-                parsed.fragment,
-            )
-        )
-
-    @staticmethod
-    def _with_retry(operation, default, tries: int = 3, delay: int = 3):
+    def _with_retry(operation, tries: int = 2, delay: int = 3):
         remaining = tries
-        wait_seconds = delay
+        last_err = None
         while remaining > 0:
             try:
                 return operation()
             except Exception as err:
+                last_err = err
                 remaining -= 1
-                if remaining == 0:
-                    logger.warning(f"ANiStrm请求失败，已达到最大重试次数：{err}")
-                    break
-                logger.warning(f"未获取到文件信息，{wait_seconds}秒后重试 ...")
-                time.sleep(wait_seconds)
-        logger.warning("请确保当前季度番剧文件夹存在或检查网络问题")
-        return default
-
-    @staticmethod
-    def _extract_latest_season(files: List[Dict[str, str]]) -> Optional[str]:
-        seasons: List[Tuple[int, int]] = []
-        for file_info in files:
-            name = file_info.get("name") or ""
-            mime_type = file_info.get("mimeType") or ""
-            if mime_type != AniStrmClient.FOLDER_MIME_TYPE:
-                continue
-            parts = name.split("-", 1)
-            if len(parts) != 2 or not parts[0].isdigit() or not parts[1].isdigit():
-                continue
-            seasons.append((int(parts[0]), int(parts[1])))
-        if not seasons:
-            return None
-        year, month = max(seasons)
-        return f"{year}-{month}"
+                if remaining > 0:
+                    time.sleep(delay)
+        raise last_err
 
 
 class StrmFileService:
-    @staticmethod
-    def build_season_url(season: str, file_name: str, base_url: str) -> str:
-        encoded_filename = quote(file_name, safe="")
-        return f"{base_url.rstrip('/')}/{season}/{encoded_filename}"
-
     @staticmethod
     def normalize_stream_url(url: str) -> str:
         if url.endswith(".mp4"):
@@ -589,33 +430,18 @@ class StrmFileService:
             return url.replace("?d=mp4", ".mp4")
         if "?d=true" in url and ".mp4?d=true" not in url:
             return url.replace("?d=true", "")
-        return f"{url}.mp4"
+        return url
 
-    def touch_strm_file(
-        self,
-        storage_path: str,
-        file_name: str,
-        season: Optional[str] = None,
-        file_url: Optional[str] = None,
-        base_url: str = "https://openani.an-i.workers.dev",
-        relative_dir: Optional[str] = None,
-    ) -> str:
+    def touch_strm_file(self, storage_path: str, file_name: str, file_url: str) -> str:
         if not storage_path:
             logger.error("创建strm源文件失败：未配置存储目录")
             return "failed"
 
-        if file_url:
-            src_url = self.normalize_stream_url(file_url)
-        else:
-            if not season:
-                logger.error("创建strm源文件失败：未提供季度信息")
-                return "failed"
-            src_url = self.build_season_url(season, file_name, base_url=base_url)
+        safe_name = file_name.replace("/", "_").replace("\\", "_")
+        src_url = self.normalize_stream_url(file_url)
 
         directory = Path(storage_path)
-        if relative_dir:
-            directory = directory / relative_dir
-        file_path = directory / f"{file_name}.strm"
+        file_path = directory / f"{safe_name}.strm"
         if file_path.exists():
             logger.debug(f"ANi-Strm跳过已存在文件：{file_path.name}")
             return "exists"
