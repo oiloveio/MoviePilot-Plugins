@@ -8,7 +8,7 @@ import xml.etree.ElementTree as ET
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
-from urllib.parse import urlparse
+from urllib.parse import quote, unquote, urlparse, urlunparse
 
 import pytz
 from apscheduler.schedulers.background import BackgroundScheduler
@@ -31,6 +31,9 @@ https://api.ani.rip/ani-download.xml
 SUBTITLE_EXTENSIONS = (".srt", ".vtt", ".ass", ".ssa")
 # 从直链里提取季度目录，如 .../2026-7/xxx.mp4 -> 2026-7
 SEASON_RE = re.compile(r"/(\d{4}-\d{1,2})/")
+# 匹配ANi标题/文件名里的集数，形如" - 11 ["，用于资源补齐时定位并替换集数数字。
+# 要求前有"-"后有"["，避免误命中季度目录(yyyy-mm)或分辨率(1080P)里的数字。
+EPISODE_NUM_RE = re.compile(r"(-\s*)(\d{1,4})(\s*\[)")
 
 
 class ANiStrmHub(_PluginBase):
@@ -58,8 +61,12 @@ class ANiStrmHub(_PluginBase):
     _filename_blacklist = ""
     _season_dir = False
     _season_filter: List[str] = ["all"]
-    _proxy_prefix = ""
+    _proxy_prefixes = ""
+    _active_proxy_prefix: Optional[str] = None
     _apply_proxy_prefix_once = False
+    _restore_proxy_once = False
+    _detect_proxy_once = False
+    _backfill_once = False
     _scheduler: Optional[BackgroundScheduler] = None
 
     def __init__(self):
@@ -86,8 +93,15 @@ class ANiStrmHub(_PluginBase):
         self._filename_blacklist = config.get("filename_blacklist") or ""
         self._season_dir = config.get("season_dir", False)
         self._season_filter = config.get("season_filter") or ["all"]
-        self._proxy_prefix = config.get("proxy_prefix") or ""
+        self._proxy_prefixes = config.get("proxy_prefixes")
+        if not self._proxy_prefixes:
+            # 兼容3.8.0的单值配置proxy_prefix，自动迁移成列表的第一行
+            self._proxy_prefixes = config.get("proxy_prefix") or ""
+        self._active_proxy_prefix = config.get("active_proxy_prefix")
         self._apply_proxy_prefix_once = config.get("apply_proxy_prefix_once", False)
+        self._restore_proxy_once = config.get("restore_proxy_once", False)
+        self._detect_proxy_once = config.get("detect_proxy_once", False)
+        self._backfill_once = config.get("backfill_once", False)
         self._rss_sources = config.get("rss_sources")
         if not self._rss_sources:
             self._rss_sources = DEFAULT_RSS_SOURCES
@@ -106,6 +120,9 @@ class ANiStrmHub(_PluginBase):
             or self._detect_once
             or self._migrate_once
             or self._apply_proxy_prefix_once
+            or self._restore_proxy_once
+            or self._detect_proxy_once
+            or self._backfill_once
         ):
             logger.info("ANiStrmHub未启用且未触发立即运行，跳过任务注册")
             return
@@ -176,7 +193,7 @@ class ANiStrmHub(_PluginBase):
             if self.__is_task_running("proxy_prefix"):
                 logger.warning("ANiStrmHub套代理前缀：上一次任务还在运行中，本次跳过排队，等它跑完再重新勾选")
             else:
-                logger.info(f"ANiStrmHub服务启动，立即给本地strm套上代理前缀：{self._proxy_prefix}")
+                logger.info(f"ANiStrmHub服务启动，立即给本地strm套上代理前缀：{self.__get_active_proxy_prefix()}")
                 self._scheduler.add_job(
                     func=self.__apply_proxy_prefix_task,
                     trigger="date",
@@ -185,11 +202,75 @@ class ANiStrmHub(_PluginBase):
                 )
             self._apply_proxy_prefix_once = False
 
+        if self._restore_proxy_once:
+            if self.__is_task_running("restore_proxy"):
+                logger.warning("ANiStrmHub一键还原：上一次任务还在运行中，本次跳过排队，等它跑完再重新勾选")
+            else:
+                logger.info("ANiStrmHub服务启动，立即把本地strm还原为官方裸直链")
+                self._scheduler.add_job(
+                    func=self.__restore_proxy_task,
+                    trigger="date",
+                    run_date=datetime.now(tz=pytz.timezone(settings.TZ)) + timedelta(seconds=3),
+                    name="ANiStrmHub一键还原",
+                )
+            self._restore_proxy_once = False
+
+        if self._detect_proxy_once:
+            if self.__is_task_running("detect_proxy"):
+                logger.warning("ANiStrmHub探测加速源：上一次任务还在运行中，本次跳过排队，等它跑完再重新勾选")
+            else:
+                logger.info("ANiStrmHub服务启动，立即探测各加速源延迟/网速")
+                self._scheduler.add_job(
+                    func=self.__detect_proxy_task,
+                    trigger="date",
+                    run_date=datetime.now(tz=pytz.timezone(settings.TZ)) + timedelta(seconds=3),
+                    name="ANiStrmHub探测加速源",
+                )
+            self._detect_proxy_once = False
+
+        if self._backfill_once:
+            if self.__is_task_running("backfill"):
+                logger.warning("ANiStrmHub资源补齐：上一次任务还在运行中，本次跳过排队，等它跑完再重新勾选")
+            else:
+                logger.info("ANiStrmHub服务启动，立即回溯探测本地已有剧集缺失的老集数")
+                self._scheduler.add_job(
+                    func=self.__backfill_task,
+                    trigger="date",
+                    run_date=datetime.now(tz=pytz.timezone(settings.TZ)) + timedelta(seconds=3),
+                    name="ANiStrmHub资源补齐",
+                )
+            self._backfill_once = False
+
         self.__update_config()
 
         if self._scheduler.get_jobs():
             self._scheduler.print_jobs()
             self._scheduler.start()
+
+    def __parse_proxy_prefixes(self) -> List[str]:
+        """解析多行加速源配置(格式类似rss_sources：一行一个地址，#开头禁用)，
+        按行顺序去重返回"""
+        prefixes = []
+        for raw_line in (self._proxy_prefixes or "").splitlines():
+            line = raw_line.strip()
+            if not line or line.startswith("#"):
+                continue
+            prefixes.append(line.rstrip("/"))
+        return list(dict.fromkeys(prefixes))
+
+    def __get_active_proxy_prefix(self) -> Optional[str]:
+        """返回当前生效的加速源：用户在下拉里选中的那个(如果还在列表里)，
+        否则退化成列表第一个non-disabled的。没配置任何加速源则返回None，
+        调用方应把None当成"不套壳，维持原直链"处理"""
+        prefixes = self.__parse_proxy_prefixes()
+        if not prefixes:
+            return None
+        if self._active_proxy_prefix and self._active_proxy_prefix in prefixes:
+            return self._active_proxy_prefix
+        return prefixes[0]
+
+    def __build_proxy_prefix_options(self) -> List[Dict[str, str]]:
+        return [{"title": prefix, "value": prefix} for prefix in self.__parse_proxy_prefixes()]
 
     def __pick_healthy_reference_links(self) -> List[str]:
         """按配置顺序依次探测各数据源，返回所有当前RSS能拉到、且样本视频直链实测
@@ -299,6 +380,10 @@ class ANiStrmHub(_PluginBase):
             self.__save_task_status("task", "done", "季度筛选后无条目")
             return
 
+        active_prefix = self.__get_active_proxy_prefix()
+        if active_prefix:
+            logger.info(f"ANiStrmHub任务：新生成的strm将自动套用加速源 {active_prefix}")
+
         total_created = 0
         total_exists = 0
         total_failed = 0
@@ -317,10 +402,17 @@ class ANiStrmHub(_PluginBase):
             season = SEASON_RE.search(entry["link"])
             relative_dir = season.group(1) if (self._season_dir and season) else None
 
+            # 自动套用当前生效加速源：这里不逐条探测确认可达，信任加速源本身
+            # 已经通过「探测加速源」验证过——每次拉新番几十上百条都探测一遍
+            # 太慢也太费请求，跟事后批量套壳(会逐条探测)是不同场景
+            file_url = entry["link"]
+            if active_prefix:
+                file_url = StrmRelinkService.build_proxied_url(file_url, active_prefix)
+
             status = self._strm_service.touch_strm_file(
                 storage_path=self._storageplace,
                 file_name=display_name,
-                file_url=entry["link"],
+                file_url=file_url,
                 relative_dir=relative_dir,
             )
             if status == "created":
@@ -485,10 +577,10 @@ class ANiStrmHub(_PluginBase):
         path + 原query。写入前依然会实测探测确认可达才覆盖，不会无脑批量替换。
         """
         self.__save_task_status("proxy_prefix", "running", "进行中")
-        proxy_prefix = (self._proxy_prefix or "").strip()
+        proxy_prefix = self.__get_active_proxy_prefix()
         if not proxy_prefix:
-            logger.warning("ANiStrmHub套代理前缀：未配置代理/加速地址，任务结束")
-            self.__save_task_status("proxy_prefix", "done", "未配置代理地址")
+            logger.warning("ANiStrmHub套代理前缀：未配置加速源，任务结束")
+            self.__save_task_status("proxy_prefix", "done", "未配置加速源")
             return
 
         directory = Path(self._storageplace)
@@ -534,6 +626,206 @@ class ANiStrmHub(_PluginBase):
         summary = "，".join(f"{k}={v}" for k, v in stats.items())
         logger.info(f"ANiStrmHub套代理前缀完成：{summary}")
         self.__save_task_status("proxy_prefix", "done", summary)
+
+    def __restore_proxy_task(self):
+        """__apply_proxy_prefix_task的反向操作：把已经套壳的strm还原成官方裸
+        直链(https://resources.ani.rip + 资源路径)。用于换加速源前先清空基线，
+        或者加速源全部失效时回退到官方裸链接(配合use_proxy走MP自己的代理)。
+        写入前依然实测探测确认可达才覆盖——官方域名国内大概率连不上，探测
+        不通过就是信号，说明当前不适合还原，保留原文件不动，不会硬切。"""
+        self.__save_task_status("restore_proxy", "running", "进行中")
+        directory = Path(self._storageplace)
+        if not directory.exists():
+            logger.warning(f"ANiStrmHub一键还原：目录不存在 {self._storageplace}")
+            self.__save_task_status("restore_proxy", "done", "存储目录不存在")
+            return
+
+        official_prefix = "https://resources.ani.rip"
+        stats = {
+            "已还原为官方直链": 0,
+            "无需还原(已是官方直链)": 0,
+            "探测不可达(保留原文件)": 0,
+            "无法识别(保留原文件)": 0,
+        }
+        for strm_file in sorted(directory.rglob("*.strm")):
+            try:
+                old_content = strm_file.read_text(encoding="utf-8").strip()
+            except Exception as err:
+                logger.warning(f"ANiStrmHub一键还原：读取失败，跳过 {strm_file.name} - {err}")
+                stats["无法识别(保留原文件)"] += 1
+                continue
+
+            resource_path = StrmRelinkService.extract_resource_path(old_content)
+            if not resource_path:
+                stats["无法识别(保留原文件)"] += 1
+                continue
+
+            new_link = f"{official_prefix}/{resource_path}"
+            if new_link == old_content:
+                stats["无需还原(已是官方直链)"] += 1
+                continue
+
+            time.sleep(0.3)
+            latency_ms, fail_reason = self._relink_service.probe_latency_ms(new_link)
+            if latency_ms is not None:
+                strm_file.write_text(new_link, encoding="utf-8")
+                stats["已还原为官方直链"] += 1
+                logger.info(f"ANiStrmHub一键还原：成功({latency_ms}ms) {strm_file.name}")
+            else:
+                logger.warning(f"ANiStrmHub一键还原：官方直链探测不可达({fail_reason})，保留原文件 {strm_file.name}")
+                stats["探测不可达(保留原文件)"] += 1
+
+        summary = "，".join(f"{k}={v}" for k, v in stats.items())
+        logger.info(f"ANiStrmHub一键还原完成：{summary}")
+        self.__save_task_status("restore_proxy", "done", summary)
+
+    def __detect_proxy_task(self):
+        """探测配置的每个加速源实测延迟+网速，推荐最快的一个——跟__detect_task
+        测的是"RSS数据源"不是一回事，这里测的是"加速前缀"本身的转发质量，
+        用同一条样本直链分别套上每个加速源前缀实测，结果单独存一张表"""
+        self.__save_task_status("detect_proxy", "running", "进行中")
+        prefixes = self.__parse_proxy_prefixes()
+        if not prefixes:
+            logger.warning("ANiStrmHub探测加速源：未配置加速源，任务结束")
+            self.__save_task_status("detect_proxy", "done", "未配置加速源")
+            return
+
+        sample_link = None
+        for url in self._client.get_source_urls():
+            try:
+                entries = self._client.fetch_one_source(url)
+            except Exception:
+                continue
+            if entries:
+                sample_link = entries[0]["link"]
+                break
+
+        if not sample_link:
+            logger.warning("ANiStrmHub探测加速源：所有数据源都抓不到样本直链，任务结束")
+            self.__save_task_status("detect_proxy", "done", "无法取得样本直链")
+            return
+
+        results = []
+        for prefix in prefixes:
+            candidate = StrmRelinkService.build_proxied_url(sample_link, prefix)
+            time.sleep(0.3)
+            latency_ms, fail_reason = self._relink_service.probe_latency_ms(candidate)
+            probe = {"prefix": prefix, "latency_ms": latency_ms, "speed_kbps": None, "error": fail_reason}
+            if latency_ms is not None:
+                probe["speed_kbps"] = self._relink_service.probe_speed_kbps(candidate)
+                logger.info(
+                    f"ANiStrmHub探测加速源：{prefix} 延迟={latency_ms}ms 网速={probe['speed_kbps']}KB/s"
+                )
+            else:
+                logger.info(f"ANiStrmHub探测加速源：{prefix} 不可达({fail_reason})")
+            results.append(probe)
+
+        reachable = [p for p in results if p.get("latency_ms") is not None]
+        if reachable:
+            fastest = max(reachable, key=lambda p: p.get("speed_kbps") or 0)
+            fastest["recommended"] = True
+
+        checked_at = datetime.now(tz=pytz.timezone(settings.TZ)).strftime("%Y-%m-%d %H:%M:%S")
+        self.save_data("proxy_health", {"checked_at": checked_at, "results": results})
+        summary = f"{len(results)}个加速源，可达={len(reachable)}个"
+        logger.info(f"ANiStrmHub探测加速源完成：{summary}")
+        self.__save_task_status("detect_proxy", "done", summary)
+
+    def __backfill_task(self):
+        """资源补齐：ani-download.xml这个RSS只是滚动窗口，只含近期资源，更早的
+        集数不在里面，但ANi同一部剧全部集数的直链只有集数数字不同，其余部分
+        (域名/季度目录/文件名其它属性/查询参数)完全一致——这是用户实测确认的：
+        把"- 11"手动改成"- 10"依然能播放，说明季度目录是按剧集首播月份命名，
+        不是按每一集实际上传日期命名。
+
+        对本地已有的每部剧，从当前最早一集往前递减集数构造候选直链，严格串行
+        探测(不并发)、探测间隔sleep、单次任务设总探测数上限，一旦某一集探测
+        不可达就停止继续往前探测这部剧(假设更早的集数同样不可达或已下架，
+        没必要继续浪费请求)——这几条都是用户明确要求的限流设计，避免被
+        目标站点风控封IP。确认可达才写入，不是无脑改写。"""
+        self.__save_task_status("backfill", "running", "进行中")
+        directory = Path(self._storageplace)
+        if not directory.exists():
+            logger.warning(f"ANiStrmHub资源补齐：目录不存在 {self._storageplace}")
+            self.__save_task_status("backfill", "done", "存储目录不存在")
+            return
+
+        max_probes_total = 30
+        max_back_per_series = 20
+        probe_interval_sec = 1.5
+
+        series_min_ep: Dict[str, Tuple[int, Path]] = {}
+        for strm_file in sorted(directory.rglob("*.strm")):
+            stem = strm_file.stem
+            match = EPISODE_NUM_RE.search(stem)
+            if not match:
+                continue
+            ep_num = int(match.group(2))
+            series_key = f"{stem[:match.start(2)]}\0{stem[match.end(2):]}"
+            if series_key not in series_min_ep or ep_num < series_min_ep[series_key][0]:
+                series_min_ep[series_key] = (ep_num, strm_file)
+
+        if not series_min_ep:
+            logger.info("ANiStrmHub资源补齐：本地没有可识别集数的strm，任务结束")
+            self.__save_task_status("backfill", "done", "本地无可识别集数的资源")
+            return
+
+        active_prefix = self.__get_active_proxy_prefix()
+        total_probed = 0
+        total_created = 0
+
+        for min_ep, ref_file in series_min_ep.values():
+            if total_probed >= max_probes_total:
+                logger.info("ANiStrmHub资源补齐：本次任务探测次数已达上限，剩余剧集留到下次手动运行")
+                break
+            try:
+                ref_content = ref_file.read_text(encoding="utf-8").strip()
+            except Exception:
+                continue
+
+            for offset in range(1, max_back_per_series + 1):
+                candidate_ep = min_ep - offset
+                if candidate_ep < 1:
+                    break
+                if total_probed >= max_probes_total:
+                    break
+
+                candidate_link = StrmRelinkService.build_episode_variant_link(ref_content, candidate_ep)
+                candidate_title = StrmRelinkService.build_title_variant(ref_file.stem, candidate_ep)
+                if not candidate_link or not candidate_title:
+                    break
+
+                candidate_path = ref_file.with_name(f"{candidate_title}.strm")
+                if candidate_path.exists():
+                    # 这一集本地已经有了(之前补过/正常拉过)，不用重新探测，
+                    # 继续往前查更早的集数
+                    continue
+
+                time.sleep(probe_interval_sec)
+                total_probed += 1
+                latency_ms, fail_reason = self._relink_service.probe_latency_ms(candidate_link)
+                if latency_ms is None:
+                    logger.info(
+                        f"ANiStrmHub资源补齐：{ref_file.stem} 回溯到第{candidate_ep}集不可达"
+                        f"({fail_reason})，停止继续往前探测这部剧"
+                    )
+                    break
+
+                final_link = (
+                    StrmRelinkService.build_proxied_url(candidate_link, active_prefix)
+                    if active_prefix
+                    else candidate_link
+                )
+                try:
+                    candidate_path.write_text(final_link, encoding="utf-8")
+                    total_created += 1
+                    logger.info(f"ANiStrmHub资源补齐：成功补上第{candidate_ep}集({latency_ms}ms) {candidate_path.name}")
+                except Exception as err:
+                    logger.warning(f"ANiStrmHub资源补齐：写入失败 {candidate_path.name} - {err}")
+
+        summary = f"探测{total_probed}次，成功补齐{total_created}集"
+        logger.info(f"ANiStrmHub资源补齐完成：{summary}")
+        self.__save_task_status("backfill", "done", summary)
 
     def __save_task_status(self, task_key: str, status: str, summary: str = ""):
         """记录一次性任务(拉取/修复/探测/换源)的运行状态，供详情页展示进度，
@@ -843,20 +1135,18 @@ class ANiStrmHub(_PluginBase):
                                         "content": [
                                             {
                                                 "component": "VCol",
-                                                "props": {"cols": 12, "md": 8},
+                                                "props": {"cols": 12, "md": 6},
                                                 "content": [
                                                     {
-                                                        "component": "VTextField",
+                                                        "component": "VTextarea",
                                                         "props": {
-                                                            "model": "proxy_prefix",
-                                                            "label": "本地strm一键套代理前缀",
+                                                            "model": "proxy_prefixes",
+                                                            "label": "加速源列表（一行一个代理/加速地址）",
+                                                            "rows": 3,
                                                             "placeholder": "https://pro.pili.cc.cd",
-                                                            "hint": "把本地已有strm的链接整体包一层这个代理地址(不管现在是裸官方"
-                                                            "地址还是走了别的镜像)，格式是「代理前缀+原链接」，"
-                                                            "比如resources.ani.rip/2025-10/xxx?d=mp4 套上"
-                                                            "https://pro.pili.cc.cd 会变成"
-                                                            "https://pro.pili.cc.cd/resources.ani.rip/2025-10/xxx?d=mp4。"
-                                                            "写入前会实测探测确认可达，探测不通过的保留原文件不动",
+                                                            "hint": "把strm链接整体包一层这个地址(不管现在是裸官方地址还是走了"
+                                                            "别的镜像)，格式是「加速地址+原链接」，行首加#表示禁用。"
+                                                            "配了「当前生效加速源」后，新拉的番会自动套上，不用再手动跑套壳",
                                                             "persistent-hint": True,
                                                         },
                                                     }
@@ -864,13 +1154,75 @@ class ANiStrmHub(_PluginBase):
                                             },
                                             {
                                                 "component": "VCol",
-                                                "props": {"cols": 12, "md": 4},
+                                                "props": {"cols": 12, "md": 6},
+                                                "content": [
+                                                    {
+                                                        "component": "VSelect",
+                                                        "props": {
+                                                            "model": "active_proxy_prefix",
+                                                            "label": "当前生效加速源",
+                                                            "items": self.__build_proxy_prefix_options(),
+                                                            "clearable": True,
+                                                            "hint": "新拉的番自动套用这个加速源；不选则默认用列表第一个未禁用的。"
+                                                            "先「探测加速源延迟/网速」看哪个最快再选",
+                                                            "persistent-hint": True,
+                                                        },
+                                                    }
+                                                ],
+                                            },
+                                        ],
+                                    },
+                                    {
+                                        "component": "VRow",
+                                        "content": [
+                                            {
+                                                "component": "VCol",
+                                                "props": {"cols": 12, "md": 3},
+                                                "content": [
+                                                    {
+                                                        "component": "VSwitch",
+                                                        "props": {
+                                                            "model": "detect_proxy_once",
+                                                            "label": "探测加速源延迟/网速",
+                                                        },
+                                                    }
+                                                ],
+                                            },
+                                            {
+                                                "component": "VCol",
+                                                "props": {"cols": 12, "md": 3},
                                                 "content": [
                                                     {
                                                         "component": "VSwitch",
                                                         "props": {
                                                             "model": "apply_proxy_prefix_once",
-                                                            "label": "立即给本地strm套上代理前缀",
+                                                            "label": "一键加速(本地strm套加速源)",
+                                                        },
+                                                    }
+                                                ],
+                                            },
+                                            {
+                                                "component": "VCol",
+                                                "props": {"cols": 12, "md": 3},
+                                                "content": [
+                                                    {
+                                                        "component": "VSwitch",
+                                                        "props": {
+                                                            "model": "restore_proxy_once",
+                                                            "label": "一键还原(改回官方直链)",
+                                                        },
+                                                    }
+                                                ],
+                                            },
+                                            {
+                                                "component": "VCol",
+                                                "props": {"cols": 12, "md": 3},
+                                                "content": [
+                                                    {
+                                                        "component": "VSwitch",
+                                                        "props": {
+                                                            "model": "backfill_once",
+                                                            "label": "资源补齐(回溯本地已有剧集的老集数)",
                                                         },
                                                     }
                                                 ],
@@ -882,7 +1234,10 @@ class ANiStrmHub(_PluginBase):
                                         "props": {"class": "text-caption mt-2"},
                                         "text": "修复失效链接：标题还在RSS窗口内的直接换成最新直链；不在窗口内的老集数，"
                                         "从旧链接提取季度/文件名部分换上当前探测确认能连通的源的域名前缀，实测探测"
-                                        "确认可达才覆盖写入，探测不通过的保留原文件不动。运行状态和结果见下方详情页。",
+                                        "确认可达才覆盖写入，探测不通过的保留原文件不动。"
+                                        "资源补齐：对本地已有的剧，往回探测更早的集数(同季度目录、只改集数号)，"
+                                        "严格串行+限流探测，探测到不可达就停止这部剧继续往前查，避免高频请求被封IP，"
+                                        "手动触发，不进定时任务。运行状态和结果见下方详情页。",
                                     },
                                 ],
                             },
@@ -936,8 +1291,12 @@ class ANiStrmHub(_PluginBase):
             "filename_blacklist": "",
             "season_dir": False,
             "season_filter": ["all"],
-            "proxy_prefix": "",
+            "proxy_prefixes": "",
+            "active_proxy_prefix": None,
             "apply_proxy_prefix_once": False,
+            "restore_proxy_once": False,
+            "detect_proxy_once": False,
+            "backfill_once": False,
             "rss_sources": DEFAULT_RSS_SOURCES,
             "cron": "20 22,23,0,1 * * *",
         }
@@ -961,8 +1320,12 @@ class ANiStrmHub(_PluginBase):
                 "filename_blacklist": self._filename_blacklist,
                 "season_dir": self._season_dir,
                 "season_filter": self._season_filter,
-                "proxy_prefix": self._proxy_prefix,
+                "proxy_prefixes": self._proxy_prefixes,
+                "active_proxy_prefix": self._active_proxy_prefix,
                 "apply_proxy_prefix_once": self._apply_proxy_prefix_once,
+                "restore_proxy_once": self._restore_proxy_once,
+                "detect_proxy_once": self._detect_proxy_once,
+                "backfill_once": self._backfill_once,
                 "rss_sources": self._rss_sources,
             }
         )
@@ -972,7 +1335,10 @@ class ANiStrmHub(_PluginBase):
         "relink": "修复本地失效链接",
         "detect": "探测数据源健康度",
         "migrate": "一键切换来源",
-        "proxy_prefix": "套代理前缀",
+        "proxy_prefix": "一键加速(套加速源)",
+        "restore_proxy": "一键还原(官方直链)",
+        "detect_proxy": "探测加速源延迟/网速",
+        "backfill": "资源补齐(回溯集数)",
     }
 
     def get_page(self) -> List[dict]:
@@ -1039,20 +1405,94 @@ class ANiStrmHub(_PluginBase):
 
         health = self.get_data("source_health") or {}
         domain_stats = self.get_data("domain_stats") or {}
+        proxy_health = self.get_data("proxy_health") or {}
 
-        if not health and not domain_stats:
+        if not health and not domain_stats and not proxy_health:
             content.append(
                 {
                     "component": "VAlert",
                     "props": {
                         "type": "info",
                         "variant": "tonal",
-                        "text": "还没有探测数据。去插件配置页勾选「探测各数据源播放健康度」跑一次，"
-                        "这里会显示每个数据源当前能不能连、以及本地已生成的strm都在用哪些域名。",
+                        "text": "还没有探测数据。去插件配置页勾选「探测各数据源播放健康度」或「探测加速源"
+                        "延迟/网速」跑一次，这里会显示每个数据源/加速源当前能不能连、以及本地已生成的"
+                        "strm都在用哪些域名。",
                     },
                 }
             )
             return content
+
+        if proxy_health:
+            rows = []
+            for probe in proxy_health.get("results", []):
+                if probe.get("latency_ms") is not None:
+                    status_text, status_color = "✅ 可用", "success"
+                else:
+                    status_text, status_color = "❌ 不可用", "error"
+
+                perf_parts = []
+                if probe.get("latency_ms") is not None:
+                    perf_parts.append(f"延迟{probe['latency_ms']:.0f}ms")
+                if probe.get("speed_kbps") is not None:
+                    speed = probe["speed_kbps"]
+                    perf_parts.append(f"{speed / 1024:.1f}MB/s" if speed >= 1024 else f"{speed:.0f}KB/s")
+                if not perf_parts:
+                    perf_parts.append(probe.get("error") or "")
+                detail = " · ".join(perf_parts)
+
+                prefix_cell = [{"component": "span", "text": probe.get("prefix")}]
+                if probe.get("recommended"):
+                    prefix_cell.append(
+                        {
+                            "component": "VChip",
+                            "props": {"color": "primary", "size": "x-small", "class": "ml-2"},
+                            "text": "🚀 推荐",
+                        }
+                    )
+
+                rows.append(
+                    {
+                        "component": "VRow",
+                        "props": {"class": "align-center"},
+                        "content": [
+                            {
+                                "component": "VCol",
+                                "props": {"cols": 12, "md": 5},
+                                "content": prefix_cell,
+                            },
+                            {
+                                "component": "VCol",
+                                "props": {"cols": 12, "md": 2},
+                                "content": [
+                                    {
+                                        "component": "VChip",
+                                        "props": {"color": status_color, "size": "small"},
+                                        "text": status_text,
+                                    }
+                                ],
+                            },
+                            {
+                                "component": "VCol",
+                                "props": {"cols": 12, "md": 5},
+                                "content": [{"component": "span", "props": {"class": "text-caption"}, "text": detail}],
+                            },
+                        ],
+                    }
+                )
+            content.append(
+                {
+                    "component": "VCard",
+                    "props": {"class": "mb-4"},
+                    "content": [
+                        {
+                            "component": "VCardTitle",
+                            "text": f"加速源健康度（探测于 {proxy_health.get('checked_at', '未知时间')}，"
+                            "🚀推荐=当前可用加速源里网速最快的）",
+                        },
+                        {"component": "VCardText", "content": rows or [{"component": "span", "text": "无数据"}]},
+                    ],
+                }
+            )
 
         if health:
             rows = []
@@ -1414,6 +1854,29 @@ class StrmRelinkService:
         if parsed.query:
             suffix += "?" + parsed.query
         return f"{proxy_prefix}/{suffix}"
+
+    @staticmethod
+    def build_title_variant(original_title: str, new_episode: int) -> Optional[str]:
+        """把标题/文件名里的集数换成new_episode，其余原样保留"""
+        match = EPISODE_NUM_RE.search(original_title)
+        if not match:
+            return None
+        return f"{original_title[:match.start(2)]}{new_episode}{original_title[match.end(2):]}"
+
+    @staticmethod
+    def build_episode_variant_link(original_link: str, new_episode: int) -> Optional[str]:
+        """资源补齐用：把直链里的集数数字换成new_episode，域名/季度目录/文件名
+        其它属性/查询参数原样保留。直链的文件名部分是URL编码过的(空格/方括号等)，
+        先解码定位集数、替换后只对path重新编码，query本身没有需要编码的字符
+        不用动。"""
+        decoded = unquote(original_link)
+        match = EPISODE_NUM_RE.search(decoded)
+        if not match:
+            return None
+        new_decoded = f"{decoded[:match.start(2)]}{new_episode}{decoded[match.end(2):]}"
+        parsed = urlparse(new_decoded)
+        new_path = quote(parsed.path, safe="/")
+        return urlunparse((parsed.scheme, parsed.netloc, new_path, parsed.params, parsed.query, parsed.fragment))
 
     def probe_latency_ms(self, url: str) -> Tuple[Optional[float], Optional[str]]:
         """探测直链能不能连通、连通要多久（只请求1个字节，类似ping）。
