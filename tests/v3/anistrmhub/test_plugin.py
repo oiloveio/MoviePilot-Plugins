@@ -8,6 +8,7 @@ from unittest.mock import MagicMock
 import pytest
 
 from app.plugins.anistrmhub import (
+    ANiStrmHub,
     AniRssAggregator,
     StrmFileService,
     StrmRelinkService,
@@ -267,3 +268,68 @@ class TestRelinkExisting:
         assert service._verify_reachable("https://alive.example/ep.mp4?d=mp4") is True
         request_utils.update_headers.assert_called_once_with({"Range": "bytes=0-0"})
         request_utils.get_res.assert_called_once_with("https://alive.example/ep.mp4?d=mp4")
+
+
+class TestStopServiceNonBlocking:
+    def test_shutdown_called_with_wait_false(self):
+        # 回归测试：shutdown()默认wait=True会阻塞到正在运行的job跑完才返回，
+        # 用户点保存时如果上一次探测/修复任务还没跑完，保存动作会被真实卡住
+        # (已用真实APScheduler实测复现过)。必须显式传wait=False。
+        plugin = ANiStrmHub()
+        fake_scheduler = MagicMock()
+        fake_scheduler.running = True
+        plugin._scheduler = fake_scheduler
+
+        plugin.stop_service()
+
+        fake_scheduler.shutdown.assert_called_once_with(wait=False)
+        assert plugin._scheduler is None
+
+
+class TestTaskStatusGuard:
+    def test_running_task_is_detected_and_done_is_not(self):
+        plugin = ANiStrmHub()
+        getattr(plugin, "_ANiStrmHub__save_task_status")("relink", "running", "进行中")
+        assert getattr(plugin, "_ANiStrmHub__is_task_running")("relink") is True
+
+        getattr(plugin, "_ANiStrmHub__save_task_status")("relink", "done", "跑完了")
+        assert getattr(plugin, "_ANiStrmHub__is_task_running")("relink") is False
+
+    def test_unknown_task_is_not_running(self):
+        plugin = ANiStrmHub()
+        assert getattr(plugin, "_ANiStrmHub__is_task_running")("never_ran") is False
+
+
+class TestPickHealthyReferenceLink:
+    def test_skips_source_whose_video_domain_is_unreachable(self):
+        # 对应实测踩过的坑：一个源RSS能拉到，但样本直链探测不通(比如国内被墙的
+        # 官方裸域名，或者被Cloudflare挑战拦截的镜像)，之前会被盲目当参照源，
+        # 导致所有路径迁移候选全部超时失败。现在应该跳过它，选下一个真正能播的。
+        plugin = ANiStrmHub()
+        plugin._client.set_sources("https://dead.example/rss.xml\nhttps://alive.example/rss.xml")
+        plugin._client.fetch_one_source = MagicMock(
+            side_effect=lambda url: (
+                [{"title": "x", "link": "https://dead-video.example/2026-7/x.mp4?d=mp4"}]
+                if url == "https://dead.example/rss.xml"
+                else [{"title": "y", "link": "https://alive-video.example/2026-7/y.mp4?d=mp4"}]
+            )
+        )
+        plugin._relink_service._verify_reachable = MagicMock(
+            side_effect=lambda link: "alive-video.example" in link
+        )
+
+        result = getattr(plugin, "_ANiStrmHub__pick_healthy_reference_link")()
+
+        assert result == "https://alive-video.example/2026-7/y.mp4?d=mp4"
+
+    def test_returns_none_when_all_sources_unreachable(self):
+        plugin = ANiStrmHub()
+        plugin._client.set_sources("https://dead.example/rss.xml")
+        plugin._client.fetch_one_source = MagicMock(
+            return_value=[{"title": "x", "link": "https://dead-video.example/x.mp4?d=mp4"}]
+        )
+        plugin._relink_service._verify_reachable = MagicMock(return_value=False)
+
+        result = getattr(plugin, "_ANiStrmHub__pick_healthy_reference_link")()
+
+        assert result is None

@@ -37,7 +37,7 @@ class ANiStrmHub(_PluginBase):
     plugin_name = "ANiStrmHub"
     plugin_desc = "多源聚合抓取ANi新番资源，自动去重轮询多个镜像，生成strm文件，mp刮削入库，媒体服务器直连播放"
     plugin_icon = "https://raw.githubusercontent.com/oiloveio/MoviePilot-Plugins/main/icons/anistrmhub.png"
-    plugin_version = "3.5.0"
+    plugin_version = "3.6.0"
     plugin_author = "honue,oiloveio"
     author_url = "https://github.com/honue"
     plugin_config_prefix = "anistrmhub_"
@@ -121,33 +121,42 @@ class ANiStrmHub(_PluginBase):
             self._onlyonce = False
 
         if self._relink_once:
-            logger.info("ANiStrmHub服务启动，立即修复本地已存在的失效链接")
-            self._scheduler.add_job(
-                func=self.__relink_task,
-                trigger="date",
-                run_date=datetime.now(tz=pytz.timezone(settings.TZ)) + timedelta(seconds=3),
-                name="ANiStrmHub修复失效链接",
-            )
+            if self.__is_task_running("relink"):
+                logger.warning("ANiStrmHub修复链接：上一次任务还在运行中，本次跳过排队，等它跑完再重新勾选")
+            else:
+                logger.info("ANiStrmHub服务启动，立即修复本地已存在的失效链接")
+                self._scheduler.add_job(
+                    func=self.__relink_task,
+                    trigger="date",
+                    run_date=datetime.now(tz=pytz.timezone(settings.TZ)) + timedelta(seconds=3),
+                    name="ANiStrmHub修复失效链接",
+                )
             self._relink_once = False
 
         if self._detect_once:
-            logger.info("ANiStrmHub服务启动，立即探测各数据源播放健康度")
-            self._scheduler.add_job(
-                func=self.__detect_task,
-                trigger="date",
-                run_date=datetime.now(tz=pytz.timezone(settings.TZ)) + timedelta(seconds=3),
-                name="ANiStrmHub探测数据源",
-            )
+            if self.__is_task_running("detect"):
+                logger.warning("ANiStrmHub探测：上一次任务还在运行中，本次跳过排队，等它跑完再重新勾选")
+            else:
+                logger.info("ANiStrmHub服务启动，立即探测各数据源播放健康度")
+                self._scheduler.add_job(
+                    func=self.__detect_task,
+                    trigger="date",
+                    run_date=datetime.now(tz=pytz.timezone(settings.TZ)) + timedelta(seconds=3),
+                    name="ANiStrmHub探测数据源",
+                )
             self._detect_once = False
 
         if self._migrate_once:
-            logger.info(f"ANiStrmHub服务启动，立即将本地strm一键切换到指定来源：{self._migrate_target_source}")
-            self._scheduler.add_job(
-                func=self.__migrate_task,
-                trigger="date",
-                run_date=datetime.now(tz=pytz.timezone(settings.TZ)) + timedelta(seconds=3),
-                name="ANiStrmHub一键切换来源",
-            )
+            if self.__is_task_running("migrate"):
+                logger.warning("ANiStrmHub一键换源：上一次任务还在运行中，本次跳过排队，等它跑完再重新勾选")
+            else:
+                logger.info(f"ANiStrmHub服务启动，立即将本地strm一键切换到指定来源：{self._migrate_target_source}")
+                self._scheduler.add_job(
+                    func=self.__migrate_task,
+                    trigger="date",
+                    run_date=datetime.now(tz=pytz.timezone(settings.TZ)) + timedelta(seconds=3),
+                    name="ANiStrmHub一键切换来源",
+                )
             self._migrate_once = False
 
         self.__update_config()
@@ -156,10 +165,29 @@ class ANiStrmHub(_PluginBase):
             self._scheduler.print_jobs()
             self._scheduler.start()
 
+    def __pick_healthy_reference_link(self) -> Optional[str]:
+        """按配置顺序依次探测各数据源，返回第一个RSS能拉到、且样本视频直链实测
+        能连通的link，供路径迁移当参照。不像修复失效链接前那样盲信"合并列表第
+        一条"——那条可能来自一个RSS通但视频域名连不上的源(比如意外被启用的
+        官方裸域名在国内被墙)，会导致所有路径迁移候选都探测超时。"""
+        for url in self._client.get_source_urls():
+            try:
+                entries = self._client.fetch_one_source(url)
+            except Exception:
+                continue
+            if not entries:
+                continue
+            sample_link = entries[0]["link"]
+            if self._relink_service._verify_reachable(sample_link):
+                return sample_link
+        return None
+
     def __task(self):
+        self.__save_task_status("task", "running", "进行中")
         source_urls = self._client.get_source_urls()
         if not source_urls:
             logger.info("未配置任何数据源，任务结束")
+            self.__save_task_status("task", "done", "未配置数据源")
             return
 
         logger.info(f"ANiStrmHub任务开始：数据源数={len(source_urls)}，storage={self._storageplace}")
@@ -172,6 +200,7 @@ class ANiStrmHub(_PluginBase):
 
         if not entries:
             logger.warning("ANiStrmHub所有数据源均不可用或无内容，本次任务结束")
+            self.__save_task_status("task", "done", "所有数据源均不可用")
             return
 
         total_created = 0
@@ -205,13 +234,15 @@ class ANiStrmHub(_PluginBase):
             else:
                 total_failed += 1
 
-        logger.info(
-            f"ANiStrmHub任务完成：去重后条目数={len(entries)}，"
-            f"新增={total_created}，跳过(已存在)={total_exists}，"
+        summary = (
+            f"去重后{len(entries)}条，新增={total_created}，跳过(已存在)={total_exists}，"
             f"跳过(字幕/黑名单)={total_skipped}，失败={total_failed}"
         )
+        logger.info(f"ANiStrmHub任务完成：{summary}")
+        self.__save_task_status("task", "done", summary)
 
     def __relink_task(self):
+        self.__save_task_status("relink", "running", "进行中")
         entries, source_stats = self._client.fetch_all_entries()
         logger.info(
             "ANiStrmHub修复链接：数据源抓取结果："
@@ -219,27 +250,31 @@ class ANiStrmHub(_PluginBase):
         )
         if not entries:
             logger.warning("ANiStrmHub修复链接：所有数据源均不可用，无法作为迁移参照，任务结束")
+            self.__save_task_status("relink", "done", "所有数据源均不可用")
             return
 
         title_map = {
             StrmFileService.clean_file_name(entry["title"], self._filename_remove): entry["link"]
             for entry in entries
         }
-        reference_link = entries[0]["link"]
+        reference_link = self.__pick_healthy_reference_link()
+        if not reference_link:
+            logger.warning("ANiStrmHub修复链接：所有数据源的视频直链探测都不通，路径迁移这部分会全部失败")
+            reference_link = entries[0]["link"]
 
         stats = self._relink_service.relink_existing(
             storage_path=self._storageplace,
             title_map=title_map,
             reference_link=reference_link,
         )
-        logger.info(
-            "ANiStrmHub修复链接完成："
-            + "，".join(f"{k}={v}" for k, v in stats.items())
-        )
+        summary = "，".join(f"{k}={v}" for k, v in stats.items())
+        logger.info(f"ANiStrmHub修复链接完成：{summary}")
+        self.__save_task_status("relink", "done", summary)
 
     def __detect_task(self):
         """探测每个已启用数据源当前是否真的能播（RSS可拉 + 视频直链域名可连），
         顺带统计本地已生成strm按域名的分布，结果存起来给详情页展示"""
+        self.__save_task_status("detect", "running", "进行中")
         source_urls = self._client.get_source_urls()
         health_results = []
         for url in source_urls:
@@ -279,23 +314,29 @@ class ANiStrmHub(_PluginBase):
             "domain_stats",
             {"checked_at": checked_at, "total": domain_stats.get("__total__", 0), "by_domain": domain_stats.get("by_domain", {})},
         )
-        logger.info(f"ANiStrmHub探测完成：{len(health_results)}个源，本地strm按域名分布={domain_stats}")
+        summary = f"{len(health_results)}个源，本地strm按域名分布={domain_stats}"
+        logger.info(f"ANiStrmHub探测完成：{summary}")
+        self.__save_task_status("detect", "done", summary)
 
     def __migrate_task(self):
         """不管当前是否已经能播，强制把本地全部strm按标题匹配/路径迁移的方式
         统一改写成用户指定的目标数据源，路径迁移分支同样会实际探测确认可达才覆盖"""
+        self.__save_task_status("migrate", "running", "进行中")
         target = self._migrate_target_source
         if not target:
             logger.warning("ANiStrmHub一键换源：未选择目标数据源，任务结束")
+            self.__save_task_status("migrate", "done", "未选择目标数据源")
             return
 
         try:
             entries = self._client.fetch_one_source(target)
         except Exception as err:
             logger.warning(f"ANiStrmHub一键换源：目标源抓取失败，任务结束：{target} - {err}")
+            self.__save_task_status("migrate", "done", f"目标源抓取失败：{err}")
             return
         if not entries:
             logger.warning(f"ANiStrmHub一键换源：目标源RSS无内容，任务结束：{target}")
+            self.__save_task_status("migrate", "done", "目标源RSS无内容")
             return
 
         title_map = {
@@ -309,10 +350,24 @@ class ANiStrmHub(_PluginBase):
             title_map=title_map,
             reference_link=reference_link,
         )
-        logger.info(
-            f"ANiStrmHub一键换源完成(目标={target})："
-            + "，".join(f"{k}={v}" for k, v in stats.items())
-        )
+        summary = "，".join(f"{k}={v}" for k, v in stats.items())
+        logger.info(f"ANiStrmHub一键换源完成(目标={target})：{summary}")
+        self.__save_task_status("migrate", "done", summary)
+
+    def __save_task_status(self, task_key: str, status: str, summary: str = ""):
+        """记录一次性任务(拉取/修复/探测/换源)的运行状态，供详情页展示进度，
+        也用来防止上一次还没跑完时被重复排队"""
+        all_status = self.get_data("task_status") or {}
+        all_status[task_key] = {
+            "status": status,  # running / done / failed
+            "summary": summary,
+            "updated_at": datetime.now(tz=pytz.timezone(settings.TZ)).strftime("%Y-%m-%d %H:%M:%S"),
+        }
+        self.save_data("task_status", all_status)
+
+    def __is_task_running(self, task_key: str) -> bool:
+        all_status = self.get_data("task_status") or {}
+        return all_status.get(task_key, {}).get("status") == "running"
 
     def get_state(self) -> bool:
         return self._enabled
@@ -326,37 +381,47 @@ class ANiStrmHub(_PluginBase):
         """当前插件不注册后端API，探测/换源都走配置开关+详情页缓存展示"""
         return []
 
+    @staticmethod
+    def __section_title(text: str) -> dict:
+        return {
+            "component": "VRow",
+            "content": [
+                {
+                    "component": "VCol",
+                    "props": {"cols": 12},
+                    "content": [
+                        {
+                            "component": "div",
+                            "props": {"class": "text-subtitle-1 font-weight-bold mt-3 mb-1"},
+                            "text": text,
+                        }
+                    ],
+                }
+            ],
+        }
+
     def get_form(self) -> Tuple[List[dict], Dict[str, Any]]:
         return [
             {
                 "component": "VForm",
                 "content": [
+                    self.__section_title("核心设置——拉取新番生成strm"),
                     {
                         "component": "VRow",
                         "content": [
                             {
                                 "component": "VCol",
-                                "props": {"cols": 12, "md": 3},
+                                "props": {"cols": 12, "md": 4},
                                 "content": [
                                     {
                                         "component": "VSwitch",
-                                        "props": {"model": "enabled", "label": "启用插件"},
+                                        "props": {"model": "enabled", "label": "启用插件（按执行周期定时拉取）"},
                                     }
                                 ],
                             },
                             {
                                 "component": "VCol",
-                                "props": {"cols": 12, "md": 3},
-                                "content": [
-                                    {
-                                        "component": "VSwitch",
-                                        "props": {"model": "use_proxy", "label": "使用代理"},
-                                    }
-                                ],
-                            },
-                            {
-                                "component": "VCol",
-                                "props": {"cols": 12, "md": 3},
+                                "props": {"cols": 12, "md": 4},
                                 "content": [
                                     {
                                         "component": "VSwitch",
@@ -366,64 +431,11 @@ class ANiStrmHub(_PluginBase):
                             },
                             {
                                 "component": "VCol",
-                                "props": {"cols": 12, "md": 3},
+                                "props": {"cols": 12, "md": 4},
                                 "content": [
                                     {
                                         "component": "VSwitch",
-                                        "props": {
-                                            "model": "relink_once",
-                                            "label": "修复本地失效链接",
-                                        },
-                                    }
-                                ],
-                            },
-                        ],
-                    },
-                    {
-                        "component": "VRow",
-                        "content": [
-                            {
-                                "component": "VCol",
-                                "props": {"cols": 12, "md": 3},
-                                "content": [
-                                    {
-                                        "component": "VSwitch",
-                                        "props": {
-                                            "model": "detect_once",
-                                            "label": "探测各数据源播放健康度",
-                                        },
-                                    }
-                                ],
-                            },
-                            {
-                                "component": "VCol",
-                                "props": {"cols": 12, "md": 6},
-                                "content": [
-                                    {
-                                        "component": "VSelect",
-                                        "props": {
-                                            "model": "migrate_target_source",
-                                            "label": "一键切换到指定来源（配合下方开关使用）",
-                                            "items": self.__build_source_options(),
-                                            "clearable": True,
-                                            "hint": "选中后勾选右侧「立即切换到指定来源」，会把本地所有strm"
-                                            "（无论现在能不能播）强制统一改写成这个源，标题能匹配的直接换，"
-                                            "匹配不到的老集数走路径迁移，实测探测确认能连通才覆盖",
-                                            "persistent-hint": True,
-                                        },
-                                    }
-                                ],
-                            },
-                            {
-                                "component": "VCol",
-                                "props": {"cols": 12, "md": 3},
-                                "content": [
-                                    {
-                                        "component": "VSwitch",
-                                        "props": {
-                                            "model": "migrate_once",
-                                            "label": "立即切换到指定来源",
-                                        },
+                                        "props": {"model": "use_proxy", "label": "使用代理"},
                                     }
                                 ],
                             },
@@ -462,6 +474,34 @@ class ANiStrmHub(_PluginBase):
                             },
                         ],
                     },
+                    {
+                        "component": "VRow",
+                        "content": [
+                            {
+                                "component": "VCol",
+                                "props": {"cols": 12},
+                                "content": [
+                                    {
+                                        "component": "VTextarea",
+                                        "props": {
+                                            "model": "rss_sources",
+                                            "label": "数据源列表（一行一个RSS地址）",
+                                            "rows": 8,
+                                            "placeholder": DEFAULT_RSS_SOURCES,
+                                            "hint": "按行顺序依次轮询抓取，抓取失败的源自动跳过不影响其他源；"
+                                            "多个源抓到同一集时，strm里写入排序靠前的源给出的直链地址，"
+                                            "所以顺序也是直链域名的优先级——国内能直连的镜像建议放前面，"
+                                            "官方裸域名(api.ani.rip/open.ani.rip)不走代理很可能连不通，建议放最后兜底。"
+                                            "行首加 # 表示禁用这个源(已知连不上)，不要把 # 开头的行删掉/改掉，"
+                                            "不然那些已知失效的域名会被重新启用",
+                                            "persistent-hint": True,
+                                        },
+                                    }
+                                ],
+                            }
+                        ],
+                    },
+                    self.__section_title("生成规则（可选）"),
                     {
                         "component": "VRow",
                         "content": [
@@ -513,31 +553,96 @@ class ANiStrmHub(_PluginBase):
                         ],
                     },
                     {
-                        "component": "VRow",
+                        "component": "VCard",
+                        "props": {"variant": "tonal", "color": "warning", "class": "mt-4"},
                         "content": [
                             {
-                                "component": "VCol",
-                                "props": {"cols": 12},
+                                "component": "VCardTitle",
+                                "props": {"class": "text-subtitle-1"},
+                                "text": "维护操作——按需手动触发，探测/修复可能耗时几分钟",
+                            },
+                            {
+                                "component": "VCardText",
                                 "content": [
                                     {
-                                        "component": "VTextarea",
-                                        "props": {
-                                            "model": "rss_sources",
-                                            "label": "数据源列表（一行一个RSS地址）",
-                                            "rows": 8,
-                                            "placeholder": DEFAULT_RSS_SOURCES,
-                                            "hint": "按行顺序依次轮询抓取，抓取失败的源自动跳过不影响其他源；"
-                                            "多个源抓到同一集时，strm里写入排序靠前的源给出的直链地址，"
-                                            "所以顺序也是直链域名的优先级——国内能直连的镜像建议放前面，"
-                                            "官方裸域名(api.ani.rip/open.ani.rip)不走代理很可能连不通，建议放最后兜底；"
-                                            "行首加 # 可临时禁用某个源而不删除",
-                                            "persistent-hint": True,
-                                        },
-                                    }
+                                        "component": "VRow",
+                                        "content": [
+                                            {
+                                                "component": "VCol",
+                                                "props": {"cols": 12, "md": 4},
+                                                "content": [
+                                                    {
+                                                        "component": "VSwitch",
+                                                        "props": {
+                                                            "model": "detect_once",
+                                                            "label": "探测各数据源播放健康度",
+                                                        },
+                                                    }
+                                                ],
+                                            },
+                                            {
+                                                "component": "VCol",
+                                                "props": {"cols": 12, "md": 4},
+                                                "content": [
+                                                    {
+                                                        "component": "VSwitch",
+                                                        "props": {
+                                                            "model": "relink_once",
+                                                            "label": "修复本地失效链接",
+                                                        },
+                                                    }
+                                                ],
+                                            },
+                                        ],
+                                    },
+                                    {
+                                        "component": "VRow",
+                                        "content": [
+                                            {
+                                                "component": "VCol",
+                                                "props": {"cols": 12, "md": 8},
+                                                "content": [
+                                                    {
+                                                        "component": "VSelect",
+                                                        "props": {
+                                                            "model": "migrate_target_source",
+                                                            "label": "一键切换到指定来源",
+                                                            "items": self.__build_source_options(),
+                                                            "clearable": True,
+                                                            "hint": "选中后勾选右边「立即切换到指定来源」，会把本地所有strm"
+                                                            "（无论现在能不能播）强制统一改写成这个源",
+                                                            "persistent-hint": True,
+                                                        },
+                                                    }
+                                                ],
+                                            },
+                                            {
+                                                "component": "VCol",
+                                                "props": {"cols": 12, "md": 4},
+                                                "content": [
+                                                    {
+                                                        "component": "VSwitch",
+                                                        "props": {
+                                                            "model": "migrate_once",
+                                                            "label": "立即切换到指定来源",
+                                                        },
+                                                    }
+                                                ],
+                                            },
+                                        ],
+                                    },
+                                    {
+                                        "component": "div",
+                                        "props": {"class": "text-caption mt-2"},
+                                        "text": "修复失效链接：标题还在RSS窗口内的直接换成最新直链；不在窗口内的老集数，"
+                                        "从旧链接提取季度/文件名部分换上当前探测确认能连通的源的域名前缀，实测探测"
+                                        "确认可达才覆盖写入，探测不通过的保留原文件不动。运行状态和结果见下方详情页。",
+                                    },
                                 ],
-                            }
+                            },
                         ],
                     },
+                    self.__section_title("使用说明"),
                     {
                         "component": "VRow",
                         "content": [
@@ -563,19 +668,6 @@ class ANiStrmHub(_PluginBase):
                                             "variant": "tonal",
                                             "text": "emby容器需要设置代理，docker的环境变量必须要有http_proxy代理变量，大小写敏感，否则无法提取媒体信息，具体见readme.\n"
                                             "https://github.com/honue/MoviePilot-Plugins",
-                                            "style": "white-space: pre-line;",
-                                        },
-                                    },
-                                    {
-                                        "component": "VAlert",
-                                        "props": {
-                                            "type": "warning",
-                                            "variant": "tonal",
-                                            "text": "「修复本地失效链接」：勾选后立即扫描Strm存储地址下所有已存在的.strm文件，"
-                                            "重新按当前数据源列表解析直链——标题还在RSS窗口内的直接换成最新直链；"
-                                            "不在窗口内的老集数，会从旧链接里提取季度/文件名部分，换上当前排序第一个"
-                                            "可用源的域名前缀，实际探测确认能连通后才覆盖写入，探测不通过的保留原文件不动。"
-                                            "跑完在日志里看统计结果。",
                                             "style": "white-space: pre-line;",
                                         },
                                     },
@@ -623,12 +715,80 @@ class ANiStrmHub(_PluginBase):
             }
         )
 
+    TASK_LABELS = {
+        "task": "拉取新番生成strm",
+        "relink": "修复本地失效链接",
+        "detect": "探测数据源健康度",
+        "migrate": "一键切换来源",
+    }
+
     def get_page(self) -> List[dict]:
+        content: List[dict] = []
+
+        task_status = self.get_data("task_status") or {}
+        if task_status:
+            rows = []
+            for key, label in self.TASK_LABELS.items():
+                info = task_status.get(key)
+                if not info:
+                    status_text, color = "从未运行", "grey"
+                elif info.get("status") == "running":
+                    status_text, color = "🔄 运行中...", "info"
+                else:
+                    status_text, color = "✅ 已完成", "success"
+                summary = (info or {}).get("summary", "")
+                updated_at = (info or {}).get("updated_at", "")
+                rows.append(
+                    {
+                        "component": "VRow",
+                        "props": {"class": "align-center"},
+                        "content": [
+                            {
+                                "component": "VCol",
+                                "props": {"cols": 12, "md": 3},
+                                "content": [{"component": "span", "text": label}],
+                            },
+                            {
+                                "component": "VCol",
+                                "props": {"cols": 12, "md": 2},
+                                "content": [
+                                    {
+                                        "component": "VChip",
+                                        "props": {"color": color, "size": "small"},
+                                        "text": status_text,
+                                    }
+                                ],
+                            },
+                            {
+                                "component": "VCol",
+                                "props": {"cols": 12, "md": 7},
+                                "content": [
+                                    {
+                                        "component": "span",
+                                        "props": {"class": "text-caption"},
+                                        "text": f"{updated_at}  {summary}" if updated_at else "",
+                                    }
+                                ],
+                            },
+                        ],
+                    }
+                )
+            content.append(
+                {
+                    "component": "VCard",
+                    "props": {"class": "mb-4"},
+                    "content": [
+                        {"component": "VCardTitle", "text": "任务运行状态"},
+                        {"component": "VCardText", "content": rows},
+                    ],
+                }
+            )
+
         health = self.get_data("source_health") or {}
         domain_stats = self.get_data("domain_stats") or {}
 
         if not health and not domain_stats:
-            return [
+            content.append(
                 {
                     "component": "VAlert",
                     "props": {
@@ -638,9 +798,8 @@ class ANiStrmHub(_PluginBase):
                         "这里会显示每个数据源当前能不能连、以及本地已生成的strm都在用哪些域名。",
                     },
                 }
-            ]
-
-        content: List[dict] = []
+            )
+            return content
 
         if health:
             rows = []
@@ -743,7 +902,11 @@ class ANiStrmHub(_PluginBase):
             if self._scheduler:
                 self._scheduler.remove_all_jobs()
                 if self._scheduler.running:
-                    self._scheduler.shutdown()
+                    # 注意：shutdown()默认wait=True，会阻塞等正在跑的job(比如探测/修复
+                    # 这类耗时几分钟的一次性任务)跑完才返回。用户保存配置会先走到这里，
+                    # 如果上一次任务还没跑完，保存动作会被卡住——这是实测踩过的真bug，
+                    # 必须wait=False：不等，让旧job在自己的线程里跑完，保存立即返回。
+                    self._scheduler.shutdown(wait=False)
                 self._scheduler = None
         except Exception as err:
             logger.error(f"退出插件失败：{err}")
