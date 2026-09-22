@@ -1,13 +1,13 @@
 """ANiStrm插件纯逻辑单测。
 
 按V3插件开发指南要求：普通单测不依赖公网状态，外部HTTP一律mock。
-在宿主虚拟环境下运行：../MoviePilot/.venv/bin/python -m pytest tests/v3/anistrm
+在宿主虚拟环境下运行：../MoviePilot/.venv/bin/python -m pytest tests/v3/anistrmhub
 """
 from unittest.mock import MagicMock
 
 import pytest
 
-from app.plugins.anistrm import (
+from app.plugins.anistrmhub import (
     AniRssAggregator,
     StrmFileService,
     StrmRelinkService,

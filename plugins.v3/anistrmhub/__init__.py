@@ -24,14 +24,14 @@ https://api.ani.rip/ani-download.xml
 # https://openani.an-i.workers.dev/ani-download.xml  当前429(限流)，恢复后可去掉#启用"""
 
 
-class ANiStrm(_PluginBase):
-    plugin_name = "ANiStrm"
+class ANiStrmHub(_PluginBase):
+    plugin_name = "ANiStrmHub"
     plugin_desc = "多源聚合抓取ANi新番资源，自动去重轮询多个镜像，生成strm文件，mp刮削入库，媒体服务器直连播放"
-    plugin_icon = "https://raw.githubusercontent.com/oiloveio/MoviePilot-Plugins/main/icons/anistrm.png"
-    plugin_version = "3.3.0"
+    plugin_icon = "https://raw.githubusercontent.com/oiloveio/MoviePilot-Plugins/main/icons/anistrmhub.png"
+    plugin_version = "3.4.0"
     plugin_author = "honue,oiloveio"
     author_url = "https://github.com/honue"
-    plugin_config_prefix = "anistrm_"
+    plugin_config_prefix = "anistrmhub_"
     plugin_order = 15
     auth_level = 2
 
@@ -73,13 +73,13 @@ class ANiStrm(_PluginBase):
         self._client.set_use_proxy(self._use_proxy)
         self._client.set_sources(self._rss_sources)
         logger.info(
-            f"ANi-Strm配置加载：enabled={self._enabled}, onlyonce={self._onlyonce}, "
+            f"ANiStrmHub配置加载：enabled={self._enabled}, onlyonce={self._onlyonce}, "
             f"use_proxy={self._use_proxy}, storage={self._storageplace}, "
             f"数据源数={len(self._client.get_source_urls())}"
         )
 
         if not (self._enabled or self._onlyonce or self._relink_once or self._detect_once or self._migrate_once):
-            logger.info("ANi-Strm未启用且未触发立即运行，跳过任务注册")
+            logger.info("ANiStrmHub未启用且未触发立即运行，跳过任务注册")
             return
 
         self._scheduler = BackgroundScheduler(timezone=settings.TZ)
@@ -89,49 +89,49 @@ class ANiStrm(_PluginBase):
                 self._scheduler.add_job(
                     func=self.__task,
                     trigger=CronTrigger.from_crontab(self._cron),
-                    name="ANiStrm文件创建",
+                    name="ANiStrmHub文件创建",
                 )
-                logger.info(f"ANi-Strm定时任务创建成功：{self._cron}")
+                logger.info(f"ANiStrmHub定时任务创建成功：{self._cron}")
             except Exception as err:
                 logger.error(f"定时任务配置错误：{err}")
 
         if self._onlyonce:
-            logger.info("ANi-Strm服务启动，立即运行一次")
+            logger.info("ANiStrmHub服务启动，立即运行一次")
             self._scheduler.add_job(
                 func=self.__task,
                 trigger="date",
                 run_date=datetime.now(tz=pytz.timezone(settings.TZ)) + timedelta(seconds=3),
-                name="ANiStrm文件创建",
+                name="ANiStrmHub文件创建",
             )
             self._onlyonce = False
 
         if self._relink_once:
-            logger.info("ANi-Strm服务启动，立即修复本地已存在的失效链接")
+            logger.info("ANiStrmHub服务启动，立即修复本地已存在的失效链接")
             self._scheduler.add_job(
                 func=self.__relink_task,
                 trigger="date",
                 run_date=datetime.now(tz=pytz.timezone(settings.TZ)) + timedelta(seconds=3),
-                name="ANiStrm修复失效链接",
+                name="ANiStrmHub修复失效链接",
             )
             self._relink_once = False
 
         if self._detect_once:
-            logger.info("ANi-Strm服务启动，立即探测各数据源播放健康度")
+            logger.info("ANiStrmHub服务启动，立即探测各数据源播放健康度")
             self._scheduler.add_job(
                 func=self.__detect_task,
                 trigger="date",
                 run_date=datetime.now(tz=pytz.timezone(settings.TZ)) + timedelta(seconds=3),
-                name="ANiStrm探测数据源",
+                name="ANiStrmHub探测数据源",
             )
             self._detect_once = False
 
         if self._migrate_once:
-            logger.info(f"ANi-Strm服务启动，立即将本地strm一键切换到指定来源：{self._migrate_target_source}")
+            logger.info(f"ANiStrmHub服务启动，立即将本地strm一键切换到指定来源：{self._migrate_target_source}")
             self._scheduler.add_job(
                 func=self.__migrate_task,
                 trigger="date",
                 run_date=datetime.now(tz=pytz.timezone(settings.TZ)) + timedelta(seconds=3),
-                name="ANiStrm一键切换来源",
+                name="ANiStrmHub一键切换来源",
             )
             self._migrate_once = False
 
@@ -147,16 +147,16 @@ class ANiStrm(_PluginBase):
             logger.info("未配置任何数据源，任务结束")
             return
 
-        logger.info(f"ANi-Strm任务开始：数据源数={len(source_urls)}，storage={self._storageplace}")
+        logger.info(f"ANiStrmHub任务开始：数据源数={len(source_urls)}，storage={self._storageplace}")
 
         entries, source_stats = self._client.fetch_all_entries()
         logger.info(
-            "ANi-Strm数据源抓取结果："
+            "ANiStrmHub数据源抓取结果："
             + "; ".join(f"{url}={stat}" for url, stat in source_stats.items())
         )
 
         if not entries:
-            logger.warning("ANi-Strm所有数据源均不可用或无内容，本次任务结束")
+            logger.warning("ANiStrmHub所有数据源均不可用或无内容，本次任务结束")
             return
 
         total_created = 0
@@ -176,18 +176,18 @@ class ANiStrm(_PluginBase):
                 total_failed += 1
 
         logger.info(
-            f"ANi-Strm任务完成：去重后条目数={len(entries)}，"
+            f"ANiStrmHub任务完成：去重后条目数={len(entries)}，"
             f"新增={total_created}，跳过={total_exists}，失败={total_failed}"
         )
 
     def __relink_task(self):
         entries, source_stats = self._client.fetch_all_entries()
         logger.info(
-            "ANi-Strm修复链接：数据源抓取结果："
+            "ANiStrmHub修复链接：数据源抓取结果："
             + "; ".join(f"{url}={stat}" for url, stat in source_stats.items())
         )
         if not entries:
-            logger.warning("ANi-Strm修复链接：所有数据源均不可用，无法作为迁移参照，任务结束")
+            logger.warning("ANiStrmHub修复链接：所有数据源均不可用，无法作为迁移参照，任务结束")
             return
 
         title_map = {entry["title"]: entry["link"] for entry in entries}
@@ -199,7 +199,7 @@ class ANiStrm(_PluginBase):
             reference_link=reference_link,
         )
         logger.info(
-            "ANi-Strm修复链接完成："
+            "ANiStrmHub修复链接完成："
             + "，".join(f"{k}={v}" for k, v in stats.items())
         )
 
@@ -215,7 +215,7 @@ class ANiStrm(_PluginBase):
             except Exception as err:
                 probe["error"] = str(err)
                 health_results.append(probe)
-                logger.warning(f"ANi-Strm探测：{url} RSS抓取失败 - {err}")
+                logger.warning(f"ANiStrmHub探测：{url} RSS抓取失败 - {err}")
                 continue
 
             probe["rss_ok"] = True
@@ -230,7 +230,7 @@ class ANiStrm(_PluginBase):
             probe["video_ok"] = self._relink_service._verify_reachable(sample_link)
             health_results.append(probe)
             logger.info(
-                f"ANi-Strm探测：{url} -> RSS正常，样本域名={probe['sample_domain']}，"
+                f"ANiStrmHub探测：{url} -> RSS正常，样本域名={probe['sample_domain']}，"
                 f"视频直链{'可播放' if probe['video_ok'] else '连不通'}"
             )
 
@@ -245,23 +245,23 @@ class ANiStrm(_PluginBase):
             "domain_stats",
             {"checked_at": checked_at, "total": domain_stats.get("__total__", 0), "by_domain": domain_stats.get("by_domain", {})},
         )
-        logger.info(f"ANi-Strm探测完成：{len(health_results)}个源，本地strm按域名分布={domain_stats}")
+        logger.info(f"ANiStrmHub探测完成：{len(health_results)}个源，本地strm按域名分布={domain_stats}")
 
     def __migrate_task(self):
         """不管当前是否已经能播，强制把本地全部strm按标题匹配/路径迁移的方式
         统一改写成用户指定的目标数据源，路径迁移分支同样会实际探测确认可达才覆盖"""
         target = self._migrate_target_source
         if not target:
-            logger.warning("ANi-Strm一键换源：未选择目标数据源，任务结束")
+            logger.warning("ANiStrmHub一键换源：未选择目标数据源，任务结束")
             return
 
         try:
             entries = self._client.fetch_one_source(target)
         except Exception as err:
-            logger.warning(f"ANi-Strm一键换源：目标源抓取失败，任务结束：{target} - {err}")
+            logger.warning(f"ANiStrmHub一键换源：目标源抓取失败，任务结束：{target} - {err}")
             return
         if not entries:
-            logger.warning(f"ANi-Strm一键换源：目标源RSS无内容，任务结束：{target}")
+            logger.warning(f"ANiStrmHub一键换源：目标源RSS无内容，任务结束：{target}")
             return
 
         title_map = {entry["title"]: entry["link"] for entry in entries}
@@ -273,7 +273,7 @@ class ANiStrm(_PluginBase):
             reference_link=reference_link,
         )
         logger.info(
-            f"ANi-Strm一键换源完成(目标={target})："
+            f"ANiStrmHub一键换源完成(目标={target})："
             + "，".join(f"{k}={v}" for k, v in stats.items())
         )
 
@@ -693,7 +693,7 @@ class AniRssAggregator:
             try:
                 entries = self._fetch_one(url)
             except Exception as err:
-                logger.warning(f"ANi-Strm数据源抓取失败，跳过：{url} - {err}")
+                logger.warning(f"ANiStrmHub数据源抓取失败，跳过：{url} - {err}")
                 source_stats[url] = "失败"
                 continue
 
@@ -784,13 +784,13 @@ class StrmFileService:
         directory = Path(storage_path)
         file_path = directory / f"{safe_name}.strm"
         if file_path.exists():
-            logger.debug(f"ANi-Strm跳过已存在文件：{file_path.name}")
+            logger.debug(f"ANiStrmHub跳过已存在文件：{file_path.name}")
             return "exists"
 
         try:
             directory.mkdir(parents=True, exist_ok=True)
             file_path.write_text(src_url, encoding="utf-8")
-            logger.debug(f"ANi-Strm创建成功：{file_path.name}")
+            logger.debug(f"ANiStrmHub创建成功：{file_path.name}")
             return "created"
         except Exception as err:
             logger.error(f"创建strm源文件失败：{file_path.name} - {err}")
@@ -877,7 +877,7 @@ class StrmRelinkService:
 
         directory = Path(storage_path)
         if not directory.exists():
-            logger.warning(f"ANi-Strm修复链接：目录不存在，跳过 {storage_path}")
+            logger.warning(f"ANiStrmHub修复链接：目录不存在，跳过 {storage_path}")
             return stats
 
         reference_prefix = self.derive_prefix(reference_link) if reference_link else None
@@ -887,7 +887,7 @@ class StrmRelinkService:
             try:
                 old_content = strm_file.read_text(encoding="utf-8").strip()
             except Exception as err:
-                logger.warning(f"ANi-Strm修复链接：读取失败，跳过 {strm_file.name} - {err}")
+                logger.warning(f"ANiStrmHub修复链接：读取失败，跳过 {strm_file.name} - {err}")
                 stats["无法识别(保留原文件)"] += 1
                 continue
 
@@ -896,7 +896,7 @@ class StrmRelinkService:
                 if new_link != old_content:
                     strm_file.write_text(new_link, encoding="utf-8")
                     stats["标题精确匹配更新"] += 1
-                    logger.info(f"ANi-Strm修复链接：标题精确匹配更新 {strm_file.name}")
+                    logger.info(f"ANiStrmHub修复链接：标题精确匹配更新 {strm_file.name}")
                 else:
                     stats["无需更新"] += 1
                 continue
@@ -907,7 +907,7 @@ class StrmRelinkService:
 
             old_resource_path = self.extract_resource_path(old_content)
             if not old_resource_path:
-                logger.warning(f"ANi-Strm修复链接：无法从旧链接提取季度路径，跳过 {strm_file.name}")
+                logger.warning(f"ANiStrmHub修复链接：无法从旧链接提取季度路径，跳过 {strm_file.name}")
                 stats["无法识别(保留原文件)"] += 1
                 continue
 
@@ -920,9 +920,9 @@ class StrmRelinkService:
             if self._verify_reachable(candidate):
                 strm_file.write_text(candidate, encoding="utf-8")
                 stats["路径迁移成功"] += 1
-                logger.info(f"ANi-Strm修复链接：路径迁移成功 {strm_file.name}")
+                logger.info(f"ANiStrmHub修复链接：路径迁移成功 {strm_file.name}")
             else:
-                logger.warning(f"ANi-Strm修复链接：候选链接探测不可达，保留原文件 {strm_file.name}")
+                logger.warning(f"ANiStrmHub修复链接：候选链接探测不可达，保留原文件 {strm_file.name}")
                 stats["路径迁移失败(保留原文件)"] += 1
 
         return stats

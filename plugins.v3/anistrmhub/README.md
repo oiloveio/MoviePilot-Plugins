@@ -1,11 +1,15 @@
-- [1. ANi-Strm插件](#MoviePilot-x-ANi-Strm)
+- [1. ANiStrmHub插件](#MoviePilot-x-ANi-Strm)
     - [2023-10秋 刮削效果](#2023-10秋-刮削效果)
     - [注意事项](#注意事项)
     - [Todo](#Todo)
 
+## 改名说明
+
+本插件原名 ANi-Strm，是 honue 原版的 fork。为避免和 honue 原版及其他 fork（ANiStrmPlus、ANiStrmPro 等）撞插件 ID，从 v3.4.0 起插件 ID/类名/目录名统一改为 **ANiStrmHub**。已安装旧版 ANiStrm 的需要按新 ID 重新安装（视为不同插件，配置不会自动迁移）。
+
 ## V3 插件规范说明
 
-本插件按 [MoviePilot 插件开发指南（V3）](https://github.com/jxxghp/MoviePilot-Plugins/blob/main/docs/Plugin_Development.md) 组织：插件目录 `plugins.v3/anistrm/`，导入统一走 `app.sdk.*` 稳定出口（`app.sdk.config`/`app.sdk.logging`/`app.sdk.network`），不使用 `app.core.*`/`app.utils.*`/`app.log` 等旧路径。索引信息见仓库根目录 `package.v3.json`。
+本插件按 [MoviePilot 插件开发指南（V3）](https://github.com/jxxghp/MoviePilot-Plugins/blob/main/docs/Plugin_Development.md) 组织：插件目录 `plugins.v3/anistrmhub/`，导入统一走 `app.sdk.*` 稳定出口（`app.sdk.config`/`app.sdk.logging`/`app.sdk.network`），不使用 `app.core.*`/`app.utils.*`/`app.log` 等旧路径。索引信息见仓库根目录 `package.v3.json`。
 
 ## 2023-10秋 刮削效果
 

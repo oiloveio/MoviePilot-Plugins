@@ -1,12 +1,12 @@
-### MoviePilot-Plugins（ANi-Strm 专项 Fork）
+### MoviePilot-Plugins（ANiStrmHub 专项 Fork）
 
 本仓库是给 [MoviePilot](https://github.com/jxxghp/MoviePilot) 用的第三方插件仓库，感谢 [jxxghp](https://github.com/jxxghp) 开发并开源 MoviePilot 本体。
 
 本仓库 fork 自 [honue/MoviePilot-Plugins](https://github.com/honue/MoviePilot-Plugins/)，感谢原作者 [honue](https://github.com/honue) 开源的 ANi-Strm 插件与整套 MoviePilot 插件体系，本 fork 是在他的实现基础上做的。
 
-本 fork 只保留并深度改造了 **ANi-Strm** 一个插件，其余插件请前往上游仓库获取。
+本 fork 只保留并深度改造了原来的 **ANi-Strm** 一个插件，其余插件请前往上游仓库获取。插件已改名为 **ANiStrmHub**（插件 ID/类名/目录名同步改），避免与 honue 原版及其他 fork（ANiStrmPlus、ANiStrmPro 等）撞插件 ID，装的时候认这个新名字。
 
-- [ANi-Strm插件](./plugins.v3/anistrm/README.md)
+- [ANiStrmHub插件](./plugins.v3/anistrmhub/README.md)
 
 > 多源聚合抓取 ANi 新番资源直链，自动去重、轮询多个镜像容灾，生成 strm 文件，由 mp 刮削入库，媒体服务器直连播放
 
@@ -17,13 +17,13 @@
 ```text
 MoviePilot-Plugins/
 ├── plugins.v3/
-│   └── anistrm/
+│   └── anistrmhub/
 │       ├── __init__.py
 │       ├── README.md
 │       └── img/
 ├── tests/
 │   └── v3/
-│       └── anistrm/
+│       └── anistrmhub/
 │           └── test_plugin.py
 └── package.v3.json
 ```
