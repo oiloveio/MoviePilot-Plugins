@@ -3,6 +3,21 @@
     - [注意事项](#注意事项)
     - [Todo](#Todo)
 
+## v3.8.0 更新：本地strm一键套代理前缀
+
+**背景**：用户国内网络下 ANi 官方域名直连不通，需要走代理/反代镜像才能访问；本地已经攒了一批 strm 是裸官方地址（`resources.ani.rip`），想批量给它们套上一个能连通的镜像地址。
+
+**这不是"域名替换"，是"前缀拼接"**——这两种转换结果不一样，容易搞混：
+
+- 域名替换（`修复失效链接`/`一键切换来源`用的方式，`derive_prefix`+`extract_resource_path`）：`https://resources.ani.rip/2025-10/xxx?d=mp4` → 丢掉`resources.ani.rip`，换成`https://pro.pili.cc.cd/2025-10/xxx?d=mp4`
+- 前缀拼接（这次新增的`proxy_prefix`用的方式，`build_proxied_url`）：保留原host，整体包一层 → `https://pro.pili.cc.cd/resources.ani.rip/2025-10/xxx?d=mp4`
+
+后者才是 pili/op5 这类"Proxy Everything"反代实际生成 RSS 时用的真实格式（已经实测确认），也是用户明确要求的效果。两种转换公式不能混用。
+
+**用法**：配置页填一个代理前缀（如`https://pro.pili.cc.cd`），勾选「立即给本地strm套上代理前缀」。扫描`storageplace`下所有`.strm`文件，不管当前是裸官方地址还是已经走了别的镜像，整体包一层新前缀；如果内容已经以这个前缀开头就跳过（不重复叠加）；写入前用`probe_latency_ms`实测确认新地址可达，探测不通过的保留原文件不动。
+
+真实网络端到端验证过：3个裸官方地址的strm全部正确套上`pro.pili.cc.cd`前缀，格式和实测的 pili 真实RSS格式完全一致。
+
 ## v3.7.0 更新
 
 装了v3.6.0之后用户反馈修复链接**仍然**大量"候选链接探测不可达"，怀疑是不是插件没有文件写权限。排查过程：

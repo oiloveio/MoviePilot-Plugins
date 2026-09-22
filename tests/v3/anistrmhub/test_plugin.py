@@ -472,3 +472,103 @@ class TestSeasonFilter:
         plugin._season_filter = ["2026-4", "2025-10"]
         result = getattr(plugin, "_ANiStrmHub__apply_season_filter")(self.ENTRIES)
         assert [e["title"] for e in result] == ["b", "c"]
+
+
+class TestBuildProxiedUrl:
+    # 借鉴用户实测确认的"Proxy Everything"风格前缀拼接格式：
+    # 代理前缀 + 原host + 原path + 原query，保留原host(不是域名替换)
+
+    def test_wraps_bare_official_link(self):
+        result = StrmRelinkService.build_proxied_url(
+            "https://resources.ani.rip/2025-10/xxx?d=mp4", "https://pro.pili.cc.cd"
+        )
+        assert result == "https://pro.pili.cc.cd/resources.ani.rip/2025-10/xxx?d=mp4"
+
+    def test_wraps_link_without_query(self):
+        result = StrmRelinkService.build_proxied_url(
+            "https://resources.ani.rip/2025-10/xxx.mp4", "https://pro.pili.cc.cd"
+        )
+        assert result == "https://pro.pili.cc.cd/resources.ani.rip/2025-10/xxx.mp4"
+
+    def test_strips_trailing_slash_on_prefix(self):
+        result = StrmRelinkService.build_proxied_url(
+            "https://resources.ani.rip/2025-10/xxx?d=mp4", "https://pro.pili.cc.cd/"
+        )
+        assert result == "https://pro.pili.cc.cd/resources.ani.rip/2025-10/xxx?d=mp4"
+
+    def test_does_not_double_wrap_already_proxied_link(self):
+        already = "https://pro.pili.cc.cd/resources.ani.rip/2025-10/xxx?d=mp4"
+        result = StrmRelinkService.build_proxied_url(already, "https://pro.pili.cc.cd")
+        assert result == already
+
+    def test_can_rewrap_link_proxied_by_a_different_prefix(self):
+        # 已经走了op5的壳，现在想统一换成pili——应该整体再包一层，
+        # 不需要先识别/剥离旧前缀，效果上等同于换了个代理
+        already_op5 = "https://pro.op5.de5.net/resources.ani.rip/2025-10/xxx?d=mp4"
+        result = StrmRelinkService.build_proxied_url(already_op5, "https://pro.pili.cc.cd")
+        assert result == "https://pro.pili.cc.cd/pro.op5.de5.net/resources.ani.rip/2025-10/xxx?d=mp4"
+
+
+class TestApplyProxyPrefixTask:
+    def _make_plugin(self, reachable: bool):
+        plugin = ANiStrmHub()
+        request_utils = MagicMock()
+        request_utils.get_res.return_value = MagicMock(status_code=206 if reachable else 403)
+        plugin._relink_service._request_factory = lambda: request_utils
+        return plugin
+
+    def test_wraps_bare_links_when_reachable(self, tmp_path):
+        plugin = self._make_plugin(reachable=True)
+        plugin._storageplace = str(tmp_path)
+        plugin._proxy_prefix = "https://pro.pili.cc.cd"
+        strm_file = tmp_path / "示例.mp4.strm"
+        strm_file.write_text("https://resources.ani.rip/2025-10/xxx?d=mp4", encoding="utf-8")
+
+        getattr(plugin, "_ANiStrmHub__apply_proxy_prefix_task")()
+
+        assert strm_file.read_text().strip() == "https://pro.pili.cc.cd/resources.ani.rip/2025-10/xxx?d=mp4"
+        status = plugin.get_data("task_status")["proxy_prefix"]
+        assert status["status"] == "done"
+        assert "已套上代理=1" in status["summary"]
+
+    def test_keeps_original_when_probe_fails(self, tmp_path):
+        plugin = self._make_plugin(reachable=False)
+        plugin._storageplace = str(tmp_path)
+        plugin._proxy_prefix = "https://pro.pili.cc.cd"
+        strm_file = tmp_path / "示例.mp4.strm"
+        original = "https://resources.ani.rip/2025-10/xxx?d=mp4"
+        strm_file.write_text(original, encoding="utf-8")
+
+        getattr(plugin, "_ANiStrmHub__apply_proxy_prefix_task")()
+
+        assert strm_file.read_text().strip() == original
+        status = plugin.get_data("task_status")["proxy_prefix"]
+        assert "探测不可达(保留原文件)=1" in status["summary"]
+
+    def test_skips_when_already_wrapped(self, tmp_path):
+        plugin = self._make_plugin(reachable=True)
+        plugin._storageplace = str(tmp_path)
+        plugin._proxy_prefix = "https://pro.pili.cc.cd"
+        strm_file = tmp_path / "示例.mp4.strm"
+        already = "https://pro.pili.cc.cd/resources.ani.rip/2025-10/xxx?d=mp4"
+        strm_file.write_text(already, encoding="utf-8")
+
+        getattr(plugin, "_ANiStrmHub__apply_proxy_prefix_task")()
+
+        assert strm_file.read_text().strip() == already
+        status = plugin.get_data("task_status")["proxy_prefix"]
+        assert "无需更新(已套过)=1" in status["summary"]
+
+    def test_no_proxy_prefix_configured_is_a_noop(self, tmp_path):
+        plugin = self._make_plugin(reachable=True)
+        plugin._storageplace = str(tmp_path)
+        plugin._proxy_prefix = ""
+        strm_file = tmp_path / "示例.mp4.strm"
+        original = "https://resources.ani.rip/2025-10/xxx?d=mp4"
+        strm_file.write_text(original, encoding="utf-8")
+
+        getattr(plugin, "_ANiStrmHub__apply_proxy_prefix_task")()
+
+        assert strm_file.read_text().strip() == original
+        status = plugin.get_data("task_status")["proxy_prefix"]
+        assert status["summary"] == "未配置代理地址"

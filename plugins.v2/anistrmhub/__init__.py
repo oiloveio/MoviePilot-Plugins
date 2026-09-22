@@ -37,7 +37,7 @@ class ANiStrmHub(_PluginBase):
     plugin_name = "ANiStrmHub"
     plugin_desc = "多源聚合抓取ANi新番资源，自动去重轮询多个镜像，生成strm文件，mp刮削入库，媒体服务器直连播放"
     plugin_icon = "https://raw.githubusercontent.com/oiloveio/MoviePilot-Plugins/main/icons/anistrmhub.png"
-    plugin_version = "3.7.0"
+    plugin_version = "3.8.0"
     plugin_author = "oiloveio,honue"
     author_url = "https://github.com/honue"
     plugin_config_prefix = "anistrmhub_"
@@ -58,6 +58,8 @@ class ANiStrmHub(_PluginBase):
     _filename_blacklist = ""
     _season_dir = False
     _season_filter: List[str] = ["all"]
+    _proxy_prefix = ""
+    _apply_proxy_prefix_once = False
     _scheduler: Optional[BackgroundScheduler] = None
 
     def __init__(self):
@@ -84,6 +86,8 @@ class ANiStrmHub(_PluginBase):
         self._filename_blacklist = config.get("filename_blacklist") or ""
         self._season_dir = config.get("season_dir", False)
         self._season_filter = config.get("season_filter") or ["all"]
+        self._proxy_prefix = config.get("proxy_prefix") or ""
+        self._apply_proxy_prefix_once = config.get("apply_proxy_prefix_once", False)
         self._rss_sources = config.get("rss_sources")
         if not self._rss_sources:
             self._rss_sources = DEFAULT_RSS_SOURCES
@@ -95,7 +99,14 @@ class ANiStrmHub(_PluginBase):
             f"数据源数={len(self._client.get_source_urls())}"
         )
 
-        if not (self._enabled or self._onlyonce or self._relink_once or self._detect_once or self._migrate_once):
+        if not (
+            self._enabled
+            or self._onlyonce
+            or self._relink_once
+            or self._detect_once
+            or self._migrate_once
+            or self._apply_proxy_prefix_once
+        ):
             logger.info("ANiStrmHub未启用且未触发立即运行，跳过任务注册")
             return
 
@@ -160,6 +171,19 @@ class ANiStrmHub(_PluginBase):
                     name="ANiStrmHub一键切换来源",
                 )
             self._migrate_once = False
+
+        if self._apply_proxy_prefix_once:
+            if self.__is_task_running("proxy_prefix"):
+                logger.warning("ANiStrmHub套代理前缀：上一次任务还在运行中，本次跳过排队，等它跑完再重新勾选")
+            else:
+                logger.info(f"ANiStrmHub服务启动，立即给本地strm套上代理前缀：{self._proxy_prefix}")
+                self._scheduler.add_job(
+                    func=self.__apply_proxy_prefix_task,
+                    trigger="date",
+                    run_date=datetime.now(tz=pytz.timezone(settings.TZ)) + timedelta(seconds=3),
+                    name="ANiStrmHub套代理前缀",
+                )
+            self._apply_proxy_prefix_once = False
 
         self.__update_config()
 
@@ -450,6 +474,66 @@ class ANiStrmHub(_PluginBase):
         summary = "，".join(f"{k}={v}" for k, v in stats.items())
         logger.info(f"ANiStrmHub一键换源完成(目标={target})：{summary}")
         self.__save_task_status("migrate", "done", summary)
+
+    def __apply_proxy_prefix_task(self):
+        """给本地已存在的strm文件统一套上一层用户指定的代理/加速地址前缀。
+
+        跟"修复失效链接"/"一键换源"不同：那两个要先抓RSS重新识别内容(标题匹配
+        或路径迁移)；这个不关心内容是否还在RSS窗口内，纯粹是"把当前存的链接
+        整体包一层代理前缀"——不管原链接现在是裸官方地址还是已经走了别的镜像，
+        格式仿"Proxy Everything"这类通用反代：新地址 = 代理前缀 + 原host + 原
+        path + 原query。写入前依然会实测探测确认可达才覆盖，不会无脑批量替换。
+        """
+        self.__save_task_status("proxy_prefix", "running", "进行中")
+        proxy_prefix = (self._proxy_prefix or "").strip()
+        if not proxy_prefix:
+            logger.warning("ANiStrmHub套代理前缀：未配置代理/加速地址，任务结束")
+            self.__save_task_status("proxy_prefix", "done", "未配置代理地址")
+            return
+
+        directory = Path(self._storageplace)
+        if not directory.exists():
+            logger.warning(f"ANiStrmHub套代理前缀：目录不存在 {self._storageplace}")
+            self.__save_task_status("proxy_prefix", "done", "存储目录不存在")
+            return
+
+        stats = {
+            "已套上代理": 0,
+            "无需更新(已套过)": 0,
+            "探测不可达(保留原文件)": 0,
+            "无法识别(保留原文件)": 0,
+        }
+        for strm_file in sorted(directory.rglob("*.strm")):
+            try:
+                old_content = strm_file.read_text(encoding="utf-8").strip()
+            except Exception as err:
+                logger.warning(f"ANiStrmHub套代理前缀：读取失败，跳过 {strm_file.name} - {err}")
+                stats["无法识别(保留原文件)"] += 1
+                continue
+
+            if not old_content.startswith(("http://", "https://")):
+                logger.warning(f"ANiStrmHub套代理前缀：内容不是有效URL，跳过 {strm_file.name}")
+                stats["无法识别(保留原文件)"] += 1
+                continue
+
+            new_link = StrmRelinkService.build_proxied_url(old_content, proxy_prefix)
+            if new_link == old_content:
+                stats["无需更新(已套过)"] += 1
+                continue
+
+            time.sleep(0.3)
+            latency_ms, fail_reason = self._relink_service.probe_latency_ms(new_link)
+            if latency_ms is not None:
+                strm_file.write_text(new_link, encoding="utf-8")
+                stats["已套上代理"] += 1
+                logger.info(f"ANiStrmHub套代理前缀：成功({latency_ms}ms) {strm_file.name}")
+            else:
+                logger.warning(f"ANiStrmHub套代理前缀：候选链接探测不可达({fail_reason})，保留原文件 {strm_file.name}")
+                stats["探测不可达(保留原文件)"] += 1
+
+        summary = "，".join(f"{k}={v}" for k, v in stats.items())
+        logger.info(f"ANiStrmHub套代理前缀完成：{summary}")
+        self.__save_task_status("proxy_prefix", "done", summary)
 
     def __save_task_status(self, task_key: str, status: str, summary: str = ""):
         """记录一次性任务(拉取/修复/探测/换源)的运行状态，供详情页展示进度，
@@ -755,6 +839,45 @@ class ANiStrmHub(_PluginBase):
                                         ],
                                     },
                                     {
+                                        "component": "VRow",
+                                        "content": [
+                                            {
+                                                "component": "VCol",
+                                                "props": {"cols": 12, "md": 8},
+                                                "content": [
+                                                    {
+                                                        "component": "VTextField",
+                                                        "props": {
+                                                            "model": "proxy_prefix",
+                                                            "label": "本地strm一键套代理前缀",
+                                                            "placeholder": "https://pro.pili.cc.cd",
+                                                            "hint": "把本地已有strm的链接整体包一层这个代理地址(不管现在是裸官方"
+                                                            "地址还是走了别的镜像)，格式是「代理前缀+原链接」，"
+                                                            "比如resources.ani.rip/2025-10/xxx?d=mp4 套上"
+                                                            "https://pro.pili.cc.cd 会变成"
+                                                            "https://pro.pili.cc.cd/resources.ani.rip/2025-10/xxx?d=mp4。"
+                                                            "写入前会实测探测确认可达，探测不通过的保留原文件不动",
+                                                            "persistent-hint": True,
+                                                        },
+                                                    }
+                                                ],
+                                            },
+                                            {
+                                                "component": "VCol",
+                                                "props": {"cols": 12, "md": 4},
+                                                "content": [
+                                                    {
+                                                        "component": "VSwitch",
+                                                        "props": {
+                                                            "model": "apply_proxy_prefix_once",
+                                                            "label": "立即给本地strm套上代理前缀",
+                                                        },
+                                                    }
+                                                ],
+                                            },
+                                        ],
+                                    },
+                                    {
                                         "component": "div",
                                         "props": {"class": "text-caption mt-2"},
                                         "text": "修复失效链接：标题还在RSS窗口内的直接换成最新直链；不在窗口内的老集数，"
@@ -813,6 +936,8 @@ class ANiStrmHub(_PluginBase):
             "filename_blacklist": "",
             "season_dir": False,
             "season_filter": ["all"],
+            "proxy_prefix": "",
+            "apply_proxy_prefix_once": False,
             "rss_sources": DEFAULT_RSS_SOURCES,
             "cron": "20 22,23,0,1 * * *",
         }
@@ -836,6 +961,8 @@ class ANiStrmHub(_PluginBase):
                 "filename_blacklist": self._filename_blacklist,
                 "season_dir": self._season_dir,
                 "season_filter": self._season_filter,
+                "proxy_prefix": self._proxy_prefix,
+                "apply_proxy_prefix_once": self._apply_proxy_prefix_once,
                 "rss_sources": self._rss_sources,
             }
         )
@@ -845,6 +972,7 @@ class ANiStrmHub(_PluginBase):
         "relink": "修复本地失效链接",
         "detect": "探测数据源健康度",
         "migrate": "一键切换来源",
+        "proxy_prefix": "套代理前缀",
     }
 
     def get_page(self) -> List[dict]:
@@ -1265,6 +1393,27 @@ class StrmRelinkService:
         if not resource_path:
             return None
         return url[: url.index(resource_path)]
+
+    @staticmethod
+    def build_proxied_url(original_link: str, proxy_prefix: str) -> str:
+        """把原始链接整体包一层反代前缀，格式仿"Proxy Everything"这类通用反代
+        工具的用法：新地址 = 代理前缀 + / + 原host + 原path + 原query。
+
+        例：原链接 https://resources.ani.rip/2025-10/xxx?d=mp4，
+        代理前缀 https://pro.pili.cc.cd，
+        结果 https://pro.pili.cc.cd/resources.ani.rip/2025-10/xxx?d=mp4
+
+        跟derive_prefix/extract_resource_path那套"域名替换"(丢掉原host)是
+        两种不同的转换——这个是"前缀拼接"(保留原host)，按用户实测确认的
+        真实反代格式来，两者不要混用。"""
+        proxy_prefix = proxy_prefix.rstrip("/")
+        if original_link.startswith(proxy_prefix + "/"):
+            return original_link  # 已经套过这层代理，不重复叠加
+        parsed = urlparse(original_link)
+        suffix = parsed.netloc + parsed.path
+        if parsed.query:
+            suffix += "?" + parsed.query
+        return f"{proxy_prefix}/{suffix}"
 
     def probe_latency_ms(self, url: str) -> Tuple[Optional[float], Optional[str]]:
         """探测直链能不能连通、连通要多久（只请求1个字节，类似ping）。
