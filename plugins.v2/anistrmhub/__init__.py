@@ -37,8 +37,8 @@ class ANiStrmHub(_PluginBase):
     plugin_name = "ANiStrmHub"
     plugin_desc = "多源聚合抓取ANi新番资源，自动去重轮询多个镜像，生成strm文件，mp刮削入库，媒体服务器直连播放"
     plugin_icon = "https://raw.githubusercontent.com/oiloveio/MoviePilot-Plugins/main/icons/anistrmhub.png"
-    plugin_version = "3.6.0"
-    plugin_author = "honue,oiloveio"
+    plugin_version = "3.7.0"
+    plugin_author = "oiloveio,honue"
     author_url = "https://github.com/honue"
     plugin_config_prefix = "anistrmhub_"
     plugin_order = 15
@@ -57,6 +57,7 @@ class ANiStrmHub(_PluginBase):
     _filename_remove = ""
     _filename_blacklist = ""
     _season_dir = False
+    _season_filter: List[str] = ["all"]
     _scheduler: Optional[BackgroundScheduler] = None
 
     def __init__(self):
@@ -82,6 +83,7 @@ class ANiStrmHub(_PluginBase):
         self._filename_remove = config.get("filename_remove") or ""
         self._filename_blacklist = config.get("filename_blacklist") or ""
         self._season_dir = config.get("season_dir", False)
+        self._season_filter = config.get("season_filter") or ["all"]
         self._rss_sources = config.get("rss_sources")
         if not self._rss_sources:
             self._rss_sources = DEFAULT_RSS_SOURCES
@@ -165,22 +167,86 @@ class ANiStrmHub(_PluginBase):
             self._scheduler.print_jobs()
             self._scheduler.start()
 
-    def __pick_healthy_reference_link(self) -> Optional[str]:
-        """按配置顺序依次探测各数据源，返回第一个RSS能拉到、且样本视频直链实测
-        能连通的link，供路径迁移当参照。不像修复失效链接前那样盲信"合并列表第
-        一条"——那条可能来自一个RSS通但视频域名连不上的源(比如意外被启用的
-        官方裸域名在国内被墙)，会导致所有路径迁移候选都探测超时。"""
+    def __pick_healthy_reference_links(self) -> List[str]:
+        """按配置顺序依次探测各数据源，返回所有当前RSS能拉到、且样本视频直链实测
+        能连通的link列表(保持优先级顺序)，供路径迁移当候选参照。
+
+        v3.6.0只返回"第一个能用的"当唯一参照，实测暴露了问题：修复几十上百个
+        文件是个持续几分钟的长任务，如果这唯一参照源中途被限流/抖动一下(社区
+        镜像这类轻量Worker代理很容易被这样打到)，后面所有候选就会一起失败，
+        表现成一长串"探测不可达"，容易被误以为是权限或者数据问题。改成返回
+        全部健康候选，relink_existing对每个文件按顺序逐个候选前缀尝试，一个
+        不通换下一个，不会被单个源的抖动拖累整批。"""
+        healthy_links: List[str] = []
         for url in self._client.get_source_urls():
             try:
                 entries = self._client.fetch_one_source(url)
-            except Exception:
+            except Exception as err:
+                logger.debug(f"ANiStrmHub选参照源：{url} RSS抓取失败 - {err}")
                 continue
             if not entries:
                 continue
             sample_link = entries[0]["link"]
-            if self._relink_service._verify_reachable(sample_link):
-                return sample_link
-        return None
+            latency_ms, fail_reason = self._relink_service.probe_latency_ms(sample_link)
+            if latency_ms is not None:
+                logger.info(f"ANiStrmHub选参照源：{url} 样本直链{latency_ms}ms可达，加入候选")
+                healthy_links.append(sample_link)
+            else:
+                logger.info(f"ANiStrmHub选参照源：{url} 样本直链不可达({fail_reason})，跳过")
+        return healthy_links
+
+    def __build_season_options(self) -> List[Dict[str, str]]:
+        """拉一个源的样本条目，从里面提取当前RSS窗口内出现过的季度，供配置页
+        「拉取季度筛选」下拉用。跟honue原版的"季度多选"不是一回事——原版靠的是
+        目录扫描API(能列出所有历史季度文件夹)，那套接口已经确认死了(见docs)；
+        这里只能从RSS滚动窗口(近期约50~60条)里已经出现的季度里选，选不到
+        没在窗口内的老季度。只探测第一个配置源，避免每次打开配置页都要挨个
+        源发请求，够用就行不用太精确。"""
+        seasons = set()
+        source_urls = self._client.get_source_urls()
+        if source_urls:
+            try:
+                entries = self._client.fetch_one_source(source_urls[0])
+            except Exception:
+                entries = []
+            for entry in entries:
+                match = SEASON_RE.search(entry.get("link", ""))
+                if match:
+                    seasons.add(match.group(1))
+        sorted_seasons = sorted(seasons, key=lambda s: tuple(map(int, s.split("-"))), reverse=True)
+        return [
+            {"title": "不筛选(全部)", "value": "all"},
+            {"title": "最新季(RSS窗口内)", "value": "latest"},
+        ] + [{"title": season, "value": season} for season in sorted_seasons]
+
+    def __apply_season_filter(self, entries: List[Dict[str, str]]) -> List[Dict[str, str]]:
+        if not self._season_filter or "all" in self._season_filter:
+            return entries
+
+        all_seasons = set()
+        for entry in entries:
+            match = SEASON_RE.search(entry["link"])
+            if match:
+                all_seasons.add(match.group(1))
+
+        target_seasons = set(s for s in self._season_filter if s not in ("all", "latest"))
+        if "latest" in self._season_filter and all_seasons:
+            target_seasons.add(max(all_seasons, key=lambda s: tuple(map(int, s.split("-")))))
+
+        if not target_seasons:
+            return entries
+
+        filtered = []
+        for entry in entries:
+            match = SEASON_RE.search(entry["link"])
+            if match and match.group(1) in target_seasons:
+                filtered.append(entry)
+
+        logger.info(
+            f"ANiStrmHub季度筛选：配置={self._season_filter} -> 命中季度={sorted(target_seasons)}，"
+            f"{len(entries)}条筛选为{len(filtered)}条"
+        )
+        return filtered
 
     def __task(self):
         self.__save_task_status("task", "running", "进行中")
@@ -201,6 +267,12 @@ class ANiStrmHub(_PluginBase):
         if not entries:
             logger.warning("ANiStrmHub所有数据源均不可用或无内容，本次任务结束")
             self.__save_task_status("task", "done", "所有数据源均不可用")
+            return
+
+        entries = self.__apply_season_filter(entries)
+        if not entries:
+            logger.warning("ANiStrmHub季度筛选后没有条目，本次任务结束")
+            self.__save_task_status("task", "done", "季度筛选后无条目")
             return
 
         total_created = 0
@@ -257,15 +329,17 @@ class ANiStrmHub(_PluginBase):
             StrmFileService.clean_file_name(entry["title"], self._filename_remove): entry["link"]
             for entry in entries
         }
-        reference_link = self.__pick_healthy_reference_link()
-        if not reference_link:
+        reference_links = self.__pick_healthy_reference_links()
+        if not reference_links:
             logger.warning("ANiStrmHub修复链接：所有数据源的视频直链探测都不通，路径迁移这部分会全部失败")
-            reference_link = entries[0]["link"]
+            reference_links = [entries[0]["link"]]
+        else:
+            logger.info(f"ANiStrmHub修复链接：候选参照源共{len(reference_links)}个，按顺序逐个尝试")
 
         stats = self._relink_service.relink_existing(
             storage_path=self._storageplace,
             title_map=title_map,
-            reference_link=reference_link,
+            reference_links=reference_links,
         )
         summary = "，".join(f"{k}={v}" for k, v in stats.items())
         logger.info(f"ANiStrmHub修复链接完成：{summary}")
@@ -273,12 +347,21 @@ class ANiStrmHub(_PluginBase):
 
     def __detect_task(self):
         """探测每个已启用数据源当前是否真的能播（RSS可拉 + 视频直链域名可连），
-        顺带统计本地已生成strm按域名的分布，结果存起来给详情页展示"""
+        能连的再实测延迟(类似ping)和下载一小段测网速(类似测速)，挑网速最快的
+        标为推荐节点。顺带统计本地已生成strm按域名的分布，结果存起来给详情页展示"""
         self.__save_task_status("detect", "running", "进行中")
         source_urls = self._client.get_source_urls()
         health_results = []
         for url in source_urls:
-            probe = {"source": url, "rss_ok": False, "video_ok": False, "sample_domain": None, "error": None}
+            probe = {
+                "source": url,
+                "rss_ok": False,
+                "video_ok": False,
+                "sample_domain": None,
+                "latency_ms": None,
+                "speed_kbps": None,
+                "error": None,
+            }
             try:
                 entries = self._client.fetch_one_source(url)
             except Exception as err:
@@ -296,12 +379,24 @@ class ANiStrmHub(_PluginBase):
             sample_link = entries[0]["link"]
             probe["sample_domain"] = urlparse(sample_link).netloc
             time.sleep(0.3)
-            probe["video_ok"] = self._relink_service._verify_reachable(sample_link)
+            latency_ms, fail_reason = self._relink_service.probe_latency_ms(sample_link)
+            probe["video_ok"] = latency_ms is not None
+            probe["latency_ms"] = latency_ms
+            if probe["video_ok"]:
+                probe["speed_kbps"] = self._relink_service.probe_speed_kbps(sample_link)
+                logger.info(
+                    f"ANiStrmHub探测：{url} -> RSS正常，样本域名={probe['sample_domain']}，"
+                    f"延迟={latency_ms}ms，网速={probe['speed_kbps']}KB/s"
+                )
+            else:
+                probe["error"] = fail_reason
+                logger.info(f"ANiStrmHub探测：{url} -> RSS正常，视频直链连不上({fail_reason})")
             health_results.append(probe)
-            logger.info(
-                f"ANiStrmHub探测：{url} -> RSS正常，样本域名={probe['sample_domain']}，"
-                f"视频直链{'可播放' if probe['video_ok'] else '连不通'}"
-            )
+
+        reachable = [p for p in health_results if p.get("video_ok")]
+        if reachable:
+            fastest = max(reachable, key=lambda p: p.get("speed_kbps") or 0)
+            fastest["recommended"] = True
 
         domain_stats = self._relink_service.scan_domain_distribution(self._storageplace)
 
@@ -343,12 +438,14 @@ class ANiStrmHub(_PluginBase):
             StrmFileService.clean_file_name(entry["title"], self._filename_remove): entry["link"]
             for entry in entries
         }
-        reference_link = entries[0]["link"]
+        # 一键换源就是要强制换到用户选的这一个，不做候选兜底——
+        # 跟修复链接的"多候选轮询"语义不同，这里只传单一目标
+        reference_links = [entries[0]["link"]]
 
         stats = self._relink_service.relink_existing(
             storage_path=self._storageplace,
             title_map=title_map,
-            reference_link=reference_link,
+            reference_links=reference_links,
         )
         summary = "，".join(f"{k}={v}" for k, v in stats.items())
         logger.info(f"ANiStrmHub一键换源完成(目标={target})：{summary}")
@@ -499,6 +596,32 @@ class ANiStrmHub(_PluginBase):
                                     }
                                 ],
                             }
+                        ],
+                    },
+                    {
+                        "component": "VRow",
+                        "content": [
+                            {
+                                "component": "VCol",
+                                "props": {"cols": 12, "md": 6},
+                                "content": [
+                                    {
+                                        "component": "VSelect",
+                                        "props": {
+                                            "model": "season_filter",
+                                            "label": "拉取季度筛选",
+                                            "items": self.__build_season_options(),
+                                            "multiple": True,
+                                            "chips": True,
+                                            "clearable": True,
+                                            "hint": "只在当前RSS滚动窗口(近期约50~60条)里筛选，不是补历史季度——"
+                                            "那需要目录扫描接口，已确认失效。默认「不筛选」处理窗口内全部；"
+                                            "选「最新季」只处理窗口里季度最新的那批；也可以手动选具体季度",
+                                            "persistent-hint": True,
+                                        },
+                                    }
+                                ],
+                            },
                         ],
                     },
                     self.__section_title("生成规则（可选）"),
@@ -689,6 +812,7 @@ class ANiStrmHub(_PluginBase):
             "filename_remove": "",
             "filename_blacklist": "",
             "season_dir": False,
+            "season_filter": ["all"],
             "rss_sources": DEFAULT_RSS_SOURCES,
             "cron": "20 22,23,0,1 * * *",
         }
@@ -711,6 +835,7 @@ class ANiStrmHub(_PluginBase):
                 "filename_remove": self._filename_remove,
                 "filename_blacklist": self._filename_blacklist,
                 "season_dir": self._season_dir,
+                "season_filter": self._season_filter,
                 "rss_sources": self._rss_sources,
             }
         )
@@ -810,7 +935,27 @@ class ANiStrmHub(_PluginBase):
                     status_text, status_color = "⚠️ RSS通但视频连不上", "warning"
                 else:
                     status_text, status_color = "❌ 不可用", "error"
-                detail = probe.get("sample_domain") or probe.get("error") or ""
+
+                perf_parts = []
+                if probe.get("latency_ms") is not None:
+                    perf_parts.append(f"延迟{probe['latency_ms']:.0f}ms")
+                if probe.get("speed_kbps") is not None:
+                    speed = probe["speed_kbps"]
+                    perf_parts.append(f"{speed / 1024:.1f}MB/s" if speed >= 1024 else f"{speed:.0f}KB/s")
+                if not perf_parts:
+                    perf_parts.append(probe.get("sample_domain") or probe.get("error") or "")
+                detail = " · ".join(perf_parts)
+
+                source_cell = [{"component": "span", "text": probe.get("source")}]
+                if probe.get("recommended"):
+                    source_cell.append(
+                        {
+                            "component": "VChip",
+                            "props": {"color": "primary", "size": "x-small", "class": "ml-2"},
+                            "text": "🚀 推荐",
+                        }
+                    )
+
                 rows.append(
                     {
                         "component": "VRow",
@@ -818,12 +963,12 @@ class ANiStrmHub(_PluginBase):
                         "content": [
                             {
                                 "component": "VCol",
-                                "props": {"cols": 12, "md": 6},
-                                "content": [{"component": "span", "text": probe.get("source")}],
+                                "props": {"cols": 12, "md": 5},
+                                "content": source_cell,
                             },
                             {
                                 "component": "VCol",
-                                "props": {"cols": 12, "md": 3},
+                                "props": {"cols": 12, "md": 2},
                                 "content": [
                                     {
                                         "component": "VChip",
@@ -834,7 +979,7 @@ class ANiStrmHub(_PluginBase):
                             },
                             {
                                 "component": "VCol",
-                                "props": {"cols": 12, "md": 3},
+                                "props": {"cols": 12, "md": 5},
                                 "content": [{"component": "span", "props": {"class": "text-caption"}, "text": detail}],
                             },
                         ],
@@ -847,7 +992,8 @@ class ANiStrmHub(_PluginBase):
                     "content": [
                         {
                             "component": "VCardTitle",
-                            "text": f"数据源健康度（探测于 {health.get('checked_at', '未知时间')}）",
+                            "text": f"数据源健康度（探测于 {health.get('checked_at', '未知时间')}，"
+                            "延迟类似ping、网速下载1MB实测，🚀推荐=当前可播源里网速最快的）",
                         },
                         {"component": "VCardText", "content": rows or [{"component": "span", "text": "无数据"}]},
                     ],
@@ -1096,11 +1242,14 @@ class StrmRelinkService:
        "季度/文件名?d=mp4"这一段实测在所有镜像间完全一致，只有前缀（域名，
        以及是否带resources.ani.rip中间路径）不同。所以标题不在当前RSS窗口内的
        老集数（比如失效前很久生成的strm），可以从旧链接里提取这一段，换上
-       当前配置里第一个成功抓到内容的源的前缀，拼出候选新链接；写入前会用
-       Range请求实际探测一次，确认能连通才采用，避免写入猜测性的死链接。
+       候选参照源的前缀，拼出候选新链接；写入前会用Range请求实际探测一次，
+       确认能连通才采用，避免写入猜测性的死链接。参照源支持传多个候选，按
+       顺序逐个尝试——单个候选源(社区镜像这类轻量Worker代理)在长任务跑到
+       一半时被限流/抖动是实测踩过的真实情况，不能让它拖累整批文件都失败。
     """
 
     SEASON_PATH_RE = re.compile(r"(\d{4}-\d{1,2}/.+)$")
+    DEFAULT_SPEED_TEST_BYTES = 1_048_576  # 1MB，够估算网速又不会跑太久/太费流量
 
     def __init__(self, request_factory):
         self._request_factory = request_factory
@@ -1117,7 +1266,11 @@ class StrmRelinkService:
             return None
         return url[: url.index(resource_path)]
 
-    def _verify_reachable(self, url: str) -> bool:
+    def probe_latency_ms(self, url: str) -> Tuple[Optional[float], Optional[str]]:
+        """探测直链能不能连通、连通要多久（只请求1个字节，类似ping）。
+        返回(延迟ms, None)表示成功；返回(None, 失败原因)表示不可达——原因写清楚
+        具体HTTP状态码或异常信息，不能只留一句"不可达"就没了，不然出问题
+        没法分清到底是链接真死了、单纯超时、还是被限流，这个坑已经踩过。"""
         try:
             # 注意：get_res(url, headers=...)里的headers会整体替换掉RequestUtils构造时
             # 设置的默认header(包括UA)，不是合并。必须用update_headers()把Range头合并
@@ -1125,10 +1278,39 @@ class StrmRelinkService:
             # 导致本来可达的链接被误判为不可达——这个坑已经在联调时实测踩过。
             request_utils = self._request_factory()
             request_utils.update_headers({"Range": "bytes=0-0"})
+            start = time.monotonic()
             response = request_utils.get_res(url)
-            return bool(response) and response.status_code in (200, 206)
+            elapsed_ms = (time.monotonic() - start) * 1000
+            if not response:
+                return None, "无响应(连接失败或超时)"
+            if response.status_code not in (200, 206):
+                return None, f"HTTP {response.status_code}"
+            return round(elapsed_ms, 1), None
+        except Exception as err:
+            return None, f"异常:{err}"
+
+    def probe_speed_kbps(self, url: str, chunk_bytes: Optional[int] = None) -> Optional[float]:
+        """下载一小段(默认1MB)实测网速，不是下载整部视频。只应该在已经确认
+        probe_latency_ms可达之后再调用，避免对本来就连不上的链接白跑一次。"""
+        chunk_bytes = chunk_bytes or self.DEFAULT_SPEED_TEST_BYTES
+        try:
+            request_utils = self._request_factory()
+            request_utils.update_headers({"Range": f"bytes=0-{chunk_bytes - 1}"})
+            start = time.monotonic()
+            response = request_utils.get_res(url)
+            elapsed = time.monotonic() - start
+            if not response or response.status_code not in (200, 206):
+                return None
+            downloaded = len(response.content or b"")
+            if downloaded <= 0 or elapsed <= 0:
+                return None
+            return round(downloaded / 1024 / elapsed, 1)
         except Exception:
-            return False
+            return None
+
+    def _verify_reachable(self, url: str) -> bool:
+        latency_ms, _ = self.probe_latency_ms(url)
+        return latency_ms is not None
 
     @staticmethod
     def scan_domain_distribution(storage_path: str) -> Dict[str, Any]:
@@ -1154,7 +1336,7 @@ class StrmRelinkService:
         self,
         storage_path: str,
         title_map: Dict[str, str],
-        reference_link: Optional[str],
+        reference_links: List[str],
     ) -> Dict[str, int]:
         stats = {
             "标题精确匹配更新": 0,
@@ -1169,7 +1351,9 @@ class StrmRelinkService:
             logger.warning(f"ANiStrmHub修复链接：目录不存在，跳过 {storage_path}")
             return stats
 
-        reference_prefix = self.derive_prefix(reference_link) if reference_link else None
+        reference_prefixes = [
+            prefix for prefix in (self.derive_prefix(link) for link in reference_links) if prefix
+        ]
 
         for strm_file in sorted(directory.rglob("*.strm")):
             title = strm_file.stem
@@ -1190,7 +1374,7 @@ class StrmRelinkService:
                     stats["无需更新"] += 1
                 continue
 
-            if not reference_prefix:
+            if not reference_prefixes:
                 stats["无法识别(保留原文件)"] += 1
                 continue
 
@@ -1200,18 +1384,32 @@ class StrmRelinkService:
                 stats["无法识别(保留原文件)"] += 1
                 continue
 
-            candidate = reference_prefix + old_resource_path
-            if candidate == old_content:
-                stats["无需更新"] += 1
-                continue
+            # 按顺序逐个候选前缀尝试，一个连不上/超时就换下一个，不会因为
+            # 单个候选源中途抖动/被限流就拖累这个文件、进而拖累整批任务
+            migrated = False
+            fail_reasons = []
+            for prefix in reference_prefixes:
+                candidate = prefix + old_resource_path
+                if candidate == old_content:
+                    stats["无需更新"] += 1
+                    migrated = True
+                    break
 
-            time.sleep(0.3)
-            if self._verify_reachable(candidate):
-                strm_file.write_text(candidate, encoding="utf-8")
-                stats["路径迁移成功"] += 1
-                logger.info(f"ANiStrmHub修复链接：路径迁移成功 {strm_file.name}")
-            else:
-                logger.warning(f"ANiStrmHub修复链接：候选链接探测不可达，保留原文件 {strm_file.name}")
+                time.sleep(0.3)
+                latency_ms, fail_reason = self.probe_latency_ms(candidate)
+                if latency_ms is not None:
+                    strm_file.write_text(candidate, encoding="utf-8")
+                    stats["路径迁移成功"] += 1
+                    logger.info(f"ANiStrmHub修复链接：路径迁移成功({latency_ms}ms) {strm_file.name}")
+                    migrated = True
+                    break
+                fail_reasons.append(f"{urlparse(prefix).netloc}:{fail_reason}")
+
+            if not migrated:
+                logger.warning(
+                    f"ANiStrmHub修复链接：全部{len(reference_prefixes)}个候选源均不可达"
+                    f"({'; '.join(fail_reasons)})，保留原文件 {strm_file.name}"
+                )
                 stats["路径迁移失败(保留原文件)"] += 1
 
         return stats

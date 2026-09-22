@@ -209,7 +209,7 @@ class TestRelinkExisting:
         stats = service.relink_existing(
             storage_path=str(tmp_path),
             title_map={"在RSS窗口内的标题.mp4": "https://alive.example/new.mp4?d=mp4"},
-            reference_link="https://alive.example/new.mp4?d=mp4",
+            reference_links=["https://alive.example/new.mp4?d=mp4"],
         )
 
         assert stats["标题精确匹配更新"] == 1
@@ -223,7 +223,7 @@ class TestRelinkExisting:
         stats = service.relink_existing(
             storage_path=str(tmp_path),
             title_map={},
-            reference_link="https://alive.example/2026-7/other.mp4?d=mp4",
+            reference_links=["https://alive.example/2026-7/other.mp4?d=mp4"],
         )
 
         assert stats["路径迁移成功"] == 1
@@ -238,7 +238,7 @@ class TestRelinkExisting:
         stats = service.relink_existing(
             storage_path=str(tmp_path),
             title_map={},
-            reference_link="https://alive.example/2026-7/other.mp4?d=mp4",
+            reference_links=["https://alive.example/2026-7/other.mp4?d=mp4"],
         )
 
         assert stats["路径迁移失败(保留原文件)"] == 1
@@ -252,11 +252,107 @@ class TestRelinkExisting:
         stats = service.relink_existing(
             storage_path=str(tmp_path),
             title_map={},
-            reference_link="https://alive.example/2026-7/other.mp4?d=mp4",
+            reference_links=["https://alive.example/2026-7/other.mp4?d=mp4"],
         )
 
         assert stats["无法识别(保留原文件)"] == 1
         assert strm_file.read_text() == "not-a-url-at-all"
+
+    def test_falls_back_to_next_candidate_when_first_is_unreachable(self, tmp_path):
+        # 回归测试：长任务跑到一半，唯一参照源被限流/抖动一下就会拖累整批
+        # 全部失败(实测踩过)。现在支持传多个候选前缀，第一个不通自动换下一个。
+        strm_file = tmp_path / "老标题.mp4.strm"
+        strm_file.write_text("https://dead.example/2025-1/ep.mp4?d=mp4", encoding="utf-8")
+
+        request_utils = MagicMock()
+        # 第一个候选(dead-mirror)每次探测都403，第二个候选(good-mirror)206
+        def get_res_side_effect(url, **kwargs):
+            if "dead-mirror" in url:
+                return MagicMock(status_code=403)
+            return MagicMock(status_code=206)
+
+        request_utils.get_res.side_effect = get_res_side_effect
+        service = StrmRelinkService(request_factory=lambda: request_utils)
+
+        stats = service.relink_existing(
+            storage_path=str(tmp_path),
+            title_map={},
+            reference_links=[
+                "https://dead-mirror.example/2026-7/other.mp4?d=mp4",
+                "https://good-mirror.example/2026-7/other.mp4?d=mp4",
+            ],
+        )
+
+        assert stats["路径迁移成功"] == 1
+        assert strm_file.read_text() == "https://good-mirror.example/2025-1/ep.mp4?d=mp4"
+
+    def test_all_candidates_unreachable_reports_each_reason(self, tmp_path):
+        strm_file = tmp_path / "老标题.mp4.strm"
+        strm_file.write_text("https://dead.example/2025-1/ep.mp4?d=mp4", encoding="utf-8")
+
+        request_utils = MagicMock()
+        request_utils.get_res.return_value = MagicMock(status_code=403)
+        service = StrmRelinkService(request_factory=lambda: request_utils)
+
+        stats = service.relink_existing(
+            storage_path=str(tmp_path),
+            title_map={},
+            reference_links=[
+                "https://mirror-a.example/2026-7/other.mp4?d=mp4",
+                "https://mirror-b.example/2026-7/other.mp4?d=mp4",
+            ],
+        )
+
+        assert stats["路径迁移失败(保留原文件)"] == 1
+        assert request_utils.get_res.call_count == 2  # 两个候选都试过了
+
+
+class TestProbeLatencyAndSpeed:
+    def test_probe_latency_ms_success(self):
+        request_utils = MagicMock()
+        request_utils.get_res.return_value = MagicMock(status_code=206)
+        service = StrmRelinkService(request_factory=lambda: request_utils)
+
+        latency_ms, reason = service.probe_latency_ms("https://alive.example/ep.mp4?d=mp4")
+
+        assert latency_ms is not None and latency_ms >= 0
+        assert reason is None
+
+    def test_probe_latency_ms_reports_http_status_as_reason(self):
+        request_utils = MagicMock()
+        request_utils.get_res.return_value = MagicMock(status_code=403)
+        service = StrmRelinkService(request_factory=lambda: request_utils)
+
+        latency_ms, reason = service.probe_latency_ms("https://blocked.example/ep.mp4?d=mp4")
+
+        assert latency_ms is None
+        assert reason == "HTTP 403"
+
+    def test_probe_latency_ms_reports_no_response_reason(self):
+        request_utils = MagicMock()
+        request_utils.get_res.return_value = None
+        service = StrmRelinkService(request_factory=lambda: request_utils)
+
+        latency_ms, reason = service.probe_latency_ms("https://timeout.example/ep.mp4?d=mp4")
+
+        assert latency_ms is None
+        assert "无响应" in reason
+
+    def test_probe_speed_kbps_computes_from_downloaded_bytes(self):
+        request_utils = MagicMock()
+        request_utils.get_res.return_value = MagicMock(status_code=206, content=b"x" * 1024)
+        service = StrmRelinkService(request_factory=lambda: request_utils)
+
+        speed = service.probe_speed_kbps("https://alive.example/ep.mp4?d=mp4", chunk_bytes=1024)
+
+        assert speed is not None and speed > 0
+
+    def test_probe_speed_kbps_returns_none_when_unreachable(self):
+        request_utils = MagicMock()
+        request_utils.get_res.return_value = MagicMock(status_code=403)
+        service = StrmRelinkService(request_factory=lambda: request_utils)
+
+        assert service.probe_speed_kbps("https://blocked.example/ep.mp4?d=mp4") is None
 
     def test_verify_reachable_merges_range_header_instead_of_replacing(self):
         # 回归测试：get_res(headers=...)是整体替换不是合并，早期实现丢了默认UA
@@ -300,36 +396,79 @@ class TestTaskStatusGuard:
         assert getattr(plugin, "_ANiStrmHub__is_task_running")("never_ran") is False
 
 
-class TestPickHealthyReferenceLink:
-    def test_skips_source_whose_video_domain_is_unreachable(self):
+class TestPickHealthyReferenceLinks:
+    def test_skips_unreachable_and_returns_all_reachable_in_order(self):
         # 对应实测踩过的坑：一个源RSS能拉到，但样本直链探测不通(比如国内被墙的
-        # 官方裸域名，或者被Cloudflare挑战拦截的镜像)，之前会被盲目当参照源，
-        # 导致所有路径迁移候选全部超时失败。现在应该跳过它，选下一个真正能播的。
+        # 官方裸域名，或者被Cloudflare挑战拦截的镜像)，之前只挑"第一个能用的"
+        # 当唯一参照，长任务跑到一半这个源被限流就会拖累整批全部失败。现在
+        # 返回全部健康候选(保持顺序)，供relink_existing逐个尝试兜底。
         plugin = ANiStrmHub()
-        plugin._client.set_sources("https://dead.example/rss.xml\nhttps://alive.example/rss.xml")
-        plugin._client.fetch_one_source = MagicMock(
-            side_effect=lambda url: (
-                [{"title": "x", "link": "https://dead-video.example/2026-7/x.mp4?d=mp4"}]
-                if url == "https://dead.example/rss.xml"
-                else [{"title": "y", "link": "https://alive-video.example/2026-7/y.mp4?d=mp4"}]
-            )
+        plugin._client.set_sources(
+            "https://dead.example/rss.xml\nhttps://alive1.example/rss.xml\nhttps://alive2.example/rss.xml"
         )
-        plugin._relink_service._verify_reachable = MagicMock(
-            side_effect=lambda link: "alive-video.example" in link
+        entries_by_url = {
+            "https://dead.example/rss.xml": [{"title": "x", "link": "https://dead-video.example/2026-7/x.mp4?d=mp4"}],
+            "https://alive1.example/rss.xml": [{"title": "y", "link": "https://alive1-video.example/2026-7/y.mp4?d=mp4"}],
+            "https://alive2.example/rss.xml": [{"title": "z", "link": "https://alive2-video.example/2026-7/z.mp4?d=mp4"}],
+        }
+        plugin._client.fetch_one_source = MagicMock(side_effect=lambda url: entries_by_url[url])
+        plugin._relink_service.probe_latency_ms = MagicMock(
+            side_effect=lambda link: (None, "HTTP 403") if "dead-video" in link else (50.0, None)
         )
 
-        result = getattr(plugin, "_ANiStrmHub__pick_healthy_reference_link")()
+        result = getattr(plugin, "_ANiStrmHub__pick_healthy_reference_links")()
 
-        assert result == "https://alive-video.example/2026-7/y.mp4?d=mp4"
+        assert result == [
+            "https://alive1-video.example/2026-7/y.mp4?d=mp4",
+            "https://alive2-video.example/2026-7/z.mp4?d=mp4",
+        ]
 
-    def test_returns_none_when_all_sources_unreachable(self):
+    def test_returns_empty_list_when_all_sources_unreachable(self):
         plugin = ANiStrmHub()
         plugin._client.set_sources("https://dead.example/rss.xml")
         plugin._client.fetch_one_source = MagicMock(
             return_value=[{"title": "x", "link": "https://dead-video.example/x.mp4?d=mp4"}]
         )
-        plugin._relink_service._verify_reachable = MagicMock(return_value=False)
+        plugin._relink_service.probe_latency_ms = MagicMock(return_value=(None, "HTTP 403"))
 
-        result = getattr(plugin, "_ANiStrmHub__pick_healthy_reference_link")()
+        result = getattr(plugin, "_ANiStrmHub__pick_healthy_reference_links")()
 
-        assert result is None
+        assert result == []
+
+
+class TestSeasonFilter:
+    ENTRIES = [
+        {"title": "a", "link": "https://x.example/2026-7/a.mp4?d=mp4"},
+        {"title": "b", "link": "https://x.example/2026-4/b.mp4?d=mp4"},
+        {"title": "c", "link": "https://x.example/2025-10/c.mp4?d=mp4"},
+    ]
+
+    def test_all_returns_everything_unchanged(self):
+        plugin = ANiStrmHub()
+        plugin._season_filter = ["all"]
+        result = getattr(plugin, "_ANiStrmHub__apply_season_filter")(self.ENTRIES)
+        assert result == self.ENTRIES
+
+    def test_empty_filter_returns_everything_unchanged(self):
+        plugin = ANiStrmHub()
+        plugin._season_filter = []
+        result = getattr(plugin, "_ANiStrmHub__apply_season_filter")(self.ENTRIES)
+        assert result == self.ENTRIES
+
+    def test_latest_picks_max_season_only(self):
+        plugin = ANiStrmHub()
+        plugin._season_filter = ["latest"]
+        result = getattr(plugin, "_ANiStrmHub__apply_season_filter")(self.ENTRIES)
+        assert [e["title"] for e in result] == ["a"]
+
+    def test_specific_season_selected(self):
+        plugin = ANiStrmHub()
+        plugin._season_filter = ["2026-4"]
+        result = getattr(plugin, "_ANiStrmHub__apply_season_filter")(self.ENTRIES)
+        assert [e["title"] for e in result] == ["b"]
+
+    def test_multiple_seasons_selected(self):
+        plugin = ANiStrmHub()
+        plugin._season_filter = ["2026-4", "2025-10"]
+        result = getattr(plugin, "_ANiStrmHub__apply_season_filter")(self.ENTRIES)
+        assert [e["title"] for e in result] == ["b", "c"]
