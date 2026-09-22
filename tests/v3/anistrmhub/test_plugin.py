@@ -3,16 +3,19 @@
 按V3插件开发指南要求：普通单测不依赖公网状态，外部HTTP一律mock。
 在宿主虚拟环境下运行：../MoviePilot/.venv/bin/python -m pytest tests/v3/anistrmhub
 """
+import asyncio
 import time
 from unittest.mock import MagicMock
 from urllib.parse import unquote
 
 import pytest
+from fastapi.responses import StreamingResponse
 
 from app.plugins.anistrmhub import (
     ANiStrmHub,
     AniRssAggregator,
     EPISODE_NUM_RE,
+    RelayService,
     StrmFileService,
     StrmRelinkService,
 )
@@ -855,3 +858,180 @@ class TestBackfillTask:
 
         status = plugin.get_data("task_status")["backfill"]
         assert status["summary"] == "本地无可识别集数的资源"
+
+
+class TestRelayService:
+    # Part C(Relay转发)里不依赖MoviePilot框架路由/鉴权机制的纯逻辑部分。
+    # get_api()注册和MP标准鉴权会不会拦住Emby请求这一点，必须等真实宿主验证，
+    # 这里只测URL拼接/token校验/响应头过滤这几个跟框架无关的函数。
+
+    def test_is_authorized_matches_configured_token(self):
+        service = RelayService(token="secret123")
+        assert service.is_authorized("secret123") is True
+        assert service.is_authorized("wrong") is False
+        assert service.is_authorized(None) is False
+
+    def test_is_authorized_always_false_when_no_token_configured(self):
+        service = RelayService(token="")
+        assert service.is_authorized("") is False
+        assert service.is_authorized(None) is False
+
+    def test_build_relay_link_encodes_real_url_and_appends_token(self):
+        service = RelayService(token="secret123")
+        result = service.build_relay_link(
+            "http://192.168.1.10:3000", "https://resources.ani.rip/2025-10/xxx?d=mp4"
+        )
+        assert result == (
+            "http://192.168.1.10:3000/api/v1/plugin/ANiStrmHub/relay"
+            "?url=https%3A%2F%2Fresources.ani.rip%2F2025-10%2Fxxx%3Fd%3Dmp4&token=secret123"
+        )
+
+    def test_build_relay_link_strips_trailing_slash_on_base_url(self):
+        service = RelayService(token="secret123")
+        result = service.build_relay_link("http://192.168.1.10:3000/", "https://resources.ani.rip/x?d=mp4")
+        assert result.startswith("http://192.168.1.10:3000/api/v1/plugin/ANiStrmHub/relay")
+
+    def test_filter_upstream_headers_keeps_media_headers_strips_hop_by_hop(self):
+        upstream_headers = {
+            "Content-Type": "video/mp4",
+            "Content-Length": "104857600",
+            "Content-Range": "bytes 0-1023/104857600",
+            "Accept-Ranges": "bytes",
+            "Connection": "keep-alive",
+            "Transfer-Encoding": "chunked",
+            "Keep-Alive": "timeout=5",
+        }
+        filtered = RelayService.filter_upstream_headers(upstream_headers)
+        assert filtered == {
+            "Content-Type": "video/mp4",
+            "Content-Length": "104857600",
+            "Content-Range": "bytes 0-1023/104857600",
+            "Accept-Ranges": "bytes",
+        }
+
+
+class TestRelayEndpoint:
+    # get_api()路由注册/MP标准鉴权是否真的被allow_anonymous绕过，这一点
+    # 必须在真实MoviePilot宿主上验证(sandbox里没有真实FastAPI路由挂载)。
+    # 这里只测relay_endpoint函数体本身的纯逻辑：token校验、上游失败处理、
+    # 流式转发的生成器行为，都不依赖MP框架的路由挂载。
+
+    def _make_plugin(self, token="secret123"):
+        plugin = ANiStrmHub()
+        plugin._relay_token = token
+        plugin._relay_service = RelayService(token=token)
+        return plugin
+
+    def test_rejects_when_token_invalid(self):
+        plugin = self._make_plugin()
+        result = plugin.relay_endpoint(url="https://resources.ani.rip/x?d=mp4", token="wrong")
+        assert result == {"success": False, "message": "unauthorized"}
+
+    def test_rejects_when_token_missing(self):
+        plugin = self._make_plugin()
+        result = plugin.relay_endpoint(url="https://resources.ani.rip/x?d=mp4", token=None)
+        assert result == {"success": False, "message": "unauthorized"}
+
+    def test_returns_error_dict_when_upstream_unreachable(self):
+        plugin = self._make_plugin()
+        fake_stream_ctx = MagicMock()
+        fake_upstream = MagicMock(status_code=403)
+        fake_stream_ctx.__enter__.return_value = fake_upstream
+        fake_request_utils = MagicMock()
+        fake_request_utils.get_stream.return_value = fake_stream_ctx
+        plugin._client.build_request_utils = MagicMock(return_value=fake_request_utils)
+
+        result = plugin.relay_endpoint(url="https://resources.ani.rip/x?d=mp4", token="secret123")
+
+        assert result == {"success": False, "message": "upstream error: 403"}
+        fake_stream_ctx.__exit__.assert_called_once()
+
+    def test_streams_upstream_body_and_closes_stream_after_exhausted(self):
+        plugin = self._make_plugin()
+        fake_stream_ctx = MagicMock()
+        fake_upstream = MagicMock(
+            status_code=206,
+            headers={"Content-Type": "video/mp4", "Content-Range": "bytes 0-1/2", "Connection": "keep-alive"},
+        )
+        fake_upstream.iter_content.return_value = iter([b"abc", b"def"])
+        fake_stream_ctx.__enter__.return_value = fake_upstream
+        fake_request_utils = MagicMock()
+        fake_request_utils.get_stream.return_value = fake_stream_ctx
+        plugin._client.build_request_utils = MagicMock(return_value=fake_request_utils)
+
+        response = plugin.relay_endpoint(url="https://resources.ani.rip/x?d=mp4", token="secret123")
+
+        assert isinstance(response, StreamingResponse)
+        assert response.status_code == 206
+        assert response.headers.get("content-type") == "video/mp4"
+        assert "connection" not in response.headers  # hop-by-hop头必须被剥掉
+
+        # StreamingResponse还没被真正消费之前，上游response不该被提前关闭
+        fake_stream_ctx.__exit__.assert_not_called()
+
+        # Starlette把同步生成器包成了async generator(线程池里跑)，要用
+        # async for才能正确消费，跟FastAPI真实发响应时的驱动方式一致
+        async def _collect():
+            return [chunk async for chunk in response.body_iterator]
+
+        chunks = asyncio.run(_collect())
+        assert chunks == [b"abc", b"def"]
+        fake_stream_ctx.__exit__.assert_called_once()
+
+    def test_forwards_range_header_from_incoming_request(self):
+        plugin = self._make_plugin()
+        fake_stream_ctx = MagicMock()
+        fake_upstream = MagicMock(status_code=206, headers={"Content-Type": "video/mp4"})
+        fake_upstream.iter_content.return_value = iter([b"x"])
+        fake_stream_ctx.__enter__.return_value = fake_upstream
+        fake_request_utils = MagicMock()
+        fake_request_utils.get_stream.return_value = fake_stream_ctx
+        plugin._client.build_request_utils = MagicMock(return_value=fake_request_utils)
+
+        fake_request = MagicMock()
+        fake_request.headers = {"range": "bytes=100-200"}
+
+        plugin.relay_endpoint(url="https://resources.ani.rip/x?d=mp4", token="secret123", request=fake_request)
+
+        fake_request_utils.update_headers.assert_called_once_with({"Range": "bytes=100-200"})
+
+
+class TestFinalizeStrmLink:
+    def test_relay_enabled_wraps_with_relay_link_ignoring_proxy_prefix(self):
+        plugin = ANiStrmHub()
+        plugin._relay_enabled = True
+        plugin._mp_external_url = "http://192.168.1.10:3000"
+        plugin._relay_token = "secret123"
+        plugin._relay_service = RelayService(token="secret123")
+        plugin._proxy_prefixes = "https://pro.pili.cc.cd"  # relay打开时应该被忽略
+
+        result = getattr(plugin, "_ANiStrmHub__finalize_strm_link")("https://resources.ani.rip/x?d=mp4")
+
+        assert result.startswith("http://192.168.1.10:3000/api/v1/plugin/ANiStrmHub/relay?url=")
+        assert "pro.pili.cc.cd" not in result
+
+    def test_relay_disabled_falls_back_to_active_proxy_prefix(self):
+        plugin = ANiStrmHub()
+        plugin._relay_enabled = False
+        plugin._proxy_prefixes = "https://pro.pili.cc.cd"
+
+        result = getattr(plugin, "_ANiStrmHub__finalize_strm_link")("https://resources.ani.rip/x?d=mp4")
+
+        assert result == "https://pro.pili.cc.cd/resources.ani.rip/x?d=mp4"
+
+    def test_relay_enabled_but_no_external_url_falls_back_to_proxy_prefix(self):
+        # relay开关开了但忘了填对外地址，不能生成一个残废的relay链接，退化成
+        # 正常的加速源逻辑(或裸链接)
+        plugin = ANiStrmHub()
+        plugin._relay_enabled = True
+        plugin._mp_external_url = ""
+        plugin._proxy_prefixes = "https://pro.pili.cc.cd"
+
+        result = getattr(plugin, "_ANiStrmHub__finalize_strm_link")("https://resources.ani.rip/x?d=mp4")
+
+        assert result == "https://pro.pili.cc.cd/resources.ani.rip/x?d=mp4"
+
+    def test_neither_relay_nor_prefix_configured_returns_bare_link(self):
+        plugin = ANiStrmHub()
+        result = getattr(plugin, "_ANiStrmHub__finalize_strm_link")("https://resources.ani.rip/x?d=mp4")
+        assert result == "https://resources.ani.rip/x?d=mp4"

@@ -1,4 +1,5 @@
 import re
+import secrets
 import time
 import xml.etree.ElementTree as ET
 from datetime import datetime, timedelta
@@ -9,6 +10,8 @@ from urllib.parse import quote, unquote, urlparse, urlunparse
 import pytz
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.cron import CronTrigger
+from fastapi import Request
+from fastapi.responses import StreamingResponse
 
 from app.plugins import _PluginBase
 from app.sdk.config import settings
@@ -36,7 +39,7 @@ class ANiStrmHub(_PluginBase):
     plugin_name = "ANiStrmHub"
     plugin_desc = "多源聚合抓取ANi新番资源，自动去重轮询多个镜像，生成strm文件，mp刮削入库，媒体服务器直连播放"
     plugin_icon = "https://raw.githubusercontent.com/oiloveio/MoviePilot-Plugins/main/icons/anistrmhub.png"
-    plugin_version = "3.8.0"
+    plugin_version = "4.0.0"
     plugin_author = "oiloveio,honue"
     author_url = "https://github.com/honue"
     plugin_config_prefix = "anistrmhub_"
@@ -63,6 +66,9 @@ class ANiStrmHub(_PluginBase):
     _restore_proxy_once = False
     _detect_proxy_once = False
     _backfill_once = False
+    _relay_enabled = False
+    _mp_external_url = ""
+    _relay_token = ""
     _scheduler: Optional[BackgroundScheduler] = None
 
     def __init__(self):
@@ -70,6 +76,7 @@ class ANiStrmHub(_PluginBase):
         self._client = AniRssAggregator()
         self._strm_service = StrmFileService()
         self._relink_service = StrmRelinkService(request_factory=self._client.build_request_utils)
+        self._relay_service = RelayService(token="")
 
     def init_plugin(self, config: dict = None):
         self.stop_service()
@@ -98,6 +105,12 @@ class ANiStrmHub(_PluginBase):
         self._restore_proxy_once = config.get("restore_proxy_once", False)
         self._detect_proxy_once = config.get("detect_proxy_once", False)
         self._backfill_once = config.get("backfill_once", False)
+        self._relay_enabled = config.get("relay_enabled", False)
+        self._mp_external_url = (config.get("mp_external_url") or "").strip()
+        # token只在第一次生成，之后必须固定下来复用——已经写进strm里的relay链接
+        # 带着这个token，每次重启都换新的话，所有relay链接会集体失效
+        self._relay_token = config.get("relay_token") or secrets.token_urlsafe(16)
+        self._relay_service = RelayService(token=self._relay_token)
         self._rss_sources = config.get("rss_sources")
         if not self._rss_sources:
             self._rss_sources = DEFAULT_RSS_SOURCES
@@ -268,6 +281,21 @@ class ANiStrmHub(_PluginBase):
     def __build_proxy_prefix_options(self) -> List[Dict[str, str]]:
         return [{"title": prefix, "value": prefix} for prefix in self.__parse_proxy_prefixes()]
 
+    def __finalize_strm_link(self, real_link: str) -> str:
+        """决定新生成的strm文件里最终写入的到底是什么格式的地址，__task和
+        __backfill_task这两个"生成新文件"的入口都调这一个函数，不各写各的。
+
+        relay模式打开时优先：strm指向MP自己的转发接口，由MP服务端(已经配好
+        use_proxy)代为请求真实直链再转发字节流，这时不需要再叠加加速源前缀——
+        代理已经在MP发起请求时生效了，叠加前缀反而是画蛇添足。relay关闭时
+        维持3.8.0起的行为：套用当前生效加速源(没配置就是原始直链)。"""
+        if self._relay_enabled and self._mp_external_url and self._relay_token:
+            return self._relay_service.build_relay_link(self._mp_external_url, real_link)
+        active_prefix = self.__get_active_proxy_prefix()
+        if active_prefix:
+            return StrmRelinkService.build_proxied_url(real_link, active_prefix)
+        return real_link
+
     def __pick_healthy_reference_links(self) -> List[str]:
         """按配置顺序依次探测各数据源，返回所有当前RSS能拉到、且样本视频直链实测
         能连通的link列表(保持优先级顺序)，供路径迁移当候选参照。
@@ -376,9 +404,12 @@ class ANiStrmHub(_PluginBase):
             self.__save_task_status("task", "done", "季度筛选后无条目")
             return
 
-        active_prefix = self.__get_active_proxy_prefix()
-        if active_prefix:
-            logger.info(f"ANiStrmHub任务：新生成的strm将自动套用加速源 {active_prefix}")
+        if self._relay_enabled:
+            logger.info(f"ANiStrmHub任务：新生成的strm将走Relay转发({self._mp_external_url})")
+        else:
+            active_prefix = self.__get_active_proxy_prefix()
+            if active_prefix:
+                logger.info(f"ANiStrmHub任务：新生成的strm将自动套用加速源 {active_prefix}")
 
         total_created = 0
         total_exists = 0
@@ -398,12 +429,10 @@ class ANiStrmHub(_PluginBase):
             season = SEASON_RE.search(entry["link"])
             relative_dir = season.group(1) if (self._season_dir and season) else None
 
-            # 自动套用当前生效加速源：这里不逐条探测确认可达，信任加速源本身
-            # 已经通过「探测加速源」验证过——每次拉新番几十上百条都探测一遍
-            # 太慢也太费请求，跟事后批量套壳(会逐条探测)是不同场景
-            file_url = entry["link"]
-            if active_prefix:
-                file_url = StrmRelinkService.build_proxied_url(file_url, active_prefix)
+            # 这里不逐条探测确认可达，信任加速源/relay配置本身已经验证过——
+            # 每次拉新番几十上百条都探测一遍太慢也太费请求，跟事后批量套壳
+            # (会逐条探测)是不同场景
+            file_url = self.__finalize_strm_link(entry["link"])
 
             status = self._strm_service.touch_strm_file(
                 storage_path=self._storageplace,
@@ -766,7 +795,6 @@ class ANiStrmHub(_PluginBase):
             self.__save_task_status("backfill", "done", "本地无可识别集数的资源")
             return
 
-        active_prefix = self.__get_active_proxy_prefix()
         total_probed = 0
         total_created = 0
 
@@ -807,11 +835,7 @@ class ANiStrmHub(_PluginBase):
                     )
                     break
 
-                final_link = (
-                    StrmRelinkService.build_proxied_url(candidate_link, active_prefix)
-                    if active_prefix
-                    else candidate_link
-                )
+                final_link = self.__finalize_strm_link(candidate_link)
                 try:
                     candidate_path.write_text(final_link, encoding="utf-8")
                     total_created += 1
@@ -847,8 +871,59 @@ class ANiStrmHub(_PluginBase):
         return []
 
     def get_api(self) -> List[Dict[str, Any]]:
-        """当前插件不注册后端API，探测/换源都走配置开关+详情页缓存展示"""
-        return []
+        """注册Relay转发接口：strm里存的是这个地址而非真实直链，由MP服务端
+        (已经配好use_proxy)代为请求真实直链再转发字节流给Emby/Jellyfin，
+        支持HTTP Range(拖进度条)。
+
+        allow_anonymous=True让这条路由跳过MP标准的登录态/apikey鉴权——
+        Emby/Jellyfin发起请求不会带这些。参照官方MoviePilot-Plugins仓库
+        clashruleprovider插件的写法：路由匿名放行，函数体内自己校验URL
+        参数里的token，防止被外部盗链滥用。"""
+        return [
+            {
+                "path": "/relay",
+                "endpoint": self.relay_endpoint,
+                "methods": ["GET"],
+                "summary": "Relay转发真实ANi直链给播放器",
+                "allow_anonymous": True,
+            }
+        ]
+
+    def relay_endpoint(self, url: str, token: Optional[str] = None, request: Request = None):
+        if not self._relay_service.is_authorized(token):
+            logger.warning(f"ANiStrmHub Relay：token校验失败，拒绝请求 {url}")
+            return {"success": False, "message": "unauthorized"}
+
+        range_header = request.headers.get("range") if request is not None else None
+        request_utils = self._client.build_request_utils()
+        if range_header:
+            request_utils.update_headers({"Range": range_header})
+
+        # 手动驱动get_stream()这个@contextmanager而不用with：上游response要
+        # 活到StreamingResponse把body_iterator实际消费完才能关闭，用with会在
+        # 这个函数return的瞬间就把response.close()掉，那时候还一个字节都没转发
+        stream_ctx = request_utils.get_stream(url)
+        upstream = stream_ctx.__enter__()
+        if upstream is None or upstream.status_code not in (200, 206):
+            status = upstream.status_code if upstream is not None else "无响应"
+            logger.warning(f"ANiStrmHub Relay：请求真实直链失败({status}) {url}")
+            stream_ctx.__exit__(None, None, None)
+            return {"success": False, "message": f"upstream error: {status}"}
+
+        response_headers = RelayService.filter_upstream_headers(dict(upstream.headers))
+
+        def body_iterator():
+            try:
+                for chunk in upstream.iter_content(chunk_size=65536):
+                    yield chunk
+            finally:
+                stream_ctx.__exit__(None, None, None)
+
+        return StreamingResponse(
+            body_iterator(),
+            status_code=upstream.status_code,
+            headers=response_headers,
+        )
 
     @staticmethod
     def __section_title(text: str) -> dict:
@@ -1290,6 +1365,67 @@ class ANiStrmHub(_PluginBase):
                             },
                         ],
                     },
+                    {
+                        "component": "VCard",
+                        "props": {"variant": "tonal", "color": "error", "class": "mt-4"},
+                        "content": [
+                            {
+                                "component": "VCardTitle",
+                                "props": {"class": "text-subtitle-1"},
+                                "text": "Relay转发（实验性，未在真实MoviePilot环境验证过，谨慎开启）",
+                            },
+                            {
+                                "component": "VCardText",
+                                "content": [
+                                    {
+                                        "component": "VRow",
+                                        "content": [
+                                            {
+                                                "component": "VCol",
+                                                "props": {"cols": 12, "md": 4},
+                                                "content": [
+                                                    {
+                                                        "component": "VSwitch",
+                                                        "props": {
+                                                            "model": "relay_enabled",
+                                                            "label": "启用Relay转发",
+                                                        },
+                                                    }
+                                                ],
+                                            },
+                                            {
+                                                "component": "VCol",
+                                                "props": {"cols": 12, "md": 8},
+                                                "content": [
+                                                    {
+                                                        "component": "VTextField",
+                                                        "props": {
+                                                            "model": "mp_external_url",
+                                                            "label": "MoviePilot对外可访问地址",
+                                                            "placeholder": "http://192.168.1.10:3000",
+                                                            "hint": "Emby/Jellyfin要能从这个地址连到MoviePilot；启用后新拉的番"
+                                                            "strm里存的不再是真实直链，而是这个地址+转发接口，"
+                                                            "由MoviePilot服务端代为请求真实直链再转发",
+                                                            "persistent-hint": True,
+                                                        },
+                                                    }
+                                                ],
+                                            },
+                                        ],
+                                    },
+                                    {
+                                        "component": "div",
+                                        "props": {"class": "text-caption mt-2"},
+                                        "text": "开启后MoviePilot自己(已经配好的代理/网络)去连真实ANi直链，把视频数据转发"
+                                        "给播放器——即使播放器所在的网络连不上ANi也能播，但会占用MoviePilot自身的"
+                                        "带宽和连接数，多人同时看不同集时要留意。跟「加速源」二选一：开启Relay后新"
+                                        "生成的strm不会再叠加加速源前缀。这是本次升级里唯一没有在真实MoviePilot"
+                                        "环境跑通过的功能，建议先小范围试播一集确认没问题，再放心用。",
+                                    },
+                                ],
+                            },
+                        ],
+                    },
                     self.__section_title("使用说明"),
                     {
                         "component": "VRow",
@@ -1344,6 +1480,9 @@ class ANiStrmHub(_PluginBase):
             "restore_proxy_once": False,
             "detect_proxy_once": False,
             "backfill_once": False,
+            "relay_enabled": False,
+            "mp_external_url": "",
+            "relay_token": "",
             "rss_sources": DEFAULT_RSS_SOURCES,
             "cron": "20 22,23,0,1 * * *",
         }
@@ -1373,6 +1512,9 @@ class ANiStrmHub(_PluginBase):
                 "restore_proxy_once": self._restore_proxy_once,
                 "detect_proxy_once": self._detect_proxy_once,
                 "backfill_once": self._backfill_once,
+                "relay_enabled": self._relay_enabled,
+                "mp_external_url": self._mp_external_url,
+                "relay_token": self._relay_token,
                 "rss_sources": self._rss_sources,
             }
         )
@@ -2072,3 +2214,49 @@ class StrmRelinkService:
                 stats["路径迁移失败(保留原文件)"] += 1
 
         return stats
+
+
+# hop-by-hop头是"这一跳连接"自己的细节(比如连接要不要保活、要不要分块传输)，
+# 不是"这份资源"本身的属性，原样转发给下一跳会破坏下游连接，必须剥掉。
+# 参考plex302reverseproxy的_reverse_proxy实现里对这类头的处理方式。
+RELAY_HOP_BY_HOP_HEADERS = frozenset(
+    {"connection", "keep-alive", "proxy-authenticate", "proxy-authorization", "te", "trailers", "transfer-encoding", "upgrade"}
+)
+
+
+class RelayService:
+    """4.0.0 Relay转发的纯逻辑部分：strm里存的不再是裸直链，而是指向MoviePilot
+    自己一个转发接口的URL；这个接口在服务端(已经配好use_proxy)代为请求真实
+    ANi直链，把字节流(支持Range)转发给Emby/Jellyfin。这样即使真实直链域名
+    国内连不通，只要MoviePilot自己能走代理连通，播放就能成功。
+
+    这里只包含不依赖MoviePilot框架路由/鉴权机制的部分：URL拼接、token校验、
+    响应头过滤——这些可以离线单测。真正把这个接口注册到get_api()、以及MP的
+    标准鉴权(auth: bear/apikey)会不会拦在这层前面导致Emby的请求根本进不来，
+    这一点必须在用户真实的MoviePilot宿主上验证，是目前唯一没法在sandbox里
+    确认的地方(见README/计划书的风险清单)。"""
+
+    def __init__(self, token: str):
+        self._token = token
+
+    def is_authorized(self, provided_token: Optional[str]) -> bool:
+        """独立于MP标准鉴权的URL级校验：Emby/Jellyfin发起请求不会带MP的登录态
+        /API Key，所以这里自己比对一个插件启动时生成/配置的固定密钥"""
+        return bool(self._token) and provided_token == self._token
+
+    def build_relay_link(self, mp_base_url: str, real_link: str) -> str:
+        """relay_enabled打开时，strm里写的不是真实直链，而是这个转发地址"""
+        mp_base_url = (mp_base_url or "").rstrip("/")
+        encoded_url = quote(real_link, safe="")
+        return f"{mp_base_url}/api/v1/plugin/ANiStrmHub/relay?url={encoded_url}&token={self._token}"
+
+    @staticmethod
+    def filter_upstream_headers(upstream_headers: Dict[str, str]) -> Dict[str, str]:
+        """从真实ANi直链的响应头里剥掉hop-by-hop头，只保留要转发给下游的部分
+        (Content-Type/Content-Length/Content-Range/Accept-Ranges这几个决定了
+        Emby/Jellyfin能不能正确识别媒体类型、能不能拖进度条)"""
+        return {
+            key: value
+            for key, value in upstream_headers.items()
+            if key.lower() not in RELAY_HOP_BY_HOP_HEADERS
+        }

@@ -3,6 +3,48 @@
     - [注意事项](#注意事项)
     - [Todo](#Todo)
 
+## v4.0.0 更新：加速源体系完善 + 资源补齐 + Relay转发(实验性)
+
+### 加速源体系完善
+
+v3.8.0 的「套代理前缀」发布后发现一个真实遗漏：`proxy_prefix` 只在「事后批量套壳」（`__apply_proxy_prefix_task`）里生效，拉新番的主任务（`__task`）压根没用上——配了代理前缀，新拉的番还是裸链接，得手动再跑一次套壳。这一版修：
+
+- `proxy_prefix`（单值）升级成 `proxy_prefixes`（多行列表，格式同数据源列表，一行一个地址，`#` 开头禁用），旧配置自动迁移成列表第一项
+- 新增「当前生效加速源」下拉选择器：不选则默认用列表第一个未禁用的
+- **拉新番自动套用**：`__task` 生成新 strm 时直接调用当前生效加速源套壳，不用再手动跑「一键加速」——这里不逐条探测确认可达（信任加速源已经通过「探测加速源」验证过），跟事后批量套壳（会逐条探测）是不同场景
+- 新增「一键还原」：`__apply_proxy_prefix_task` 的反向操作，把已套壳的 strm 改回官方裸直链（`https://resources.ani.rip` + 资源路径），写入前依然实测探测确认可达才覆盖。用于换加速源前清基线，或加速源全部失效时回退
+- 新增「探测加速源延迟/网速」：跟"数据源健康度"是两回事——用同一条样本直链分别套上每个配置的加速源前缀实测，标出网速最快的推荐节点，结果单独一张卡片展示
+
+### 资源补齐（回溯集数探测）
+
+**背景**：`ani-download.xml` 只是滚动窗口，只含近期资源（实测例子：某剧 RSS 里只有第 11 集）。但 ANi 同一部剧全部集数的直链只有集数数字不同，季度目录按首播月份命名不按每集实际上传日期——用户实测确认：
+
+```
+https://pro.pili.cc.cd/resources.ani.rip/2026-7/[ANi] 盡墳王 - 11 [1080P][Baha][WEB-DL][AAC AVC][CHT]?d=mp4
+```
+手动把 `- 11` 改成 `- 10`，同一个季度目录下依然能播放。
+
+**设计**：对本地已有的每部剧，从当前最早一集往前递减集数构造候选直链（`EPISODE_NUM_RE` 定位形如 `" - 11 ["` 的集数子串，避免误命中季度目录 `yyyy-mm` 或分辨率 `1080P` 里的数字），**严格串行探测（不并发）+ 探测间隔固定 sleep + 单次任务设总探测数上限**，一旦某一集探测不可达就停止继续往前探测这部剧（假设更早的集数同样不可达或已下架，没必要继续浪费请求）——这几条限流设计都是用户明确要求的，避免高频请求被目标站点风控封 IP。确认可达才写入，不是无脑改写。手动触发「一键补齐」，不进定时任务。
+
+### Relay 转发（实验性，未在真实 MoviePilot 环境验证过）
+
+**目标**：strm 文件里存的不再是裸直链，而是指向 MoviePilot 自己一个转发接口的 URL；这个接口在服务端（已经配好 `use_proxy`）代为请求真实的 ANi 直链，把视频字节流（支持 Range）转发给 Emby/Jellyfin。这样即使真实直链域名国内连不通，只要 MoviePilot 自己能走代理连通，播放就能成功——不需要改 Emby 任何配置、不需要额外端口。
+
+**实现依据**（对 [jxxghp/MoviePilot](https://github.com/jxxghp/MoviePilot) 官方源码的调研，不是猜的）：
+
+- 插件路由鉴权：`app/adapters/web/plugin/routes.py` 的路由挂载逻辑里，`get_api()` 返回的字典若带 `"allow_anonymous": True`，会完全跳过 MP 标准的登录态/apikey 鉴权依赖，路由变成匿名可访问——这正是 Emby/Jellyfin 这类不带 MP 登录态的客户端需要的。参照官方 `MoviePilot-Plugins` 仓库 `clashruleprovider` 插件的写法：路由匿名放行，函数体内自己用 `secrets.compare_digest` 比对 URL 参数里的 token
+- 流式转发：`RequestUtils`（`app/adapters/network/http.py`）除了默认一次性下载完的 `get_res()`，还有专门的 `get_stream()`（`@contextmanager`），底层是标准 `requests.Session`，可以 `iter_content()` 分块转发，不用把整个视频文件读进内存
+
+**具体实现**：`get_api()` 注册 `/relay` 路由（`allow_anonymous: True`），`relay_endpoint()` 校验 URL 参数里的 token（`secrets.compare_digest` 语义，见 `RelayService.is_authorized`），透传请求方的 `Range` 头，手动驱动 `get_stream()` 这个 contextmanager（不用 `with`——`with` 会在函数 `return` 的瞬间就把上游 response 关闭，那时候 `StreamingResponse` 还一个字节都没消费），转发时用 `RelayService.filter_upstream_headers()` 剥掉 `Connection`/`Transfer-Encoding` 等 hop-by-hop 头，只保留 `Content-Type`/`Content-Length`/`Content-Range`/`Accept-Ranges`。
+
+**为什么标"实验性"**：以上源码调研针对的是 MoviePilot `v3` 分支（对应 `plugins.v3`），`v2` 宿主的 `RequestUtils`（`app.utils.http`）是否也有 `get_stream()` 没有单独确认过，风险高于 v3；更重要的是，`allow_anonymous` 鉴权绕过和整条转发链路（包括 Range 拖进度条是否流畅、多人同时播放对 MoviePilot 自身并发/内存的影响）都还没有在真实 MoviePilot + Emby/Jellyfin 环境端到端跑通过——sandbox 里只能对 `RelayService`/`relay_endpoint` 的纯逻辑分支（token 校验、上游失败处理、流式转发的生成器行为）做离线单测，FastAPI 路由挂载和真实网络这两层测不到。**默认关闭**，配置页有明显警示，建议先小范围试播一集确认没问题再放心用。
+
+跟「加速源」是二选一关系：开启 Relay 后新生成的 strm 不会再叠加加速源前缀（代理已经在 MoviePilot 发起请求时通过 `use_proxy` 生效，叠加前缀是画蛇添足）。
+
+### 配置页重新排版
+
+之前"维护操作"是一整张卡片，RSS 数据源维护、加速源管理、资源补齐全部堆在一起。拆成三张独立卡片（数据源维护/加速源管理/资源补齐），加上新增的 Relay 转发卡片，各自标题+配色+范围内的说明文字，不用再在一堆开关里找哪个说明对应哪个功能。
+
 ## v3.8.0 更新：本地strm一键套代理前缀
 
 **背景**：用户国内网络下 ANi 官方域名直连不通，需要走代理/反代镜像才能访问；本地已经攒了一批 strm 是裸官方地址（`resources.ani.rip`），想批量给它们套上一个能连通的镜像地址。
