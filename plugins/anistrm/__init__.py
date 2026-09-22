@@ -420,25 +420,15 @@ class AniRssAggregator:
 
 
 class StrmFileService:
-    @staticmethod
-    def normalize_stream_url(url: str) -> str:
-        if url.endswith(".mp4"):
-            return url
-        if url.endswith(".mp4?d=true"):
-            return url[:-7]
-        if "?d=mp4" in url:
-            return url.replace("?d=mp4", ".mp4")
-        if "?d=true" in url and ".mp4?d=true" not in url:
-            return url.replace("?d=true", "")
-        return url
-
     def touch_strm_file(self, storage_path: str, file_name: str, file_url: str) -> str:
         if not storage_path:
             logger.error("创建strm源文件失败：未配置存储目录")
             return "failed"
 
         safe_name = file_name.replace("/", "_").replace("\\", "_")
-        src_url = self.normalize_stream_url(file_url)
+        # RSS里的link本身就是可直接请求的直链(通常带?d=mp4参数)，不要对其做后缀改写，
+        # 改写会导致目标站点路由不到实际资源(404)——已实测踩过这个坑
+        src_url = file_url
 
         directory = Path(storage_path)
         file_path = directory / f"{safe_name}.strm"
