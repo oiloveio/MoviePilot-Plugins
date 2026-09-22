@@ -1053,12 +1053,12 @@ class ANiStrmHub(_PluginBase):
                     },
                     {
                         "component": "VCard",
-                        "props": {"variant": "tonal", "color": "warning", "class": "mt-4"},
+                        "props": {"variant": "tonal", "color": "info", "class": "mt-4"},
                         "content": [
                             {
                                 "component": "VCardTitle",
                                 "props": {"class": "text-subtitle-1"},
-                                "text": "维护操作——按需手动触发，探测/修复可能耗时几分钟",
+                                "text": "数据源维护——探测/修复/切换RSS来源，可能耗时几分钟",
                             },
                             {
                                 "component": "VCardText",
@@ -1068,7 +1068,7 @@ class ANiStrmHub(_PluginBase):
                                         "content": [
                                             {
                                                 "component": "VCol",
-                                                "props": {"cols": 12, "md": 4},
+                                                "props": {"cols": 12, "md": 6},
                                                 "content": [
                                                     {
                                                         "component": "VSwitch",
@@ -1081,7 +1081,7 @@ class ANiStrmHub(_PluginBase):
                                             },
                                             {
                                                 "component": "VCol",
-                                                "props": {"cols": 12, "md": 4},
+                                                "props": {"cols": 12, "md": 6},
                                                 "content": [
                                                     {
                                                         "component": "VSwitch",
@@ -1131,6 +1131,29 @@ class ANiStrmHub(_PluginBase):
                                         ],
                                     },
                                     {
+                                        "component": "div",
+                                        "props": {"class": "text-caption mt-2"},
+                                        "text": "修复失效链接：标题还在RSS窗口内的直接换成最新直链；不在窗口内的老集数，"
+                                        "从旧链接提取季度/文件名部分换上当前探测确认能连通的源的域名前缀，实测探测"
+                                        "确认可达才覆盖写入，探测不通过的保留原文件不动。运行状态和结果见下方详情页。",
+                                    },
+                                ],
+                            },
+                        ],
+                    },
+                    {
+                        "component": "VCard",
+                        "props": {"variant": "tonal", "color": "warning", "class": "mt-4"},
+                        "content": [
+                            {
+                                "component": "VCardTitle",
+                                "props": {"class": "text-subtitle-1"},
+                                "text": "加速源管理——国内直连不通ANi官方域名时，配代理/反代地址让strm能连上",
+                            },
+                            {
+                                "component": "VCardText",
+                                "content": [
+                                    {
                                         "component": "VRow",
                                         "content": [
                                             {
@@ -1145,8 +1168,7 @@ class ANiStrmHub(_PluginBase):
                                                             "rows": 3,
                                                             "placeholder": "https://pro.pili.cc.cd",
                                                             "hint": "把strm链接整体包一层这个地址(不管现在是裸官方地址还是走了"
-                                                            "别的镜像)，格式是「加速地址+原链接」，行首加#表示禁用。"
-                                                            "配了「当前生效加速源」后，新拉的番会自动套上，不用再手动跑套壳",
+                                                            "别的镜像)，格式是「加速地址+原链接」，行首加#表示禁用",
                                                             "persistent-hint": True,
                                                         },
                                                     }
@@ -1177,7 +1199,7 @@ class ANiStrmHub(_PluginBase):
                                         "content": [
                                             {
                                                 "component": "VCol",
-                                                "props": {"cols": 12, "md": 3},
+                                                "props": {"cols": 12, "md": 4},
                                                 "content": [
                                                     {
                                                         "component": "VSwitch",
@@ -1190,7 +1212,7 @@ class ANiStrmHub(_PluginBase):
                                             },
                                             {
                                                 "component": "VCol",
-                                                "props": {"cols": 12, "md": 3},
+                                                "props": {"cols": 12, "md": 4},
                                                 "content": [
                                                     {
                                                         "component": "VSwitch",
@@ -1203,7 +1225,7 @@ class ANiStrmHub(_PluginBase):
                                             },
                                             {
                                                 "component": "VCol",
-                                                "props": {"cols": 12, "md": 3},
+                                                "props": {"cols": 12, "md": 4},
                                                 "content": [
                                                     {
                                                         "component": "VSwitch",
@@ -1214,15 +1236,45 @@ class ANiStrmHub(_PluginBase):
                                                     }
                                                 ],
                                             },
+                                        ],
+                                    },
+                                    {
+                                        "component": "div",
+                                        "props": {"class": "text-caption mt-2"},
+                                        "text": "「探测加速源」测每个加速源的延迟/网速，推荐最快的一个；选好「当前生效"
+                                        "加速源」后，后续拉新番会自动套上，不用手动跑「一键加速」；「一键加速」"
+                                        "是对本地已有strm的一次性批量套壳；「一键还原」把已套壳的strm改回官方裸"
+                                        "直链，用于换加速源前清基线，或加速源全部失效时回退。均实测探测确认可达"
+                                        "才覆盖写入，探测不通过的保留原文件不动。",
+                                    },
+                                ],
+                            },
+                        ],
+                    },
+                    {
+                        "component": "VCard",
+                        "props": {"variant": "tonal", "color": "purple", "class": "mt-4"},
+                        "content": [
+                            {
+                                "component": "VCardTitle",
+                                "props": {"class": "text-subtitle-1"},
+                                "text": "资源补齐——把RSS滚动窗口之外的老集数找回来",
+                            },
+                            {
+                                "component": "VCardText",
+                                "content": [
+                                    {
+                                        "component": "VRow",
+                                        "content": [
                                             {
                                                 "component": "VCol",
-                                                "props": {"cols": 12, "md": 3},
+                                                "props": {"cols": 12, "md": 4},
                                                 "content": [
                                                     {
                                                         "component": "VSwitch",
                                                         "props": {
                                                             "model": "backfill_once",
-                                                            "label": "资源补齐(回溯本地已有剧集的老集数)",
+                                                            "label": "立即回溯补齐老集数",
                                                         },
                                                     }
                                                 ],
@@ -1232,12 +1284,11 @@ class ANiStrmHub(_PluginBase):
                                     {
                                         "component": "div",
                                         "props": {"class": "text-caption mt-2"},
-                                        "text": "修复失效链接：标题还在RSS窗口内的直接换成最新直链；不在窗口内的老集数，"
-                                        "从旧链接提取季度/文件名部分换上当前探测确认能连通的源的域名前缀，实测探测"
-                                        "确认可达才覆盖写入，探测不通过的保留原文件不动。"
-                                        "资源补齐：对本地已有的剧，往回探测更早的集数(同季度目录、只改集数号)，"
-                                        "严格串行+限流探测，探测到不可达就停止这部剧继续往前查，避免高频请求被封IP，"
-                                        "手动触发，不进定时任务。运行状态和结果见下方详情页。",
+                                        "text": "ani-download.xml只是滚动窗口，只含近期资源；ANi同一部剧全部集数的直链"
+                                        "只有集数数字不同，季度目录按首播月份命名。对本地已有的剧，从最早一集"
+                                        "往前递减集数构造候选直链，严格串行探测+限流(固定间隔+单次任务探测数上限)，"
+                                        "一旦某一集探测不可达就停止这部剧继续往前查，避免高频请求被目标站点风控封IP。"
+                                        "确认可达才写入，不是无脑改写。手动触发，不进定时任务，运行状态见下方详情页。",
                                     },
                                 ],
                             },
