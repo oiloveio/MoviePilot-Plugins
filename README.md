@@ -6,7 +6,7 @@ oiloveio 维护的 [MoviePilot](https://github.com/jxxghp/MoviePilot) 第三方�
 
 | 插件 | 说明 |
 |---|---|
-| [ANiStrmHub](./plugins.v3/anistrmhub/README.md) | 抓取 ANi 的 RSS 订阅源生成 strm 文件，由 MoviePilot 刮削入库、Emby/Jellyfin 直连播放。支持反代加速源、按番剧名称聚合存放、资源补齐、连通性探测 |
+| [ANiStrmHub](./plugins.v3/anistrmhub/README.md) | 抓取 ANi 的 RSS 订阅源生成 strm 文件，由 MoviePilot 刮削入库、Emby/Jellyfin 直连播放。支持反代加速源、按剧集分目录存放、补全历史剧集、连通性检测 |
 
 ## 仓库结构
 
@@ -37,10 +37,10 @@ MoviePilot-Plugins/
 
 - 数据源由单一目录扫描 API（被限流/封锁后插件完全失效）改为 RSS 订阅源，抓取失败时按内置候选池自动重试
 - 新增加速源：国内直连不通时给直链整体套一层反代前缀，每次拉取前自动验证可用性
-- 新增本地 strm 维护：刷新订阅源、套用/还原加速源、按存放方式重新归档
-- 新增资源补齐：回溯找回 RSS 滚动窗口之外的老集数，支持跨季度目录尝试
-- 新增连通性探测：状态码 + 响应内容双重校验，避免把返回 200 的错误页判定为可达
-- strm 可按番剧名称聚合存放，每部剧一个文件夹
+- 新增本地 strm 维护：重建直链、应用加速源、重建目录结构
+- 新增补全历史剧集：回溯找回 RSS 滚动窗口之外的老集数，支持跨季度目录尝试
+- 新增连通性检测：状态码 + 响应内容双重校验，避免把返回 200 的错误页判定为可达
+- strm 可按剧集分目录存放，每部剧一个文件夹
 - 提供 V2/V3 双实现与单元测试
 
 详细说明见[插件文档](./plugins.v3/anistrmhub/README.md)。

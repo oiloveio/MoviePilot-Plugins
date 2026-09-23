@@ -4,6 +4,7 @@
 在宿主虚拟环境下运行：../MoviePilot/.venv/bin/python -m pytest tests/v3/anistrmhub
 """
 import time
+from pathlib import Path
 from unittest.mock import MagicMock
 
 import pytest
@@ -14,6 +15,7 @@ from app.plugins.anistrmhub import (
     EPISODE_NUM_RE,
     FALLBACK_SUBSCRIPTION_POOL,
     LAYOUT_BY_TITLE,
+    MAX_CONSECUTIVE_PROBE_FAILURES,
     LAYOUT_FLAT,
     OFFICIAL_BASE_URL,
     StrmFileService,
@@ -973,6 +975,133 @@ class TestApplyAcceleratorTask:
 
         status = plugin.get_data("task_status")["apply_accelerator"]
         assert status["summary"] == "存储目录不存在"
+
+
+class TestMaintenanceLoopProtections:
+    """针对真实日志暴露的两个问题的回归测试：
+    - 一次维护任务跑满 72 分钟、1461 个文件全部探测超时、最终一个都没改
+    - 同一批任务里 499 个文件在执行期间被目录监控移走，被误报成"无法识别"
+    """
+
+    def _make_plugin(self, reachable: bool):
+        plugin = ANiStrmHub()
+        request_utils = MagicMock()
+        request_utils.get_res.return_value = _video_response(206 if reachable else 403)
+        plugin._relink_service._request_factory = lambda: request_utils
+        return plugin
+
+    def test_aborts_after_consecutive_probe_failures(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(time, "sleep", lambda *_: None)
+        plugin = self._make_plugin(reachable=False)
+        plugin._storageplace = str(tmp_path)
+        plugin._accelerator_prefix = "https://dead.example"
+        # 文件数远多于熔断阈值，验证不会把所有文件都探一遍
+        for i in range(40):
+            (tmp_path / f"第{i}集.strm").write_text(
+                f"https://resources.ani.rip/2026-7/ep{i}?d=mp4", encoding="utf-8"
+            )
+
+        getattr(plugin, "_ANiStrmHub__apply_accelerator_task")()
+
+        probes = plugin._relink_service._request_factory().get_res.call_count
+        assert probes == MAX_CONSECUTIVE_PROBE_FAILURES, f"熔断失效，共探测了{probes}次"
+        status = plugin.get_data("task_status")["apply_accelerator"]
+        assert "已中止" in status["summary"]
+
+    def test_consecutive_counter_resets_on_success(self, tmp_path, monkeypatch):
+        # 偶发失败不应触发熔断：只有"连续"失败到阈值才中止
+        monkeypatch.setattr(time, "sleep", lambda *_: None)
+        plugin = ANiStrmHub()
+        plugin._storageplace = str(tmp_path)
+        plugin._accelerator_prefix = "https://pro.pili.cc.cd"
+        results = []
+        for i in range(20):
+            (tmp_path / f"第{i:02d}集.strm").write_text(
+                f"https://resources.ani.rip/2026-7/ep{i}?d=mp4", encoding="utf-8"
+            )
+            results.append((None, "HTTP 403") if i % 2 else (50.0, None))
+        plugin._relink_service.probe_latency_ms = MagicMock(side_effect=results)
+
+        getattr(plugin, "_ANiStrmHub__apply_accelerator_task")()
+
+        status = plugin.get_data("task_status")["apply_accelerator"]
+        assert "已中止" not in status["summary"]
+        assert "已套上加速源=10" in status["summary"]
+
+    def test_file_removed_midway_counts_as_removed_not_unrecognized(self, tmp_path, monkeypatch):
+        # 长任务执行期间目录监控把文件转移走是正常现象，不该报成"无法识别"
+        monkeypatch.setattr(time, "sleep", lambda *_: None)
+        plugin = self._make_plugin(reachable=True)
+        plugin._storageplace = str(tmp_path)
+        plugin._accelerator_prefix = "https://pro.pili.cc.cd"
+        keep = tmp_path / "保留.strm"
+        keep.write_text("https://resources.ani.rip/2026-7/keep?d=mp4", encoding="utf-8")
+        vanish = tmp_path / "会消失.strm"
+        vanish.write_text("https://resources.ani.rip/2026-7/gone?d=mp4", encoding="utf-8")
+
+        real_read = Path.read_text
+
+        def read_text_but_vanish(self, *args, **kwargs):
+            if self.name == "会消失.strm":
+                raise FileNotFoundError(2, "No such file or directory", str(self))
+            return real_read(self, *args, **kwargs)
+
+        monkeypatch.setattr(Path, "read_text", read_text_but_vanish)
+
+        getattr(plugin, "_ANiStrmHub__apply_accelerator_task")()
+
+        status = plugin.get_data("task_status")["apply_accelerator"]
+        assert "已移除(跳过)=1" in status["summary"]
+        # 消失的文件不该被算进"无法识别"——摘要只列非零项，所以这一项应当整个不出现
+        assert "无法识别" not in status["summary"]
+        assert "已套上加速源=1" in status["summary"]
+
+
+class TestPendingTaskQueue:
+    def test_selected_tasks_run_sequentially(self):
+        # 多个维护开关同时勾选时必须串行执行：并发会互相看到对方写到一半的
+        # 状态，探测请求也会翻倍
+        plugin = ANiStrmHub()
+        order = []
+        pending = [
+            ("refresh_subscription", "重建直链", lambda: order.append("refresh")),
+            ("apply_accelerator", "应用加速源", lambda: order.append("accel")),
+            ("regroup", "重建目录结构", lambda: order.append("regroup")),
+        ]
+
+        getattr(plugin, "_ANiStrmHub__run_pending_tasks")(pending)
+
+        assert order == ["refresh", "accel", "regroup"]
+
+    def test_running_task_is_skipped(self):
+        plugin = ANiStrmHub()
+        getattr(plugin, "_ANiStrmHub__save_task_status")("regroup", "running", "进行中")
+        order = []
+        pending = [
+            ("regroup", "重建目录结构", lambda: order.append("regroup")),
+            ("backfill", "补全历史剧集", lambda: order.append("backfill")),
+        ]
+
+        getattr(plugin, "_ANiStrmHub__run_pending_tasks")(pending)
+
+        assert order == ["backfill"]
+
+    def test_one_task_failing_does_not_block_the_rest(self):
+        plugin = ANiStrmHub()
+        order = []
+
+        def boom():
+            raise RuntimeError("炸了")
+
+        pending = [
+            ("refresh_subscription", "重建直链", boom),
+            ("backfill", "补全历史剧集", lambda: order.append("backfill")),
+        ]
+
+        getattr(plugin, "_ANiStrmHub__run_pending_tasks")(pending)
+
+        assert order == ["backfill"]
+        assert "任务异常终止" in plugin.get_data("task_status")["refresh_subscription"]["summary"]
 
 
 class TestBackfillTask:

@@ -37,10 +37,10 @@ NON_EPISODE_BLACKLIST = "预告@PV@NCOP@NCED"
 SUBTITLE_EXTENSIONS = (".srt", ".vtt", ".ass", ".ssa")
 # 从直链里提取季度目录，如 .../2026-7/xxx.mp4 -> 2026-7
 SEASON_RE = re.compile(r"/(\d{4}-\d{1,2})/")
-# 匹配ANi标题/文件名里的集数，形如" - 11 ["，用于资源补齐时定位并替换集数数字。
+# 匹配ANi标题/文件名里的集数，形如" - 11 ["，用于补全历史剧集时定位并替换集数数字。
 # 要求前有"-"后有"["，避免误命中季度目录(yyyy-mm)或分辨率(1080P)里的数字。
 EPISODE_NUM_RE = re.compile(r"(-\s*)(\d{1,4})(\s*\[)")
-# 从ANi标题里切出剧名，用于"按番剧名称聚合"的目录归档。ANi命名格式固定是
+# 从ANi标题里切出剧名，用于"按剧集分目录"存放时的目录归档。ANi命名格式固定是
 # "[ANi] 剧名 - 集数 [1080P][Baha]..."，剧名就是开头的发布组标签之后、
 # " - 集数 ["之前那一段。两个要点：
 # 1. 集数不一定是整数——真实数据里有"- 12.5 ["(半集)和"- 電影 ["(剧场版)，
@@ -57,13 +57,17 @@ LAYOUT_BY_TITLE = "by_title"
 HTML_LIKE_PREFIXES = (b"<!doctype", b"<html", b"<?xml", b"{")
 NON_VIDEO_CONTENT_TYPES = ("text/html", "text/plain", "application/json", "application/xml", "text/xml")
 PROBE_RANGE_BYTES = 64  # 够读到mp4的ftyp box或分辨明显的错误页，开销依然很小
+# 维护类任务连续探测失败到这个次数就中止。目标地址整体不可达时逐个文件磨
+# 下去毫无意义：实测有一次跑满72分钟、1461个文件全部"无响应(连接失败或
+# 超时)"、最终一个文件都没改。
+MAX_CONSECUTIVE_PROBE_FAILURES = 10
 
 
 class ANiStrmHub(_PluginBase):
     plugin_name = "ANiStrmHub"
     plugin_desc = "填一个订阅源+一个加速地址即可，自动抓取ANi新番资源生成strm文件，mp刮削入库，媒体服务器直连播放"
     plugin_icon = "https://raw.githubusercontent.com/oiloveio/MoviePilot-Plugins/main/icons/anistrmhub.png"
-    plugin_version = "0.7.0"
+    plugin_version = "0.8.0"
     plugin_author = "oiloveio"
     author_url = "https://github.com/oiloveio"
     plugin_config_prefix = "anistrmhub_"
@@ -142,7 +146,7 @@ class ANiStrmHub(_PluginBase):
                 self._scheduler.add_job(
                     func=self.__task,
                     trigger=CronTrigger.from_crontab(self._cron),
-                    name="ANiStrmHub文件创建",
+                    name="ANiStrmHub订阅同步",
                 )
                 logger.info(f"ANiStrmHub定时任务创建成功：{self._cron}")
             except Exception as err:
@@ -154,80 +158,60 @@ class ANiStrmHub(_PluginBase):
                 func=self.__task,
                 trigger="date",
                 run_date=datetime.now(tz=pytz.timezone(settings.TZ)) + timedelta(seconds=3),
-                name="ANiStrmHub文件创建",
+                name="ANiStrmHub订阅同步",
             )
             self._onlyonce = False
 
+        pending: List[Tuple[str, str, Any]] = []
         if self._refresh_subscription_once:
-            if self.__is_task_running("refresh_subscription"):
-                logger.warning("ANiStrmHub刷新订阅源：上一次任务还在运行中，本次跳过排队，等它跑完再重新勾选")
-            else:
-                logger.info(f"ANiStrmHub服务启动，立即用当前订阅源刷新本地strm：{self._subscription_source}")
-                self._scheduler.add_job(
-                    func=self.__refresh_subscription_task,
-                    trigger="date",
-                    run_date=datetime.now(tz=pytz.timezone(settings.TZ)) + timedelta(seconds=3),
-                    name="ANiStrmHub刷新订阅源",
-                )
+            pending.append(("refresh_subscription", "重建直链", self.__refresh_subscription_task))
             self._refresh_subscription_once = False
-
         if self._apply_accelerator_once:
-            if self.__is_task_running("apply_accelerator"):
-                logger.warning("ANiStrmHub套用加速源：上一次任务还在运行中，本次跳过排队，等它跑完再重新勾选")
-            else:
-                logger.info(f"ANiStrmHub服务启动，立即给本地strm套用/还原加速源：{self._accelerator_prefix or '(还原裸链接)'}")
-                self._scheduler.add_job(
-                    func=self.__apply_accelerator_task,
-                    trigger="date",
-                    run_date=datetime.now(tz=pytz.timezone(settings.TZ)) + timedelta(seconds=3),
-                    name="ANiStrmHub套用加速源",
-                )
+            pending.append(("apply_accelerator", "应用加速源", self.__apply_accelerator_task))
             self._apply_accelerator_once = False
-
         if self._regroup_once:
-            if self.__is_task_running("regroup"):
-                logger.warning("ANiStrmHub重新归档：上一次任务还在运行中，本次跳过排队，等它跑完再重新勾选")
-            else:
-                logger.info(f"ANiStrmHub服务启动，立即按当前存放方式重新归档本地strm：{self._strm_layout}")
-                self._scheduler.add_job(
-                    func=self.__regroup_local_strm_task,
-                    trigger="date",
-                    run_date=datetime.now(tz=pytz.timezone(settings.TZ)) + timedelta(seconds=3),
-                    name="ANiStrmHub重新归档",
-                )
+            pending.append(("regroup", "重建目录结构", self.__regroup_local_strm_task))
             self._regroup_once = False
-
         if self._backfill_once:
-            if self.__is_task_running("backfill"):
-                logger.warning("ANiStrmHub资源补齐：上一次任务还在运行中，本次跳过排队，等它跑完再重新勾选")
-            else:
-                logger.info("ANiStrmHub服务启动，立即回溯探测本地已有剧集缺失的老集数")
-                self._scheduler.add_job(
-                    func=self.__backfill_task,
-                    trigger="date",
-                    run_date=datetime.now(tz=pytz.timezone(settings.TZ)) + timedelta(seconds=3),
-                    name="ANiStrmHub资源补齐",
-                )
+            pending.append(("backfill", "补全历史剧集", self.__backfill_task))
             self._backfill_once = False
-
         if self._detect_once:
-            if self.__is_task_running("detect"):
-                logger.warning("ANiStrmHub连通性探测：上一次任务还在运行中，本次跳过排队，等它跑完再重新勾选")
-            else:
-                logger.info("ANiStrmHub服务启动，立即探测订阅源连通性")
-                self._scheduler.add_job(
-                    func=self.__detect_task,
-                    trigger="date",
-                    run_date=datetime.now(tz=pytz.timezone(settings.TZ)) + timedelta(seconds=3),
-                    name="ANiStrmHub连通性探测",
-                )
+            pending.append(("detect", "连通性检测", self.__detect_task))
             self._detect_once = False
+
+        if pending:
+            logger.info(
+                "ANiStrmHub服务启动，依次执行维护任务：" + "、".join(name for _, name, _ in pending)
+            )
+            self._scheduler.add_job(
+                func=self.__run_pending_tasks,
+                args=[pending],
+                trigger="date",
+                run_date=datetime.now(tz=pytz.timezone(settings.TZ)) + timedelta(seconds=3),
+                name="ANiStrmHub维护任务",
+            )
 
         self.__update_config()
 
         if self._scheduler.get_jobs():
             self._scheduler.print_jobs()
             self._scheduler.start()
+
+    def __run_pending_tasks(self, pending: List[Tuple[str, str, Any]]) -> None:
+        """把勾选的多个维护开关串成一条队列依次执行，不并发。
+
+        这些任务会扫描并改写同一批 strm 文件：并发跑会互相看到对方写到一半的
+        中间状态，本来就受限流约束的探测请求也会成倍增加。实测日志里出现过
+        一次同时触发四个任务、彼此交叠运行的情况。"""
+        for task_key, task_name, func in pending:
+            if self.__is_task_running(task_key):
+                logger.warning(f"ANiStrmHub{task_name}：上一次任务还在运行中，本次跳过")
+                continue
+            try:
+                func()
+            except Exception as err:
+                logger.error(f"ANiStrmHub{task_name}：任务异常终止 - {err}")
+                self.__save_task_status(task_key, "done", f"任务异常终止：{err}")
 
     def __subscription_candidates(self, primary: str) -> List[str]:
         """主订阅源优先，抓取失败时按顺序自动试内置容灾候选池——这一步完全
@@ -250,32 +234,32 @@ class ANiStrmHub(_PluginBase):
         latency_ms, fail_reason = self._relink_service.probe_latency_ms(candidate)
         if latency_ms is None:
             logger.warning(
-                f"ANiStrmHub任务：加速源{prefix}套上本次样本直链探测不可达({fail_reason})，"
+                f"ANiStrmHub订阅同步：加速源{prefix}套上本次样本直链探测不可达({fail_reason})，"
                 f"本次任务不加速，写入裸直链"
             )
             return None
-        logger.info(f"ANiStrmHub任务：加速源{prefix}探测可达({latency_ms}ms)，新生成的strm将套用")
+        logger.info(f"ANiStrmHub订阅同步：加速源{prefix}探测可达({latency_ms}ms)，新生成的strm将套用")
         return prefix
 
     def __resolve_relative_dir(self, file_name: str) -> Optional[str]:
         """按当前"strm存放方式"决定这个文件该放在storageplace下的哪个子目录：
-        平铺返回None(直接放根目录)，按番剧名称聚合返回剧名目录。
+        平铺存放返回None(直接放根目录)，按剧集分目录返回剧名目录。
 
-        决定目录的逻辑只有这一处——拉新番(__task)和一键重新归档
-        (__regroup_local_strm_task)都调它；资源补齐用ref_file.with_name()
-        天然跟参照文件同目录、刷新订阅源/套用加速源都是原地改写内容不挪
+        决定目录的逻辑只有这一处——订阅同步(__task)和重建目录结构
+        (__regroup_local_strm_task)都调它；补全历史剧集用ref_file.with_name()
+        天然跟参照文件同目录、重建直链/应用加速源都是原地改写内容不挪
         位置，所以那三个任务不需要各自再解析一遍剧名(各写各的正是"同一部剧
         一半在文件夹里一半在根目录"这类分裂的来源)。"""
         if self._strm_layout != LAYOUT_BY_TITLE:
             return None
         series = StrmFileService.extract_series_title(file_name)
         if not series:
-            logger.info(f"ANiStrmHub：识别不出剧名，这个文件平铺到根目录：{file_name}")
+            logger.info(f"ANiStrmHub：无法解析剧名，改为平铺存放：{file_name}")
             return None
         return StrmFileService.safe_dir_name(series)
 
     def __finalize_strm_link(self, real_link: str) -> str:
-        """资源补齐用：套用当前配置的加速源(没配置就是原始直链)。资源补齐
+        """补全历史剧集用：套用当前配置的加速源(没配置就是原始直链)。这个任务
         本身对每个候选都会探测最终地址，天然有安全网，不需要像__task那样
         额外做一次性的"这个组合能不能用"预检查。"""
         accelerator = (self._accelerator_prefix or "").strip()
@@ -345,25 +329,25 @@ class ANiStrmHub(_PluginBase):
                 used_source = candidate
                 break
             except Exception as err:
-                logger.warning(f"ANiStrmHub任务：订阅源抓取失败，自动尝试下一个候选：{candidate} - {err}")
+                logger.warning(f"ANiStrmHub订阅同步：订阅源抓取失败，自动尝试下一个候选：{candidate} - {err}")
                 continue
 
         if entries is None:
-            logger.warning(f"ANiStrmHub任务：全部{len(tried)}个候选订阅源均抓取失败，本次任务结束")
+            logger.warning(f"ANiStrmHub订阅同步：全部{len(tried)}个候选订阅源均抓取失败，本次任务结束")
             self.__save_task_status("task", "done", f"全部候选订阅源均不可用({len(tried)}个)")
             return
 
         if used_source != primary:
-            logger.warning(f"ANiStrmHub任务：主订阅源{primary}不可用，本次自动切到{used_source}")
+            logger.warning(f"ANiStrmHub订阅同步：主订阅源{primary}不可用，本次自动切到{used_source}")
 
         if not entries:
-            logger.warning("ANiStrmHub订阅源RSS无内容，本次任务结束")
+            logger.warning("ANiStrmHub订阅同步：订阅源RSS无内容，本次任务结束")
             self.__save_task_status("task", "done", "订阅源RSS无内容")
             return
 
         entries = self.__apply_season_filter(entries)
         if not entries:
-            logger.warning("ANiStrmHub季度筛选后没有条目，本次任务结束")
+            logger.warning("ANiStrmHub订阅同步：季度筛选后没有条目，本次任务结束")
             self.__save_task_status("task", "done", "季度筛选后无条目")
             return
 
@@ -379,7 +363,7 @@ class ANiStrmHub(_PluginBase):
                 total_skipped += 1
                 continue
             if StrmFileService.is_blacklisted(title, NON_EPISODE_BLACKLIST):
-                logger.info(f"ANiStrmHub标题命中非正片关键词，跳过：{title}")
+                logger.info(f"ANiStrmHub订阅同步：标题命中非正片关键词，跳过：{title}")
                 total_skipped += 1
                 continue
 
@@ -406,17 +390,108 @@ class ANiStrmHub(_PluginBase):
             f"订阅源{used_source}共{len(entries)}条，新增={total_created}，"
             f"跳过(已存在)={total_exists}，跳过(附属文件)={total_skipped}，失败={total_failed}"
         )
-        logger.info(f"ANiStrmHub任务完成：{summary}")
+        logger.info(f"ANiStrmHub订阅同步完成：{summary}")
         self.__save_task_status("task", "done", summary)
 
+    def __rewrite_local_strm(
+        self,
+        task_key: str,
+        task_name: str,
+        kind_labels: List[str],
+        resolve,
+    ) -> Dict[str, int]:
+        """维护类任务共用的"扫描-改写"流程：遍历本地 strm，由 resolve 算出目标
+        链接，探测确认可达才覆盖写入。resolve(strm_file, old_content) 返回
+        (目标链接, 计数分类)；返回 (None, 计数分类) 表示这个文件只计数不处理。
+
+        三条共用的保护，都来自真实日志里暴露的问题：
+
+        1. **文件中途消失不算异常**：文件列表在任务开头一次性取出，而整个任务
+           可能跑几十分钟，这期间目录监控转移走文件是正常的。按"已移除"计数，
+           不再当成"无法识别"逐条报警(实测有一次刷了 499 条 WARNING)。
+        2. **连续探测失败熔断**：目标地址整体不可达时，逐个文件磨下去毫无意义
+           ——实测有一次跑满 72 分钟、1461 个文件全部超时、最终一个都没改。
+           连续失败达到 MAX_CONSECUTIVE_PROBE_FAILURES 就中止并在摘要里说明。
+        3. **逐文件日志降噪**：成功一律 debug，失败只有前几条 warning，其余
+           debug。数量统计交给结束时的汇总——实测一次任务刷了近 5000 行 INFO。
+        """
+        directory = Path(self._storageplace) if self._storageplace else None
+        if not directory or not directory.exists():
+            logger.warning(f"ANiStrmHub{task_name}：目录不存在 {self._storageplace}")
+            self.__save_task_status(task_key, "done", "存储目录不存在")
+            return {}
+
+        stats: Dict[str, int] = {label: 0 for label in kind_labels}
+        for label in ("无需更新", "探测不可达(保留原文件)", "无法识别(保留原文件)", "已移除(跳过)"):
+            stats.setdefault(label, 0)
+
+        consecutive_failures = 0
+        aborted_reason = None
+        logged_failures = 0
+
+        for strm_file in sorted(directory.rglob("*.strm")):
+            try:
+                old_content = strm_file.read_text(encoding="utf-8").strip()
+            except FileNotFoundError:
+                logger.debug(f"ANiStrmHub{task_name}：文件已不在，跳过 {strm_file.name}")
+                stats["已移除(跳过)"] += 1
+                continue
+            except Exception as err:
+                logger.warning(f"ANiStrmHub{task_name}：读取失败，跳过 {strm_file.name} - {err}")
+                stats["无法识别(保留原文件)"] += 1
+                continue
+
+            final_link, match_kind = resolve(strm_file, old_content)
+            if not final_link:
+                stats[match_kind] += 1
+                continue
+            if final_link == old_content:
+                stats["无需更新"] += 1
+                continue
+
+            time.sleep(0.3)
+            latency_ms, fail_reason = self._relink_service.probe_latency_ms(final_link)
+            if latency_ms is not None:
+                consecutive_failures = 0
+                try:
+                    strm_file.write_text(final_link, encoding="utf-8")
+                except FileNotFoundError:
+                    stats["已移除(跳过)"] += 1
+                    continue
+                stats[match_kind] += 1
+                logger.debug(f"ANiStrmHub{task_name}：已更新({latency_ms}ms) {strm_file.name}")
+                continue
+
+            stats["探测不可达(保留原文件)"] += 1
+            consecutive_failures += 1
+            message = f"ANiStrmHub{task_name}：探测不可达({fail_reason})，保留原文件 {strm_file.name}"
+            if logged_failures < 3:
+                logger.warning(message)
+                logged_failures += 1
+            else:
+                logger.debug(message)
+
+            if consecutive_failures >= MAX_CONSECUTIVE_PROBE_FAILURES:
+                aborted_reason = f"连续{consecutive_failures}次探测不可达({fail_reason})，判定目标地址整体不通，已中止"
+                logger.warning(f"ANiStrmHub{task_name}：{aborted_reason}")
+                break
+
+        summary = "，".join(f"{k}={v}" for k, v in stats.items() if v or k in kind_labels)
+        if aborted_reason:
+            summary = f"{aborted_reason}；{summary}"
+        logger.info(f"ANiStrmHub{task_name}完成：{summary}")
+        self.__save_task_status(task_key, "done", summary)
+        return stats
+
     def __refresh_subscription_task(self):
-        """用当前配置的这一个订阅源刷新本地已有的strm：标题还在RSS窗口内的
-        直接换成最新直链，不在窗口内的按路径迁移公式换成这个订阅源的域名
+        """用当前配置的这一个订阅源重建本地已有 strm 的直链：标题还在 RSS 窗口
+        内的直接换成最新直链，不在窗口内的按路径迁移公式换成这个订阅源的域名
         前缀。只有一个订阅源可选，不需要"目标订阅源"这种选择器概念。"""
         self.__save_task_status("refresh_subscription", "running", "进行中")
-        directory = Path(self._storageplace)
-        if not directory.exists():
-            logger.warning(f"ANiStrmHub刷新订阅源：目录不存在 {self._storageplace}")
+        # 先确认目录存在再抓RSS：目录都不在就没必要白发一次网络请求
+        directory = Path(self._storageplace) if self._storageplace else None
+        if not directory or not directory.exists():
+            logger.warning(f"ANiStrmHub重建直链：目录不存在 {self._storageplace}")
             self.__save_task_status("refresh_subscription", "done", "存储目录不存在")
             return
 
@@ -424,11 +499,11 @@ class ANiStrmHub(_PluginBase):
         try:
             entries = self._client.fetch_one_source(subscription)
         except Exception as err:
-            logger.warning(f"ANiStrmHub刷新订阅源：抓取失败，任务结束：{subscription} - {err}")
+            logger.warning(f"ANiStrmHub重建直链：订阅源抓取失败，任务结束：{subscription} - {err}")
             self.__save_task_status("refresh_subscription", "done", f"订阅源抓取失败：{err}")
             return
         if not entries:
-            logger.warning(f"ANiStrmHub刷新订阅源：RSS无内容，任务结束：{subscription}")
+            logger.warning(f"ANiStrmHub重建直链：订阅源RSS无内容，任务结束：{subscription}")
             self.__save_task_status("refresh_subscription", "done", "订阅源RSS无内容")
             return
 
@@ -436,126 +511,63 @@ class ANiStrmHub(_PluginBase):
         domain_prefix = StrmRelinkService.derive_prefix(entries[0]["link"])
         accelerator = (self._accelerator_prefix or "").strip()
 
-        stats = {
-            "标题精确匹配更新": 0,
-            "路径迁移更新": 0,
-            "无需更新": 0,
-            "探测不可达(保留原文件)": 0,
-            "无法识别(保留原文件)": 0,
-        }
-
-        for strm_file in sorted(directory.rglob("*.strm")):
-            try:
-                old_content = strm_file.read_text(encoding="utf-8").strip()
-            except Exception as err:
-                logger.warning(f"ANiStrmHub刷新订阅源：读取失败，跳过 {strm_file.name} - {err}")
-                stats["无法识别(保留原文件)"] += 1
-                continue
-
+        def resolve(strm_file: Path, old_content: str) -> Tuple[Optional[str], str]:
             matched_link = title_map.get(strm_file.stem)
             if matched_link:
                 bare_link = matched_link
                 match_kind = "标题精确匹配更新"
             elif domain_prefix:
-                # extract_resource_path对URL末尾的"季度/文件名?query"定位，
-                # 不管old_content当前有没有被套壳、被谁套壳都能定位到，不需要
+                # extract_resource_path 对 URL 末尾的"季度/文件名?query"定位，
+                # 不管 old_content 当前有没有被套壳、被谁套壳都能定位到，不需要
                 # 先剥壳——这一段本身就跟域名/加速源无关
                 resource_path = StrmRelinkService.extract_resource_path(old_content)
                 if not resource_path:
-                    stats["无法识别(保留原文件)"] += 1
-                    continue
+                    return None, "无法识别(保留原文件)"
                 bare_link = domain_prefix + resource_path
                 match_kind = "路径迁移更新"
             else:
-                stats["无法识别(保留原文件)"] += 1
-                continue
-
+                return None, "无法识别(保留原文件)"
             final_link = StrmRelinkService.build_proxied_url(bare_link, accelerator) if accelerator else bare_link
-            if final_link == old_content:
-                stats["无需更新"] += 1
-                continue
+            return final_link, match_kind
 
-            time.sleep(0.3)
-            latency_ms, fail_reason = self._relink_service.probe_latency_ms(final_link)
-            if latency_ms is not None:
-                strm_file.write_text(final_link, encoding="utf-8")
-                stats[match_kind] += 1
-                logger.info(f"ANiStrmHub刷新订阅源：成功({latency_ms}ms) {strm_file.name}")
-            else:
-                logger.warning(
-                    f"ANiStrmHub刷新订阅源：候选链接探测不可达({fail_reason})，保留原文件 {strm_file.name}"
-                )
-                stats["探测不可达(保留原文件)"] += 1
-
-        summary = "，".join(f"{k}={v}" for k, v in stats.items())
-        logger.info(f"ANiStrmHub刷新订阅源完成：{summary}")
-        self.__save_task_status("refresh_subscription", "done", summary)
+        self.__rewrite_local_strm(
+            "refresh_subscription",
+            "重建直链",
+            ["标题精确匹配更新", "路径迁移更新"],
+            resolve,
+        )
 
     def __apply_accelerator_task(self):
-        """用当前配置的这一个加速源(留空=不加速)重新套用/还原本地全部strm。
-        只有一个加速源可选，"套上"和"去掉"是同一个操作依据accelerator_prefix
-        是否为空决定，不需要"一键加速"/"一键还原"两个分开的开关，也不需要
-        "目标加速源"这种选择器概念。
+        """用当前配置的这一个加速源(留空=不加速)重新套用/还原本地全部 strm。
+        "套上"和"去掉"是同一个操作，依据 accelerator_prefix 是否为空决定。
 
-        不管strm当前内容有没有被套壳、被谁套壳，都先用extract_resource_path
+        不管 strm 当前内容有没有被套壳、被谁套壳，都先用 extract_resource_path
         定位出跟域名无关的"季度/文件名?query"这一段，配上官方域名重建裸直链，
-        再按需要套用当前加速源——这样加速源字段从A改成B、或者直接清空，都能
+        再按需要套用当前加速源——这样加速源字段从 A 改成 B、或者直接清空，都能
         正确处理，不需要"记住"当初到底是哪个加速源套的壳。"""
         self.__save_task_status("apply_accelerator", "running", "进行中")
-        directory = Path(self._storageplace)
-        if not directory.exists():
-            logger.warning(f"ANiStrmHub套用加速源：目录不存在 {self._storageplace}")
-            self.__save_task_status("apply_accelerator", "done", "存储目录不存在")
-            return
-
         accelerator = (self._accelerator_prefix or "").strip()
-        stats = {
-            "已套上加速源": 0,
-            "已还原为裸链接": 0,
-            "无需更新": 0,
-            "探测不可达(保留原文件)": 0,
-            "无法识别(保留原文件)": 0,
-        }
+        applied_kind = "已套上加速源" if accelerator else "已还原为裸链接"
 
-        for strm_file in sorted(directory.rglob("*.strm")):
-            try:
-                old_content = strm_file.read_text(encoding="utf-8").strip()
-            except Exception as err:
-                logger.warning(f"ANiStrmHub套用加速源：读取失败，跳过 {strm_file.name} - {err}")
-                stats["无法识别(保留原文件)"] += 1
-                continue
-
+        def resolve(strm_file: Path, old_content: str) -> Tuple[Optional[str], str]:
             resource_path = StrmRelinkService.extract_resource_path(old_content)
             if not resource_path:
-                stats["无法识别(保留原文件)"] += 1
-                continue
+                return None, "无法识别(保留原文件)"
             bare_link = f"{OFFICIAL_BASE_URL}/{resource_path}"
-
             final_link = StrmRelinkService.build_proxied_url(bare_link, accelerator) if accelerator else bare_link
-            if final_link == old_content:
-                stats["无需更新"] += 1
-                continue
+            return final_link, applied_kind
 
-            time.sleep(0.3)
-            latency_ms, fail_reason = self._relink_service.probe_latency_ms(final_link)
-            if latency_ms is not None:
-                strm_file.write_text(final_link, encoding="utf-8")
-                stats["已套上加速源" if accelerator else "已还原为裸链接"] += 1
-                logger.info(f"ANiStrmHub套用加速源：成功({latency_ms}ms) {strm_file.name}")
-            else:
-                logger.warning(
-                    f"ANiStrmHub套用加速源：候选链接探测不可达({fail_reason})，保留原文件 {strm_file.name}"
-                )
-                stats["探测不可达(保留原文件)"] += 1
-
-        summary = "，".join(f"{k}={v}" for k, v in stats.items())
-        logger.info(f"ANiStrmHub套用加速源完成：{summary}")
-        self.__save_task_status("apply_accelerator", "done", summary)
+        self.__rewrite_local_strm(
+            "apply_accelerator",
+            "应用加速源",
+            [applied_kind],
+            resolve,
+        )
 
     def __regroup_local_strm_task(self):
-        """按当前「strm存放方式」把本地已有的strm重新归档：选"按番剧名称
-        聚合"就把散在根目录(以及历史版本留下的季度目录)里的文件搬进
-        {剧名}/子目录，选"平铺"就把{剧名}/子目录里的文件搬回根目录。
+        """按当前「strm 存放方式」重建本地已有 strm 的目录结构：选"按剧集
+        分目录"就把散在根目录(以及历史版本留下的季度目录)里的文件搬进
+        {剧名}/子目录，选"平铺存放"就把{剧名}/子目录里的文件搬回根目录。
 
         只移动文件，不改文件内容，不发任何网络请求——改存放方式是纯本地
         整理，跟链接能不能连通是两回事，没必要在这里探测。目标位置已经有
@@ -563,7 +575,7 @@ class ANiStrmHub(_PluginBase):
         self.__save_task_status("regroup", "running", "进行中")
         directory = Path(self._storageplace) if self._storageplace else None
         if not directory or not directory.exists():
-            logger.warning(f"ANiStrmHub重新归档：目录不存在 {self._storageplace}")
+            logger.warning(f"ANiStrmHub重建目录结构：目录不存在 {self._storageplace}")
             self.__save_task_status("regroup", "done", "存储目录不存在")
             return
 
@@ -586,7 +598,7 @@ class ANiStrmHub(_PluginBase):
                 stats["位置已正确"] += 1
                 continue
             if target.exists():
-                logger.warning(f"ANiStrmHub重新归档：目标位置已有同名文件，保留原文件 {strm_file.name}")
+                logger.warning(f"ANiStrmHub重建目录结构：目标位置已有同名文件，保留原文件 {strm_file.name}")
                 stats["目标已存在(保留原文件)"] += 1
                 continue
 
@@ -594,9 +606,9 @@ class ANiStrmHub(_PluginBase):
                 target_dir.mkdir(parents=True, exist_ok=True)
                 strm_file.rename(target)
                 stats["识别不出剧名(平铺到根目录)" if unrecognized else "已归档"] += 1
-                logger.debug(f"ANiStrmHub重新归档：{strm_file.name} -> {target.parent.name or '根目录'}")
+                logger.debug(f"ANiStrmHub重建目录结构：{strm_file.name} -> {target.parent.name or '根目录'}")
             except Exception as err:
-                logger.warning(f"ANiStrmHub重新归档：移动失败 {strm_file.name} - {err}")
+                logger.warning(f"ANiStrmHub重建目录结构：移动失败 {strm_file.name} - {err}")
                 stats["移动失败"] += 1
 
         # 自底向上清理空目录：rmdir只对空目录成功，非空的直接跳过
@@ -611,11 +623,11 @@ class ANiStrmHub(_PluginBase):
                 continue
 
         summary = "，".join(f"{k}={v}" for k, v in stats.items()) + f"，清理空目录={removed_dirs}"
-        logger.info(f"ANiStrmHub重新归档完成：{summary}")
+        logger.info(f"ANiStrmHub重建目录结构完成：{summary}")
         self.__save_task_status("regroup", "done", summary)
 
     def __backfill_task(self):
-        """资源补齐：ani-download.xml这个RSS只是滚动窗口，只含近期资源，更早的
+        """补全历史剧集：ani-download.xml这个RSS只是滚动窗口，只含近期资源，更早的
         集数不在里面，但ANi同一部剧全部集数的直链只有集数数字不同——实测确认
         把"- 11"改成"- 10"依然能播放。
 
@@ -633,7 +645,7 @@ class ANiStrmHub(_PluginBase):
         self.__save_task_status("backfill", "running", "进行中")
         directory = Path(self._storageplace)
         if not directory.exists():
-            logger.warning(f"ANiStrmHub资源补齐：目录不存在 {self._storageplace}")
+            logger.warning(f"ANiStrmHub补全历史剧集：目录不存在 {self._storageplace}")
             self.__save_task_status("backfill", "done", "存储目录不存在")
             return
 
@@ -663,7 +675,7 @@ class ANiStrmHub(_PluginBase):
                 series_min_ep[series_key] = (ep_num, strm_file)
 
         if not series_min_ep:
-            logger.info("ANiStrmHub资源补齐：本地没有可识别集数的strm，任务结束")
+            logger.info("ANiStrmHub补全历史剧集：本地没有可识别集数的strm，任务结束")
             self.__save_task_status("backfill", "done", "本地无可识别集数的资源")
             return
 
@@ -672,7 +684,7 @@ class ANiStrmHub(_PluginBase):
 
         for min_ep, ref_file in series_min_ep.values():
             if total_probed >= max_probes_total:
-                logger.info("ANiStrmHub资源补齐：本次任务探测次数已达上限，剩余剧集留到下次手动运行")
+                logger.info("ANiStrmHub补全历史剧集：本次任务探测次数已达上限，剩余剧集留到下次手动运行")
                 break
             try:
                 ref_content = ref_file.read_text(encoding="utf-8").strip()
@@ -732,26 +744,26 @@ class ANiStrmHub(_PluginBase):
                             found = True
                             current_season = season_option
                             logger.info(
-                                f"ANiStrmHub资源补齐：成功补上第{candidate_ep}集"
+                                f"ANiStrmHub补全历史剧集：成功补上第{candidate_ep}集"
                                 f"(季度={season_option}，{latency_ms}ms) {candidate_path.name}"
                             )
                         except Exception as err:
-                            logger.warning(f"ANiStrmHub资源补齐：写入失败 {candidate_path.name} - {err}")
+                            logger.warning(f"ANiStrmHub补全历史剧集：写入失败 {candidate_path.name} - {err}")
                         break
                     logger.debug(
-                        f"ANiStrmHub资源补齐：{ref_file.stem} 第{candidate_ep}集在季度{season_option}"
+                        f"ANiStrmHub补全历史剧集：{ref_file.stem} 第{candidate_ep}集在季度{season_option}"
                         f"不可达({fail_reason})，尝试下一个候选季度"
                     )
 
                 if not found:
                     logger.info(
-                        f"ANiStrmHub资源补齐：{ref_file.stem} 回溯到第{candidate_ep}集，"
+                        f"ANiStrmHub补全历史剧集：{ref_file.stem} 回溯到第{candidate_ep}集，"
                         f"尝试过的{len(season_candidates)}个季度文件夹均不可达，停止继续往前探测这部剧"
                     )
                     break
 
         summary = f"探测{total_probed}次，成功补齐{total_created}集"
-        logger.info(f"ANiStrmHub资源补齐完成：{summary}")
+        logger.info(f"ANiStrmHub补全历史剧集完成：{summary}")
         self.__save_task_status("backfill", "done", summary)
 
     def __detect_task(self):
@@ -779,7 +791,7 @@ class ANiStrmHub(_PluginBase):
             except Exception as err:
                 row["error"] = str(err)
                 rows.append(row)
-                logger.warning(f"ANiStrmHub连通性探测：{url} RSS抓取失败 - {err}")
+                logger.warning(f"ANiStrmHub连通性检测：{url} RSS抓取失败 - {err}")
                 continue
 
             row["rss_ok"] = True
@@ -812,7 +824,7 @@ class ANiStrmHub(_PluginBase):
         self.save_data("local_distribution", {"checked_at": checked_at, **distribution})
 
         summary = f"{len(candidates)}个候选订阅源，本地strm共{distribution.get('total', 0)}个"
-        logger.info(f"ANiStrmHub连通性探测完成：{summary}")
+        logger.info(f"ANiStrmHub连通性检测完成：{summary}")
         self.__save_task_status("detect", "done", summary)
 
     def __save_task_status(self, task_key: str, status: str, summary: str = ""):
@@ -922,10 +934,10 @@ class ANiStrmHub(_PluginBase):
                                                 "model": "strm_layout",
                                                 "label": "strm存放方式",
                                                 "items": [
-                                                    {"title": "平铺", "value": LAYOUT_FLAT},
-                                                    {"title": "按番剧名称聚合", "value": LAYOUT_BY_TITLE},
+                                                    {"title": "平铺存放", "value": LAYOUT_FLAT},
+                                                    {"title": "按剧集分目录", "value": LAYOUT_BY_TITLE},
                                                 ],
-                                                "hint": "改后运行下方「重新归档」",
+                                                "hint": "改后运行下方「重建目录结构」",
                                                 "persistent-hint": True,
                                             },
                                         },
@@ -1007,7 +1019,7 @@ class ANiStrmHub(_PluginBase):
                                                     "component": "VSwitch",
                                                     "props": {
                                                         "model": "refresh_subscription_once",
-                                                        "label": "刷新订阅源",
+                                                        "label": "重建直链",
                                                     },
                                                 },
                                             ),
@@ -1017,7 +1029,7 @@ class ANiStrmHub(_PluginBase):
                                                     "component": "VSwitch",
                                                     "props": {
                                                         "model": "apply_accelerator_once",
-                                                        "label": "套用/还原加速源",
+                                                        "label": "应用加速源",
                                                     },
                                                 },
                                             ),
@@ -1025,7 +1037,7 @@ class ANiStrmHub(_PluginBase):
                                                 4,
                                                 {
                                                     "component": "VSwitch",
-                                                    "props": {"model": "regroup_once", "label": "重新归档"},
+                                                    "props": {"model": "regroup_once", "label": "重建目录结构"},
                                                 },
                                             ),
                                         ]
@@ -1036,14 +1048,14 @@ class ANiStrmHub(_PluginBase):
                                                 4,
                                                 {
                                                     "component": "VSwitch",
-                                                    "props": {"model": "backfill_once", "label": "补齐老集数"},
+                                                    "props": {"model": "backfill_once", "label": "补全历史剧集"},
                                                 },
                                             ),
                                             (
                                                 4,
                                                 {
                                                     "component": "VSwitch",
-                                                    "props": {"model": "detect_once", "label": "探测连通性"},
+                                                    "props": {"model": "detect_once", "label": "连通性检测"},
                                                 },
                                             ),
                                         ]
@@ -1051,10 +1063,10 @@ class ANiStrmHub(_PluginBase):
                                     {
                                         "component": "div",
                                         "props": {"class": "text-caption", "style": "white-space: pre-line;"},
-                                        "text": "手动触发，可能耗时几分钟，运行状态见详情页\n"
-                                        "刷新订阅源 / 套用还原加速源：改写 strm 链接，实测可达才覆盖\n"
-                                        "重新归档：按「strm存放方式」移动文件，不改内容\n"
-                                        "补齐老集数：回溯 RSS 窗口之外的早期集数，串行限流探测",
+                                        "text": "手动触发，多选时按顺序依次执行，运行状态见详情页\n"
+                                        "重建直链 / 应用加速源：改写 strm 链接，实测可达才覆盖\n"
+                                        "重建目录结构：按「strm 存放方式」移动文件，不改内容\n"
+                                        "补全历史剧集：回溯 RSS 窗口之外的早期集数，串行限流探测",
                                     },
                                 ],
                             },
@@ -1068,7 +1080,7 @@ class ANiStrmHub(_PluginBase):
                             "density": "compact",
                             "style": "white-space: pre-line;",
                             "text": "生成的 strm 建议配合「目录监控」转移到媒体库目录，由 MoviePilot 刮削\n"
-                            "存放方式选「按番剧名称聚合」时每部剧一个文件夹，Emby/Jellyfin 刮削更干净\n"
+                            "存放方式选「按剧集分目录」时每部剧一个文件夹，Emby/Jellyfin 刮削更干净\n"
                             "Emby 容器需额外设置小写 http_proxy 环境变量，否则无法提取媒体信息\n"
                             "社区加速源不稳定时，可用 GOST/Nginx 自建反代填入加速源\n"
                             "详细说明：https://github.com/oiloveio/MoviePilot-Plugins",
@@ -1114,12 +1126,12 @@ class ANiStrmHub(_PluginBase):
         )
 
     TASK_LABELS = {
-        "task": "拉取新番生成strm",
-        "refresh_subscription": "刷新订阅源",
-        "apply_accelerator": "套用/还原加速源",
-        "regroup": "按存放方式重新归档",
-        "backfill": "资源补齐(回溯集数)",
-        "detect": "连通性探测",
+        "task": "订阅同步",
+        "refresh_subscription": "重建直链",
+        "apply_accelerator": "应用加速源",
+        "regroup": "重建目录结构",
+        "backfill": "补全历史剧集",
+        "detect": "连通性检测",
     }
 
     def get_page(self) -> List[dict]:
@@ -1266,7 +1278,7 @@ class ANiStrmHub(_PluginBase):
                     "content": [
                         {
                             "component": "VCardTitle",
-                            "text": f"连通性探测（探测于 {connectivity_matrix.get('checked_at', '未知时间')}）",
+                            "text": f"连通性检测（检测于 {connectivity_matrix.get('checked_at', '未知时间')}）",
                         },
                         {
                             "component": "VCardText",
@@ -1433,8 +1445,8 @@ class StrmFileService:
 
     @staticmethod
     def extract_series_title(file_name: str) -> Optional[str]:
-        """从ANi的完整标题/文件名里切出剧名，"按番剧名称聚合"存放和"一键
-        重新归档"共用这一个函数——解析规则只有这一份，以后规则要改只改
+        """从ANi的完整标题/文件名里切出剧名，"按剧集分目录"存放和"重建目录
+        结构"共用这一个函数——解析规则只有这一份，以后规则要改只改
         这里，不会出现同一部剧一半在文件夹里一半在根目录的分裂。
 
         识别不出来返回None，调用方应当把这种文件平铺到根目录而不是瞎猜
@@ -1491,13 +1503,13 @@ class StrmRelinkService:
     核心转换公式：
     1. 域名替换（derive_prefix + extract_resource_path）：ANi各镜像的直链
        结构是 {前缀}/{季度}/{文件名}?d=mp4，其中"季度/文件名?d=mp4"这一段
-       在所有镜像间完全一致，只有前缀（域名）不同。"刷新订阅源"用的就是
+       在所有镜像间完全一致，只有前缀（域名）不同。"重建直链"用的就是
        这个公式。
     2. 前缀拼接（build_proxied_url）：把原始链接整体包一层反代前缀，格式仿
        "Proxy Everything"这类通用反代工具的用法，保留原host不做域名替换。
        加速源套壳用的是这个公式，两者不要混用。
     3. strip_known_accelerator是build_proxied_url的逆运算。
-    4. build_season_variant_link/build_episode_variant_link是资源补齐用的
+    4. build_season_variant_link/build_episode_variant_link是补全历史剧集用的
        候选构造：分别替换季度目录和集数数字，其余部分原样保留。
     """
 
@@ -1558,7 +1570,7 @@ class StrmRelinkService:
 
     @staticmethod
     def build_episode_variant_link(original_link: str, new_episode: int) -> Optional[str]:
-        """资源补齐用：把直链里的集数数字换成new_episode，域名/季度目录/文件名
+        """补全历史剧集用：把直链里的集数数字换成new_episode，域名/季度目录/文件名
         其它属性/查询参数原样保留。直链的文件名部分是URL编码过的(空格/方括号等)，
         先解码定位集数、替换后只对path重新编码，query本身没有需要编码的字符
         不用动。"""
@@ -1573,7 +1585,7 @@ class StrmRelinkService:
 
     @staticmethod
     def build_season_variant_link(link: str, new_season: str) -> Optional[str]:
-        """资源补齐用：把直链里的季度目录换成new_season，其余部分原样保留。
+        """补全历史剧集用：把直链里的季度目录换成new_season，其余部分原样保留。
         季度目录是纯ASCII(yyyy-m格式)，不涉及URL编码，直接在原始字符串上
         替换即可，不需要像集数那样先unquote再quote。"""
         match = SEASON_RE.search(link)
@@ -1583,7 +1595,7 @@ class StrmRelinkService:
 
     @staticmethod
     def season_distance(season_a: str, season_b: str) -> int:
-        """两个yyyy-m季度目录之间相差多少个月，资源补齐按这个距离由近到远
+        """两个yyyy-m季度目录之间相差多少个月，补全历史剧集按这个距离由近到远
         尝试候选季度文件夹——同一部剧更早的集数大概率落在离当前季度不太远
         的月份里，优先试近的能省探测次数。"""
 
