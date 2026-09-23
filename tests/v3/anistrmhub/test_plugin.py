@@ -12,6 +12,8 @@ from app.plugins.anistrmhub import (
     ANiStrmHub,
     AniRssAggregator,
     EPISODE_NUM_RE,
+    FALLBACK_SUBSCRIPTION_POOL,
+    OFFICIAL_BASE_URL,
     StrmFileService,
     StrmRelinkService,
 )
@@ -31,6 +33,13 @@ SAMPLE_RSS = """<?xml version="1.0" encoding="UTF-8"?>
 </item>
 </channel>
 </rss>"""
+
+# mp4容器的最小合法魔数字节：偏移4-8是'ftyp'
+MP4_MAGIC_CONTENT = b"\x00\x00\x00\x18ftypmp42" + b"\x00" * 40
+
+
+def _video_response(status_code=206):
+    return MagicMock(status_code=status_code, headers={"Content-Type": "video/mp4"}, content=MP4_MAGIC_CONTENT)
 
 
 class TestParseRss:
@@ -88,9 +97,6 @@ class TestResourcePathExtraction:
 
 
 class TestBuildProxiedUrl:
-    # 借鉴用户实测确认的"Proxy Everything"风格前缀拼接格式：
-    # 代理前缀 + 原host + 原path + 原query，保留原host(不是域名替换)
-
     def test_wraps_bare_official_link(self):
         result = StrmRelinkService.build_proxied_url(
             "https://resources.ani.rip/2025-10/xxx?d=mp4", "https://pro.pili.cc.cd"
@@ -142,7 +148,7 @@ class TestStripKnownAccelerator:
         assert matched is None
 
 
-class TestEpisodeVariant:
+class TestEpisodeAndSeasonVariant:
     def test_build_title_variant_replaces_episode_number(self):
         result = StrmRelinkService.build_title_variant(
             "[ANi] 盡墳王 - 11 [1080P][Baha][WEB-DL][AAC AVC][CHT]", 10
@@ -170,11 +176,28 @@ class TestEpisodeVariant:
     def test_build_episode_variant_link_returns_none_when_no_episode_pattern(self):
         assert StrmRelinkService.build_episode_variant_link("https://example.com/no-episode-here", 10) is None
 
+    def test_build_season_variant_link_replaces_season_keeps_rest(self):
+        original = "https://pro.pili.cc.cd/resources.ani.rip/2026-7/ep.mp4?d=mp4"
+        result = StrmRelinkService.build_season_variant_link(original, "2026-4")
+        assert result == "https://pro.pili.cc.cd/resources.ani.rip/2026-4/ep.mp4?d=mp4"
+
+    def test_build_season_variant_link_returns_none_when_no_season_pattern(self):
+        assert StrmRelinkService.build_season_variant_link("https://example.com/no-season-here", "2026-4") is None
+
+    def test_season_distance_same_year(self):
+        assert StrmRelinkService.season_distance("2026-7", "2026-4") == 3
+
+    def test_season_distance_across_year_boundary(self):
+        assert StrmRelinkService.season_distance("2026-1", "2025-10") == 3
+
+    def test_season_distance_zero_for_same_season(self):
+        assert StrmRelinkService.season_distance("2026-7", "2026-7") == 0
+
 
 class TestProbeLatencyAndSpeed:
-    def test_probe_latency_ms_success(self):
+    def test_probe_latency_ms_success_with_valid_video_content(self):
         request_utils = MagicMock()
-        request_utils.get_res.return_value = MagicMock(status_code=206)
+        request_utils.get_res.return_value = _video_response()
         service = StrmRelinkService(request_factory=lambda: request_utils)
 
         latency_ms, reason = service.probe_latency_ms("https://alive.example/ep.mp4?d=mp4")
@@ -202,6 +225,44 @@ class TestProbeLatencyAndSpeed:
         assert latency_ms is None
         assert "无响应" in reason
 
+    def test_probe_latency_ms_rejects_html_error_page_despite_200(self):
+        # 回归测试：光看HTTP状态码不够，服务器可能返回200/206但吐的是错误页
+        request_utils = MagicMock()
+        request_utils.get_res.return_value = MagicMock(
+            status_code=200,
+            headers={"Content-Type": "text/html"},
+            content=b"<!doctype html><html><body>404 Not Found</body></html>",
+        )
+        service = StrmRelinkService(request_factory=lambda: request_utils)
+
+        latency_ms, reason = service.probe_latency_ms("https://fake-200.example/ep.mp4?d=mp4")
+
+        assert latency_ms is None
+        assert "不是视频数据" in reason
+
+    def test_probe_latency_ms_rejects_html_by_content_even_without_content_type(self):
+        request_utils = MagicMock()
+        request_utils.get_res.return_value = MagicMock(
+            status_code=206,
+            headers={},
+            content=b"<html><body>error</body></html>",
+        )
+        service = StrmRelinkService(request_factory=lambda: request_utils)
+
+        latency_ms, reason = service.probe_latency_ms("https://fake-206.example/ep.mp4?d=mp4")
+
+        assert latency_ms is None
+
+    def test_probe_latency_ms_accepts_mp4_magic_bytes(self):
+        request_utils = MagicMock()
+        request_utils.get_res.return_value = _video_response()
+        service = StrmRelinkService(request_factory=lambda: request_utils)
+
+        latency_ms, reason = service.probe_latency_ms("https://real-video.example/ep.mp4?d=mp4")
+
+        assert latency_ms is not None
+        assert reason is None
+
     def test_probe_speed_kbps_computes_from_downloaded_bytes(self):
         request_utils = MagicMock()
         request_utils.get_res.return_value = MagicMock(status_code=206, content=b"x" * 1024)
@@ -222,11 +283,11 @@ class TestProbeLatencyAndSpeed:
         # 回归测试：get_res(headers=...)是整体替换不是合并，早期实现丢了默认UA
         # 导致探测请求被目标站点当可疑流量拦截误判为不可达，已改用update_headers()。
         request_utils = MagicMock()
-        request_utils.get_res.return_value = MagicMock(status_code=206)
+        request_utils.get_res.return_value = _video_response()
         service = StrmRelinkService(request_factory=lambda: request_utils)
 
         assert service._verify_reachable("https://alive.example/ep.mp4?d=mp4") is True
-        request_utils.update_headers.assert_called_once_with({"Range": "bytes=0-0"})
+        request_utils.update_headers.assert_called_once_with({"Range": "bytes=0-63"})
         request_utils.get_res.assert_called_once_with("https://alive.example/ep.mp4?d=mp4")
 
 
@@ -242,14 +303,14 @@ class TestScanLocalDistribution:
 
         result = StrmRelinkService.scan_local_distribution(
             str(tmp_path),
-            domain_to_source={"resources.ani.rip": "https://api.ani.rip/ani-download.xml"},
+            domain_to_source={"resources.ani.rip": "当前配置"},
             accelerator_prefixes=["https://pro.pili.cc.cd"],
         )
 
         assert result["total"] == 3
         assert result["by_category"] == {
-            "https://api.ani.rip/ani-download.xml + https://pro.pili.cc.cd": 2,
-            "https://api.ani.rip/ani-download.xml 裸链": 1,
+            "当前配置 + https://pro.pili.cc.cd": 2,
+            "当前配置 裸链": 1,
         }
 
     def test_unrecognized_domain_falls_back_to_domain_label(self, tmp_path):
@@ -259,6 +320,10 @@ class TestScanLocalDistribution:
 
     def test_empty_directory_returns_zero(self, tmp_path):
         result = StrmRelinkService.scan_local_distribution(str(tmp_path / "does-not-exist"), {}, [])
+        assert result == {"total": 0, "by_category": {}}
+
+    def test_none_storage_path_returns_zero(self):
+        result = StrmRelinkService.scan_local_distribution(None, {}, [])
         assert result == {"total": 0, "by_category": {}}
 
 
@@ -301,8 +366,6 @@ class TestTouchStrmFile:
 
 
 class TestFilenameHelpers:
-    # 借鉴shanhai2333/ANiStrmPro的文件名清洗/黑名单/字幕过滤
-
     def test_is_subtitle_file(self):
         assert StrmFileService.is_subtitle_file("[ANi] 示例 - 01.srt") is True
         assert StrmFileService.is_subtitle_file("[ANi] 示例 - 01.ASS") is True
@@ -314,13 +377,6 @@ class TestFilenameHelpers:
 
     def test_is_blacklisted_empty_config_never_matches(self):
         assert StrmFileService.is_blacklisted("随便什么标题", "") is False
-
-    def test_clean_file_name_removes_configured_tokens(self):
-        result = StrmFileService.clean_file_name("[ANSUB][ANi] 示例 - 01.mp4", "[ANSUB]@NC-Raw")
-        assert result == "[ANi] 示例 - 01.mp4"
-
-    def test_clean_file_name_empty_config_returns_original(self):
-        assert StrmFileService.clean_file_name("原样标题.mp4", "") == "原样标题.mp4"
 
 
 class TestSeasonFilter:
@@ -361,66 +417,55 @@ class TestSeasonFilter:
         assert [e["title"] for e in result] == ["b", "c"]
 
 
-class TestParseSourceListAndActiveSelection:
-    # 5.0.0核心设计：订阅源和加速源是完全对称的"列表+单选生效项"模型
-
-    def test_parse_filters_blank_and_commented_lines(self):
+class TestSubscriptionCandidates:
+    def test_primary_first_then_pool_without_duplicate(self):
         plugin = ANiStrmHub()
-        plugin._subscription_sources = "https://a.example/rss.xml\n\n# https://disabled.example/rss.xml\nhttps://b.example/rss.xml"
-        assert getattr(plugin, "_ANiStrmHub__parse_subscription_sources")() == [
-            "https://a.example/rss.xml",
-            "https://b.example/rss.xml",
-        ]
+        primary = "https://aniapi.op5.de5.net/ani-download.xml"
+        result = getattr(plugin, "_ANiStrmHub__subscription_candidates")(primary)
+        assert result[0] == primary
+        assert result.count(primary) == 1
+        assert set(result) == set(FALLBACK_SUBSCRIPTION_POOL)
 
-    def test_parse_dedupes_and_strips_trailing_slash(self):
+    def test_unknown_primary_prepended_to_full_pool(self):
         plugin = ANiStrmHub()
-        plugin._accelerator_sources = "https://pro.pili.cc.cd/\nhttps://pro.pili.cc.cd"
-        assert getattr(plugin, "_ANiStrmHub__parse_accelerator_sources")() == ["https://pro.pili.cc.cd"]
+        primary = "https://my-own-mirror.example/ani-download.xml"
+        result = getattr(plugin, "_ANiStrmHub__subscription_candidates")(primary)
+        assert result[0] == primary
+        assert set(result[1:]) == set(FALLBACK_SUBSCRIPTION_POOL)
 
-    def test_active_subscription_defaults_to_first_when_unset(self):
-        plugin = ANiStrmHub()
-        plugin._subscription_sources = "https://a.example/rss.xml\nhttps://b.example/rss.xml"
-        assert getattr(plugin, "_ANiStrmHub__get_active_subscription_source")() == "https://a.example/rss.xml"
 
-    def test_active_subscription_honors_explicit_selection(self):
+class TestResolveAcceleratorForRun:
+    def test_returns_none_when_not_configured(self):
         plugin = ANiStrmHub()
-        plugin._subscription_sources = "https://a.example/rss.xml\nhttps://b.example/rss.xml"
-        plugin._active_subscription_source = "https://b.example/rss.xml"
-        assert getattr(plugin, "_ANiStrmHub__get_active_subscription_source")() == "https://b.example/rss.xml"
+        plugin._accelerator_prefix = ""
+        result = getattr(plugin, "_ANiStrmHub__resolve_accelerator_for_this_run")("https://x.example/y?d=mp4")
+        assert result is None
 
-    def test_active_subscription_falls_back_when_selection_removed_from_list(self):
+    def test_returns_prefix_when_probe_succeeds(self):
         plugin = ANiStrmHub()
-        plugin._subscription_sources = "https://a.example/rss.xml"
-        plugin._active_subscription_source = "https://removed.example/rss.xml"
-        assert getattr(plugin, "_ANiStrmHub__get_active_subscription_source")() == "https://a.example/rss.xml"
+        plugin._accelerator_prefix = "https://pro.pili.cc.cd"
+        plugin._relink_service.probe_latency_ms = MagicMock(return_value=(50.0, None))
+        result = getattr(plugin, "_ANiStrmHub__resolve_accelerator_for_this_run")("https://x.example/y?d=mp4")
+        assert result == "https://pro.pili.cc.cd"
 
-    def test_active_subscription_none_when_list_empty(self):
+    def test_returns_none_when_probe_fails(self):
         plugin = ANiStrmHub()
-        plugin._subscription_sources = ""
-        assert getattr(plugin, "_ANiStrmHub__get_active_subscription_source")() is None
-
-    def test_active_accelerator_none_when_list_empty(self):
-        plugin = ANiStrmHub()
-        plugin._accelerator_sources = ""
-        assert getattr(plugin, "_ANiStrmHub__get_active_accelerator_source")() is None
-
-    def test_active_accelerator_honors_explicit_selection(self):
-        plugin = ANiStrmHub()
-        plugin._accelerator_sources = "https://pro.pili.cc.cd\nhttps://pro.op5.de5.net"
-        plugin._active_accelerator_source = "https://pro.op5.de5.net"
-        assert getattr(plugin, "_ANiStrmHub__get_active_accelerator_source")() == "https://pro.op5.de5.net"
+        plugin._accelerator_prefix = "https://pro.pili.cc.cd"
+        plugin._relink_service.probe_latency_ms = MagicMock(return_value=(None, "HTTP 403"))
+        result = getattr(plugin, "_ANiStrmHub__resolve_accelerator_for_this_run")("https://x.example/y?d=mp4")
+        assert result is None
 
 
 class TestFinalizeStrmLink:
-    def test_wraps_with_active_accelerator(self):
+    def test_wraps_with_configured_accelerator(self):
         plugin = ANiStrmHub()
-        plugin._accelerator_sources = "https://pro.pili.cc.cd"
+        plugin._accelerator_prefix = "https://pro.pili.cc.cd"
         result = getattr(plugin, "_ANiStrmHub__finalize_strm_link")("https://resources.ani.rip/x?d=mp4")
         assert result == "https://pro.pili.cc.cd/resources.ani.rip/x?d=mp4"
 
     def test_no_accelerator_configured_returns_bare_link(self):
         plugin = ANiStrmHub()
-        plugin._accelerator_sources = ""
+        plugin._accelerator_prefix = ""
         result = getattr(plugin, "_ANiStrmHub__finalize_strm_link")("https://resources.ani.rip/x?d=mp4")
         assert result == "https://resources.ani.rip/x?d=mp4"
 
@@ -428,11 +473,11 @@ class TestFinalizeStrmLink:
 class TestTaskStatusGuard:
     def test_running_task_is_detected_and_done_is_not(self):
         plugin = ANiStrmHub()
-        getattr(plugin, "_ANiStrmHub__save_task_status")("apply_local_strm", "running", "进行中")
-        assert getattr(plugin, "_ANiStrmHub__is_task_running")("apply_local_strm") is True
+        getattr(plugin, "_ANiStrmHub__save_task_status")("refresh_subscription", "running", "进行中")
+        assert getattr(plugin, "_ANiStrmHub__is_task_running")("refresh_subscription") is True
 
-        getattr(plugin, "_ANiStrmHub__save_task_status")("apply_local_strm", "done", "跑完了")
-        assert getattr(plugin, "_ANiStrmHub__is_task_running")("apply_local_strm") is False
+        getattr(plugin, "_ANiStrmHub__save_task_status")("refresh_subscription", "done", "跑完了")
+        assert getattr(plugin, "_ANiStrmHub__is_task_running")("refresh_subscription") is False
 
     def test_unknown_task_is_not_running(self):
         plugin = ANiStrmHub()
@@ -456,21 +501,9 @@ class TestStopServiceNonBlocking:
 
 
 class TestMainTask:
-    def test_no_active_subscription_source_is_a_noop(self, tmp_path):
+    def test_uses_primary_source_when_reachable(self, tmp_path):
         plugin = ANiStrmHub()
-        plugin._subscription_sources = ""
-        plugin._storageplace = str(tmp_path)
-
-        getattr(plugin, "_ANiStrmHub__task")()
-
-        status = plugin.get_data("task_status")["task"]
-        assert status["summary"] == "未配置订阅源"
-        assert list(tmp_path.glob("*.strm")) == []
-
-    def test_creates_strm_from_active_source_only(self, tmp_path):
-        plugin = ANiStrmHub()
-        plugin._subscription_sources = "https://a.example/rss.xml\nhttps://b.example/rss.xml"
-        plugin._active_subscription_source = "https://a.example/rss.xml"
+        plugin._subscription_source = "https://a.example/rss.xml"
         plugin._storageplace = str(tmp_path)
         plugin._client.fetch_one_source = MagicMock(
             return_value=[{"title": "示例", "link": "https://resources.ani.rip/2026-7/ep.mp4?d=mp4"}]
@@ -479,39 +512,73 @@ class TestMainTask:
         getattr(plugin, "_ANiStrmHub__task")()
 
         plugin._client.fetch_one_source.assert_called_once_with("https://a.example/rss.xml")
-        written = (tmp_path / "示例.strm").read_text(encoding="utf-8")
+        written = (tmp_path / "2026-7" / "示例.strm").read_text(encoding="utf-8")
         assert written == "https://resources.ani.rip/2026-7/ep.mp4?d=mp4"
 
-    def test_new_strm_auto_wraps_with_active_accelerator(self, tmp_path):
+    def test_falls_back_to_pool_when_primary_fetch_fails(self, tmp_path):
         plugin = ANiStrmHub()
-        plugin._subscription_sources = "https://a.example/rss.xml"
-        plugin._accelerator_sources = "https://pro.pili.cc.cd"
+        plugin._subscription_source = "https://dead.example/rss.xml"
         plugin._storageplace = str(tmp_path)
-        plugin._client.fetch_one_source = MagicMock(
-            return_value=[{"title": "示例", "link": "https://resources.ani.rip/2026-7/ep.mp4?d=mp4"}]
-        )
+
+        def fake_fetch(url):
+            if url == "https://dead.example/rss.xml":
+                raise ValueError("HTTP状态异常：403")
+            return [{"title": "示例", "link": "https://resources.ani.rip/2026-7/ep.mp4?d=mp4"}]
+
+        plugin._client.fetch_one_source = MagicMock(side_effect=fake_fetch)
 
         getattr(plugin, "_ANiStrmHub__task")()
 
-        written = (tmp_path / "示例.strm").read_text(encoding="utf-8")
-        assert written == "https://pro.pili.cc.cd/resources.ani.rip/2026-7/ep.mp4?d=mp4"
+        assert (tmp_path / "2026-7" / "示例.strm").exists()
+        status = plugin.get_data("task_status")["task"]
+        assert status["status"] == "done"
 
-    def test_subscription_fetch_failure_ends_task_gracefully(self, tmp_path):
+    def test_all_candidates_fail_records_status(self, tmp_path):
         plugin = ANiStrmHub()
-        plugin._subscription_sources = "https://a.example/rss.xml"
+        plugin._subscription_source = "https://dead.example/rss.xml"
         plugin._storageplace = str(tmp_path)
         plugin._client.fetch_one_source = MagicMock(side_effect=ValueError("HTTP状态异常：403"))
 
         getattr(plugin, "_ANiStrmHub__task")()
 
         status = plugin.get_data("task_status")["task"]
-        assert "订阅源抓取失败" in status["summary"]
+        assert "全部" in status["summary"] and "不可用" in status["summary"]
+        assert list(tmp_path.glob("*.strm")) == []
+
+    def test_accelerator_auto_disabled_when_precheck_fails(self, tmp_path):
+        plugin = ANiStrmHub()
+        plugin._subscription_source = "https://a.example/rss.xml"
+        plugin._accelerator_prefix = "https://pro.pili.cc.cd"
+        plugin._storageplace = str(tmp_path)
+        plugin._client.fetch_one_source = MagicMock(
+            return_value=[{"title": "示例", "link": "https://resources.ani.rip/2026-7/ep.mp4?d=mp4"}]
+        )
+        plugin._relink_service.probe_latency_ms = MagicMock(return_value=(None, "HTTP 403"))
+
+        getattr(plugin, "_ANiStrmHub__task")()
+
+        written = (tmp_path / "2026-7" / "示例.strm").read_text(encoding="utf-8")
+        assert written == "https://resources.ani.rip/2026-7/ep.mp4?d=mp4"
+
+    def test_accelerator_applied_when_precheck_succeeds(self, tmp_path):
+        plugin = ANiStrmHub()
+        plugin._subscription_source = "https://a.example/rss.xml"
+        plugin._accelerator_prefix = "https://pro.pili.cc.cd"
+        plugin._storageplace = str(tmp_path)
+        plugin._client.fetch_one_source = MagicMock(
+            return_value=[{"title": "示例", "link": "https://resources.ani.rip/2026-7/ep.mp4?d=mp4"}]
+        )
+        plugin._relink_service.probe_latency_ms = MagicMock(return_value=(50.0, None))
+
+        getattr(plugin, "_ANiStrmHub__task")()
+
+        written = (tmp_path / "2026-7" / "示例.strm").read_text(encoding="utf-8")
+        assert written == "https://pro.pili.cc.cd/resources.ani.rip/2026-7/ep.mp4?d=mp4"
 
     def test_skips_subtitle_and_blacklisted_entries(self, tmp_path):
         plugin = ANiStrmHub()
-        plugin._subscription_sources = "https://a.example/rss.xml"
+        plugin._subscription_source = "https://a.example/rss.xml"
         plugin._storageplace = str(tmp_path)
-        plugin._filename_blacklist = "PV"
         plugin._client.fetch_one_source = MagicMock(
             return_value=[
                 {"title": "字幕.srt", "link": "https://a.example/x.srt?d=mp4"},
@@ -527,158 +594,208 @@ class TestMainTask:
         assert created[0].stem == "正片"
 
 
-class TestApplyLocalStrmTask:
+class TestRefreshSubscriptionTask:
     def _make_plugin(self, reachable: bool = True):
         plugin = ANiStrmHub()
         request_utils = MagicMock()
-        request_utils.get_res.return_value = MagicMock(status_code=206 if reachable else 403)
+        request_utils.get_res.return_value = _video_response(206 if reachable else 403)
         plugin._relink_service._request_factory = lambda: request_utils
         return plugin
 
-    def test_no_target_selected_wraps_with_target_accelerator_only(self, tmp_path):
-        # 目标订阅源=不变 + 目标加速源=选中 => 等价于旧版"一键加速"
+    def test_title_match_uses_latest_link(self, tmp_path):
         plugin = self._make_plugin(reachable=True)
         plugin._storageplace = str(tmp_path)
-        plugin._target_subscription_source = None
-        plugin._target_accelerator_source = "https://pro.pili.cc.cd"
-        strm_file = tmp_path / "示例.mp4.strm"
-        strm_file.write_text("https://resources.ani.rip/2025-10/xxx?d=mp4", encoding="utf-8")
-
-        getattr(plugin, "_ANiStrmHub__apply_local_strm_task")()
-
-        assert strm_file.read_text().strip() == "https://pro.pili.cc.cd/resources.ani.rip/2025-10/xxx?d=mp4"
-        status = plugin.get_data("task_status")["apply_local_strm"]
-        assert "仅调整加速套壳=1" in status["summary"]
-
-    def test_no_target_accelerator_restores_bare_link(self, tmp_path):
-        # 目标订阅源=不变 + 目标加速源=不加速 => 等价于旧版"一键还原"
-        plugin = self._make_plugin(reachable=True)
-        plugin._storageplace = str(tmp_path)
-        plugin._accelerator_sources = "https://pro.pili.cc.cd"
-        plugin._target_subscription_source = None
-        plugin._target_accelerator_source = None
-        strm_file = tmp_path / "示例.mp4.strm"
-        strm_file.write_text(
-            "https://pro.pili.cc.cd/resources.ani.rip/2025-10/xxx?d=mp4", encoding="utf-8"
-        )
-
-        getattr(plugin, "_ANiStrmHub__apply_local_strm_task")()
-
-        assert strm_file.read_text().strip() == "https://resources.ani.rip/2025-10/xxx?d=mp4"
-        status = plugin.get_data("task_status")["apply_local_strm"]
-        assert "仅调整加速套壳=1" in status["summary"]
-
-    def test_target_subscription_title_match_uses_latest_link(self, tmp_path):
-        plugin = self._make_plugin(reachable=True)
-        plugin._storageplace = str(tmp_path)
-        plugin._target_subscription_source = "https://b.example/rss.xml"
-        plugin._target_accelerator_source = None
         plugin._client.fetch_one_source = MagicMock(
             return_value=[{"title": "在窗口内的标题", "link": "https://alive.example/new.mp4?d=mp4"}]
         )
         strm_file = tmp_path / "在窗口内的标题.strm"
         strm_file.write_text("https://dead.example/old.mp4?d=mp4", encoding="utf-8")
 
-        getattr(plugin, "_ANiStrmHub__apply_local_strm_task")()
+        getattr(plugin, "_ANiStrmHub__refresh_subscription_task")()
 
         assert strm_file.read_text().strip() == "https://alive.example/new.mp4?d=mp4"
-        status = plugin.get_data("task_status")["apply_local_strm"]
+        status = plugin.get_data("task_status")["refresh_subscription"]
         assert "标题精确匹配更新=1" in status["summary"]
 
-    def test_target_subscription_path_migration_when_title_not_matched(self, tmp_path):
+    def test_path_migration_when_title_not_matched(self, tmp_path):
         plugin = self._make_plugin(reachable=True)
         plugin._storageplace = str(tmp_path)
-        plugin._target_subscription_source = "https://b.example/rss.xml"
-        plugin._target_accelerator_source = None
         plugin._client.fetch_one_source = MagicMock(
             return_value=[{"title": "别的标题", "link": "https://alive.example/2026-7/other.mp4?d=mp4"}]
         )
         strm_file = tmp_path / "不在窗口内的老标题.strm"
         strm_file.write_text("https://dead.example/2026-7/老标题.mp4?d=mp4", encoding="utf-8")
 
-        getattr(plugin, "_ANiStrmHub__apply_local_strm_task")()
+        getattr(plugin, "_ANiStrmHub__refresh_subscription_task")()
 
         assert strm_file.read_text().strip() == "https://alive.example/2026-7/老标题.mp4?d=mp4"
-        status = plugin.get_data("task_status")["apply_local_strm"]
-        assert "按订阅源迁移更新=1" in status["summary"]
+        status = plugin.get_data("task_status")["refresh_subscription"]
+        assert "路径迁移更新=1" in status["summary"]
 
-    def test_target_subscription_and_accelerator_combined(self, tmp_path):
+    def test_applies_configured_accelerator_after_refresh(self, tmp_path):
         plugin = self._make_plugin(reachable=True)
         plugin._storageplace = str(tmp_path)
-        plugin._target_subscription_source = "https://b.example/rss.xml"
-        plugin._target_accelerator_source = "https://pro.pili.cc.cd"
+        plugin._accelerator_prefix = "https://pro.pili.cc.cd"
         plugin._client.fetch_one_source = MagicMock(
             return_value=[{"title": "示例", "link": "https://resources.ani.rip/2026-7/ep.mp4?d=mp4"}]
         )
         strm_file = tmp_path / "示例.strm"
         strm_file.write_text("https://dead.example/old.mp4?d=mp4", encoding="utf-8")
 
-        getattr(plugin, "_ANiStrmHub__apply_local_strm_task")()
+        getattr(plugin, "_ANiStrmHub__refresh_subscription_task")()
 
         assert strm_file.read_text().strip() == "https://pro.pili.cc.cd/resources.ani.rip/2026-7/ep.mp4?d=mp4"
 
     def test_keeps_original_when_probe_fails(self, tmp_path):
         plugin = self._make_plugin(reachable=False)
         plugin._storageplace = str(tmp_path)
-        plugin._target_accelerator_source = "https://pro.pili.cc.cd"
-        strm_file = tmp_path / "示例.mp4.strm"
-        original = "https://resources.ani.rip/2025-10/xxx?d=mp4"
+        plugin._client.fetch_one_source = MagicMock(
+            return_value=[{"title": "在窗口内的标题", "link": "https://alive.example/new.mp4?d=mp4"}]
+        )
+        strm_file = tmp_path / "在窗口内的标题.strm"
+        original = "https://dead.example/old.mp4?d=mp4"
         strm_file.write_text(original, encoding="utf-8")
 
-        getattr(plugin, "_ANiStrmHub__apply_local_strm_task")()
+        getattr(plugin, "_ANiStrmHub__refresh_subscription_task")()
 
         assert strm_file.read_text().strip() == original
-        status = plugin.get_data("task_status")["apply_local_strm"]
+        status = plugin.get_data("task_status")["refresh_subscription"]
         assert "探测不可达(保留原文件)=1" in status["summary"]
 
-    def test_already_in_desired_state_is_a_noop(self, tmp_path):
+    def test_subscription_fetch_failure_ends_task_gracefully(self, tmp_path):
         plugin = self._make_plugin(reachable=True)
         plugin._storageplace = str(tmp_path)
-        plugin._target_accelerator_source = "https://pro.pili.cc.cd"
-        strm_file = tmp_path / "示例.mp4.strm"
-        already = "https://pro.pili.cc.cd/resources.ani.rip/2025-10/xxx?d=mp4"
-        strm_file.write_text(already, encoding="utf-8")
-
-        getattr(plugin, "_ANiStrmHub__apply_local_strm_task")()
-
-        assert strm_file.read_text().strip() == already
-        status = plugin.get_data("task_status")["apply_local_strm"]
-        assert "无需更新=1" in status["summary"]
-
-    def test_target_subscription_fetch_failure_ends_task_gracefully(self, tmp_path):
-        plugin = self._make_plugin(reachable=True)
-        plugin._storageplace = str(tmp_path)
-        plugin._target_subscription_source = "https://b.example/rss.xml"
         plugin._client.fetch_one_source = MagicMock(side_effect=ValueError("HTTP状态异常：403"))
 
-        getattr(plugin, "_ANiStrmHub__apply_local_strm_task")()
+        getattr(plugin, "_ANiStrmHub__refresh_subscription_task")()
 
-        status = plugin.get_data("task_status")["apply_local_strm"]
-        assert "目标订阅源抓取失败" in status["summary"]
+        status = plugin.get_data("task_status")["refresh_subscription"]
+        assert "订阅源抓取失败" in status["summary"]
 
     def test_storage_dir_missing_is_a_noop(self, tmp_path):
         plugin = self._make_plugin(reachable=True)
         plugin._storageplace = str(tmp_path / "does-not-exist")
 
-        getattr(plugin, "_ANiStrmHub__apply_local_strm_task")()
+        getattr(plugin, "_ANiStrmHub__refresh_subscription_task")()
 
-        status = plugin.get_data("task_status")["apply_local_strm"]
+        status = plugin.get_data("task_status")["refresh_subscription"]
+        assert status["summary"] == "存储目录不存在"
+
+
+class TestApplyAcceleratorTask:
+    def _make_plugin(self, reachable: bool = True):
+        plugin = ANiStrmHub()
+        request_utils = MagicMock()
+        request_utils.get_res.return_value = _video_response(206 if reachable else 403)
+        plugin._relink_service._request_factory = lambda: request_utils
+        return plugin
+
+    def test_wraps_bare_link_with_configured_accelerator(self, tmp_path):
+        plugin = self._make_plugin(reachable=True)
+        plugin._storageplace = str(tmp_path)
+        plugin._accelerator_prefix = "https://pro.pili.cc.cd"
+        strm_file = tmp_path / "示例.strm"
+        strm_file.write_text("https://resources.ani.rip/2025-10/xxx?d=mp4", encoding="utf-8")
+
+        getattr(plugin, "_ANiStrmHub__apply_accelerator_task")()
+
+        assert strm_file.read_text().strip() == "https://pro.pili.cc.cd/resources.ani.rip/2025-10/xxx?d=mp4"
+        status = plugin.get_data("task_status")["apply_accelerator"]
+        assert "已套上加速源=1" in status["summary"]
+
+    def test_restores_previously_wrapped_link_when_accelerator_cleared(self, tmp_path):
+        # 回归测试：还原不依赖"记住"当初套的是哪个加速源，靠extract_resource_path
+        # 定位资源路径+官方域名重建，所以清空加速源字段也能正确还原
+        plugin = self._make_plugin(reachable=True)
+        plugin._storageplace = str(tmp_path)
+        plugin._accelerator_prefix = ""
+        strm_file = tmp_path / "示例.strm"
+        strm_file.write_text(
+            "https://pro.pili.cc.cd/resources.ani.rip/2025-10/xxx?d=mp4", encoding="utf-8"
+        )
+
+        getattr(plugin, "_ANiStrmHub__apply_accelerator_task")()
+
+        assert strm_file.read_text().strip() == f"{OFFICIAL_BASE_URL}/2025-10/xxx?d=mp4"
+        status = plugin.get_data("task_status")["apply_accelerator"]
+        assert "已还原为裸链接=1" in status["summary"]
+
+    def test_switches_from_one_accelerator_to_another(self, tmp_path):
+        plugin = self._make_plugin(reachable=True)
+        plugin._storageplace = str(tmp_path)
+        plugin._accelerator_prefix = "https://pro.op5.de5.net"
+        strm_file = tmp_path / "示例.strm"
+        strm_file.write_text(
+            "https://pro.pili.cc.cd/resources.ani.rip/2025-10/xxx?d=mp4", encoding="utf-8"
+        )
+
+        getattr(plugin, "_ANiStrmHub__apply_accelerator_task")()
+
+        assert strm_file.read_text().strip() == "https://pro.op5.de5.net/resources.ani.rip/2025-10/xxx?d=mp4"
+
+    def test_keeps_original_when_probe_fails(self, tmp_path):
+        plugin = self._make_plugin(reachable=False)
+        plugin._storageplace = str(tmp_path)
+        plugin._accelerator_prefix = "https://pro.pili.cc.cd"
+        strm_file = tmp_path / "示例.strm"
+        original = "https://resources.ani.rip/2025-10/xxx?d=mp4"
+        strm_file.write_text(original, encoding="utf-8")
+
+        getattr(plugin, "_ANiStrmHub__apply_accelerator_task")()
+
+        assert strm_file.read_text().strip() == original
+        status = plugin.get_data("task_status")["apply_accelerator"]
+        assert "探测不可达(保留原文件)=1" in status["summary"]
+
+    def test_already_in_desired_state_is_a_noop(self, tmp_path):
+        plugin = self._make_plugin(reachable=True)
+        plugin._storageplace = str(tmp_path)
+        plugin._accelerator_prefix = "https://pro.pili.cc.cd"
+        strm_file = tmp_path / "示例.strm"
+        already = "https://pro.pili.cc.cd/resources.ani.rip/2025-10/xxx?d=mp4"
+        strm_file.write_text(already, encoding="utf-8")
+
+        getattr(plugin, "_ANiStrmHub__apply_accelerator_task")()
+
+        assert strm_file.read_text().strip() == already
+        status = plugin.get_data("task_status")["apply_accelerator"]
+        assert "无需更新=1" in status["summary"]
+
+    def test_storage_dir_missing_is_a_noop(self, tmp_path):
+        plugin = self._make_plugin(reachable=True)
+        plugin._storageplace = str(tmp_path / "does-not-exist")
+
+        getattr(plugin, "_ANiStrmHub__apply_accelerator_task")()
+
+        status = plugin.get_data("task_status")["apply_accelerator"]
         assert status["summary"] == "存储目录不存在"
 
 
 class TestBackfillTask:
-    def _make_plugin(self, reachable_down_to: int = 0):
-        """reachable_down_to: 探测在这个集数(含)以上都可达，低于它的一律403，
-        模拟"回溯到某一集连不上就停"的场景"""
+    def _make_plugin(self, reachable_seasons=None, reachable_down_to=0):
+        """reachable_seasons: {season: min_reachable_episode}，只有这个季度
+        文件夹里 >= min_reachable_episode 的集数才算可达；不在字典里的季度
+        一律不可达。默认(None)时退化成单季度场景：reachable_down_to以上都
+        可达，用当前季度。"""
         from urllib.parse import unquote
 
         plugin = ANiStrmHub()
         request_utils = MagicMock()
 
         def get_res_side_effect(url, **kwargs):
-            match = EPISODE_NUM_RE.search(unquote(url))
-            ep = int(match.group(2)) if match else 0
-            return MagicMock(status_code=206 if ep >= reachable_down_to else 403)
+            decoded = unquote(url)
+            ep_match = EPISODE_NUM_RE.search(decoded)
+            ep = int(ep_match.group(2)) if ep_match else 0
+            season_match = __import__("re").search(r"/(\d{4}-\d{1,2})/", decoded)
+            season = season_match.group(1) if season_match else None
+
+            if reachable_seasons is not None:
+                min_ep = reachable_seasons.get(season)
+                ok = min_ep is not None and ep >= min_ep
+            else:
+                ok = ep >= reachable_down_to
+
+            return _video_response(206 if ok else 403)
 
         request_utils.get_res.side_effect = get_res_side_effect
         plugin._relink_service._request_factory = lambda: request_utils
@@ -702,7 +819,7 @@ class TestBackfillTask:
         status = plugin.get_data("task_status")["backfill"]
         assert "成功补齐3集" in status["summary"]
 
-    def test_stops_at_first_unreachable_episode(self, tmp_path, monkeypatch):
+    def test_stops_at_first_unreachable_episode_when_no_other_season_available(self, tmp_path, monkeypatch):
         monkeypatch.setattr(time, "sleep", lambda *_: None)
         plugin = self._make_plugin(reachable_down_to=99)  # 全部不可达
         plugin._storageplace = str(tmp_path)
@@ -718,26 +835,35 @@ class TestBackfillTask:
         created = [p for p in tmp_path.glob("*.strm") if p != existing]
         assert created == []
         status = plugin.get_data("task_status")["backfill"]
-        assert "探测1次" in status["summary"]
         assert "成功补齐0集" in status["summary"]
 
-    def test_backfilled_link_gets_active_accelerator_applied(self, tmp_path, monkeypatch):
+    def test_tries_other_known_season_folder_before_giving_up(self, tmp_path, monkeypatch):
+        # 回归测试：真实数据确认过同一部剧更早的集数可能落在更早的季度文件夹
+        # (一拳超人S3真实起点25集、SPY×FAMILY S3真实起点38集)。当前季度文件夹
+        # 探测不通时，不能直接弃剧，要尝试本地已知的其它季度文件夹。
         monkeypatch.setattr(time, "sleep", lambda *_: None)
-        plugin = self._make_plugin(reachable_down_to=10)
+        # 当前季度(2026-7)只有11集可达；更早的季度(2026-4)从第10集往下都可达
+        plugin = self._make_plugin(reachable_seasons={"2026-7": 11, "2026-4": 1})
         plugin._storageplace = str(tmp_path)
-        plugin._accelerator_sources = "https://pro.pili.cc.cd"
-        existing = tmp_path / "[ANi] 示例 - 11 [1080P][Baha][WEB-DL][AAC AVC][CHT].strm"
-        existing.write_text(
-            "https://resources.ani.rip/2026-7/"
+        existing_current = tmp_path / "[ANi] 示例 - 11 [1080P][Baha][WEB-DL][AAC AVC][CHT].strm"
+        existing_current.write_text(
+            "https://pro.pili.cc.cd/resources.ani.rip/2026-7/"
             "%5BANi%5D%20%E7%A4%BA%E4%BE%8B%20-%2011%20%5B1080P%5D%5BBaha%5D%5BWEB-DL%5D%5BAAC%20AVC%5D%5BCHT%5D?d=mp4",
+            encoding="utf-8",
+        )
+        # 本地已经有一个2026-4季度文件夹的痕迹，让resource_scan能认识这个季度
+        other_season_hint = tmp_path / "[ANi] 别的剧 - 01 [1080P][Baha][WEB-DL][AAC AVC][CHT].strm"
+        other_season_hint.write_text(
+            "https://pro.pili.cc.cd/resources.ani.rip/2026-4/"
+            "%5BANi%5D%20%E5%88%AB%E7%9A%84%E5%89%A7%20-%2001%20%5B1080P%5D%5BBaha%5D%5BWEB-DL%5D%5BAAC%20AVC%5D%5BCHT%5D?d=mp4",
             encoding="utf-8",
         )
 
         getattr(plugin, "_ANiStrmHub__backfill_task")()
 
-        created = [p for p in tmp_path.glob("*.strm") if p != existing]
-        assert len(created) == 1
-        assert created[0].read_text().startswith("https://pro.pili.cc.cd/resources.ani.rip/")
+        created = tmp_path / "[ANi] 示例 - 10 [1080P][Baha][WEB-DL][AAC AVC][CHT].strm"
+        assert created.exists()
+        assert "/2026-4/" in created.read_text()
 
     def test_skips_probe_for_episode_already_present_locally(self, tmp_path, monkeypatch):
         monkeypatch.setattr(time, "sleep", lambda *_: None)
@@ -768,14 +894,18 @@ class TestBackfillTask:
 
 
 class TestDetectTask:
-    def test_builds_connectivity_matrix_and_local_distribution(self, tmp_path):
+    def test_builds_connectivity_rows_and_local_distribution(self, tmp_path):
         plugin = ANiStrmHub()
         plugin._storageplace = str(tmp_path)
-        plugin._subscription_sources = "https://a.example/rss.xml"
-        plugin._accelerator_sources = "https://pro.pili.cc.cd"
-        plugin._client.fetch_one_source = MagicMock(
-            return_value=[{"title": "示例", "link": "https://resources.ani.rip/2026-7/ep.mp4?d=mp4"}]
-        )
+        plugin._subscription_source = "https://a.example/rss.xml"
+        plugin._accelerator_prefix = "https://pro.pili.cc.cd"
+
+        def fake_fetch(url):
+            if url == "https://a.example/rss.xml":
+                return [{"title": "示例", "link": "https://resources.ani.rip/2026-7/ep.mp4?d=mp4"}]
+            return []
+
+        plugin._client.fetch_one_source = MagicMock(side_effect=fake_fetch)
         plugin._relink_service.probe_latency_ms = MagicMock(return_value=(50.0, None))
         (tmp_path / "示例.strm").write_text(
             "https://pro.pili.cc.cd/resources.ani.rip/2026-7/ep.mp4?d=mp4", encoding="utf-8"
@@ -784,34 +914,43 @@ class TestDetectTask:
         getattr(plugin, "_ANiStrmHub__detect_task")()
 
         matrix = plugin.get_data("connectivity_matrix")
-        assert matrix["rows"][0]["subscription"] == "https://a.example/rss.xml"
-        assert matrix["rows"][0]["columns"] == [
+        primary_row = matrix["rows"][0]
+        assert primary_row["subscription"] == "https://a.example/rss.xml"
+        assert primary_row["label"] == "当前配置"
+        assert primary_row["columns"] == [
             {"label": "直连", "latency_ms": 50.0, "error": None},
-            {"label": "https://pro.pili.cc.cd", "latency_ms": 50.0, "error": None},
+            {"label": "加速后", "latency_ms": 50.0, "error": None},
         ]
 
         distribution = plugin.get_data("local_distribution")
         assert distribution["total"] == 1
-        assert distribution["by_category"] == {"https://a.example/rss.xml + https://pro.pili.cc.cd": 1}
-
-    def test_no_subscription_sources_is_a_noop(self):
-        plugin = ANiStrmHub()
-        plugin._subscription_sources = ""
-
-        getattr(plugin, "_ANiStrmHub__detect_task")()
-
-        status = plugin.get_data("task_status")["detect"]
-        assert status["summary"] == "未配置订阅源"
-        assert plugin.get_data("connectivity_matrix") is None
+        assert distribution["by_category"] == {"当前配置 + https://pro.pili.cc.cd": 1}
 
     def test_rss_fetch_failure_recorded_per_row(self):
         plugin = ANiStrmHub()
-        plugin._subscription_sources = "https://broken.example/rss.xml"
+        plugin._subscription_source = "https://broken.example/rss.xml"
         plugin._storageplace = "/does-not-exist"
         plugin._client.fetch_one_source = MagicMock(side_effect=ValueError("HTTP状态异常：403"))
 
         getattr(plugin, "_ANiStrmHub__detect_task")()
 
         matrix = plugin.get_data("connectivity_matrix")
-        assert matrix["rows"][0]["rss_ok"] is False
-        assert "403" in matrix["rows"][0]["error"]
+        primary_row = matrix["rows"][0]
+        assert primary_row["rss_ok"] is False
+        assert "403" in primary_row["error"]
+
+    def test_pool_candidates_shown_alongside_primary(self, tmp_path):
+        plugin = ANiStrmHub()
+        plugin._storageplace = str(tmp_path)
+        plugin._subscription_source = "https://my-own-mirror.example/rss.xml"
+        plugin._client.fetch_one_source = MagicMock(
+            return_value=[{"title": "示例", "link": "https://resources.ani.rip/2026-7/ep.mp4?d=mp4"}]
+        )
+        plugin._relink_service.probe_latency_ms = MagicMock(return_value=(50.0, None))
+
+        getattr(plugin, "_ANiStrmHub__detect_task")()
+
+        matrix = plugin.get_data("connectivity_matrix")
+        assert len(matrix["rows"]) == 1 + len(FALLBACK_SUBSCRIPTION_POOL)
+        assert matrix["rows"][0]["label"] == "当前配置"
+        assert all(row["label"].startswith("内置容灾候选") for row in matrix["rows"][1:])

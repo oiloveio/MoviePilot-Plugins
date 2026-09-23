@@ -19,15 +19,25 @@ from app.log import logger
 from app.plugins import _PluginBase
 from app.utils.http import RequestUtils
 
-DEFAULT_SUBSCRIPTION_SOURCES = """https://api.pili.cc.cd/ani-download.xml
-https://aniapi.op5.de5.net/ani-download.xml
-https://api.ani.rip/ani-download.xml
-# https://aniapi.v300.eu.org/ani-download.xml  RSS能拉到,但视频直链域名proi.v300.eu.org被Cloudflare挑战拦截,实测无法取到视频数据,已禁用
-# https://aniapi.td.ee/ani-download.xml  RSS能拉到,但视频直链域名ani.td.ee返回"temporarily rate limited",实测无法取到视频数据,已禁用
-# http://open.ani.rip/ani-download.xml  当前403(Cloudflare拦截)，恢复后可去掉#启用
-# https://openani.an-i.workers.dev/ani-download.xml  当前429(限流)，恢复后可去掉#启用"""
+# 唯一默认订阅源。0.6.0起订阅源不再是用户要管理的"列表"，用户只填一个自己
+# 认可的地址；下面这个内置候选池是抓取失败时后台自动依次尝试的容灾兜底，
+# 不作为UI概念暴露——4.0.0"多源同时聚合谁先抓到用谁"和5.0.0"列表+选择器"
+# 都是把这件事暴露成用户要理解的概念，这正是复杂度跟需求不匹配的地方。
+DEFAULT_SUBSCRIPTION_SOURCE = "https://api.pili.cc.cd/ani-download.xml"
+# ANi官方直链域名，用于"还原成裸链接"时重建地址——不管当前strm内容被套了
+# 几层壳，extract_resource_path()都能从URL末尾定位出跟域名无关的"季度/
+# 文件名?query"这一段，配上这个官方域名就能拼出一个确定的裸直链，不需要
+# "记住"当初到底是被哪个加速源套过壳(单值配置模型下也没地方存这个记忆)。
+OFFICIAL_BASE_URL = "https://resources.ani.rip"
+FALLBACK_SUBSCRIPTION_POOL: Tuple[str, ...] = (
+    "https://api.pili.cc.cd/ani-download.xml",
+    "https://aniapi.op5.de5.net/ani-download.xml",
+    "https://api.ani.rip/ani-download.xml",
+)
 
-# 借鉴shanhai2333/ANiStrmPro：非视频附属文件的常见后缀，直接跳过不生成strm
+# 非正片附属文件的标题关键词，硬编码常量不再让用户自己配置——预告/OP/ED这类
+# 标记在几乎所有ANi/fansub命名习惯里含义固定，没必要为此暴露一个配置项
+NON_EPISODE_BLACKLIST = "预告@PV@NCOP@NCED"
 SUBTITLE_EXTENSIONS = (".srt", ".vtt", ".ass", ".ssa")
 # 从直链里提取季度目录，如 .../2026-7/xxx.mp4 -> 2026-7
 SEASON_RE = re.compile(r"/(\d{4}-\d{1,2})/")
@@ -35,12 +45,18 @@ SEASON_RE = re.compile(r"/(\d{4}-\d{1,2})/")
 # 要求前有"-"后有"["，避免误命中季度目录(yyyy-mm)或分辨率(1080P)里的数字。
 EPISODE_NUM_RE = re.compile(r"(-\s*)(\d{1,4})(\s*\[)")
 
+# 探测连通性时校验响应内容用：光看HTTP状态码不够，服务器完全可能返回200但
+# 吐的是错误页(html/json)。这几个是明显的"这不是视频数据"标记。
+HTML_LIKE_PREFIXES = (b"<!doctype", b"<html", b"<?xml", b"{")
+NON_VIDEO_CONTENT_TYPES = ("text/html", "text/plain", "application/json", "application/xml", "text/xml")
+PROBE_RANGE_BYTES = 64  # 够读到mp4的ftyp box或分辨明显的错误页，开销依然很小
+
 
 class ANiStrmHub(_PluginBase):
     plugin_name = "ANiStrmHub"
-    plugin_desc = "订阅源+加速源各选一个生效，自动抓取ANi新番资源生成strm文件，mp刮削入库，媒体服务器直连播放"
+    plugin_desc = "填一个订阅源+一个加速地址即可，自动抓取ANi新番资源生成strm文件，mp刮削入库，媒体服务器直连播放"
     plugin_icon = "https://raw.githubusercontent.com/oiloveio/MoviePilot-Plugins/main/icons/anistrmhub.png"
-    plugin_version = "5.0.0"
+    plugin_version = "0.6.0"
     plugin_author = "oiloveio,honue"
     author_url = "https://github.com/honue"
     plugin_config_prefix = "anistrmhub_"
@@ -52,20 +68,13 @@ class ANiStrmHub(_PluginBase):
     _cron = None
     _onlyonce = False
     _storageplace = None
-    _filename_remove = ""
-    _filename_blacklist = ""
-    _season_dir = False
     _season_filter: List[str] = ["all"]
 
-    _subscription_sources = DEFAULT_SUBSCRIPTION_SOURCES
-    _active_subscription_source: Optional[str] = None
-    _accelerator_sources = ""
-    _active_accelerator_source: Optional[str] = None
+    _subscription_source = DEFAULT_SUBSCRIPTION_SOURCE
+    _accelerator_prefix = ""
 
-    _target_subscription_source: Optional[str] = None
-    _target_accelerator_source: Optional[str] = None
-    _apply_local_strm_once = False
-
+    _refresh_subscription_once = False
+    _apply_accelerator_once = False
     _backfill_once = False
     _detect_once = False
     _scheduler: Optional[BackgroundScheduler] = None
@@ -86,22 +95,13 @@ class ANiStrmHub(_PluginBase):
         self._cron = config.get("cron") or "20 22,23,0,1 * * *"
         self._onlyonce = config.get("onlyonce", False)
         self._storageplace = config.get("storageplace") or "/downloads/strm"
-        self._filename_remove = config.get("filename_remove") or ""
-        self._filename_blacklist = config.get("filename_blacklist") or ""
-        self._season_dir = config.get("season_dir", False)
         self._season_filter = config.get("season_filter") or ["all"]
 
-        self._subscription_sources = config.get("subscription_sources")
-        if not self._subscription_sources:
-            self._subscription_sources = DEFAULT_SUBSCRIPTION_SOURCES
-        self._active_subscription_source = config.get("active_subscription_source")
-        self._accelerator_sources = config.get("accelerator_sources") or ""
-        self._active_accelerator_source = config.get("active_accelerator_source")
+        self._subscription_source = (config.get("subscription_source") or "").strip() or DEFAULT_SUBSCRIPTION_SOURCE
+        self._accelerator_prefix = (config.get("accelerator_prefix") or "").strip()
 
-        self._target_subscription_source = config.get("target_subscription_source")
-        self._target_accelerator_source = config.get("target_accelerator_source")
-        self._apply_local_strm_once = config.get("apply_local_strm_once", False)
-
+        self._refresh_subscription_once = config.get("refresh_subscription_once", False)
+        self._apply_accelerator_once = config.get("apply_accelerator_once", False)
         self._backfill_once = config.get("backfill_once", False)
         self._detect_once = config.get("detect_once", False)
 
@@ -109,14 +109,14 @@ class ANiStrmHub(_PluginBase):
         logger.info(
             f"ANiStrmHub配置加载：enabled={self._enabled}, onlyonce={self._onlyonce}, "
             f"use_proxy={self._use_proxy}, storage={self._storageplace}, "
-            f"生效订阅源={self.__get_active_subscription_source()}, "
-            f"生效加速源={self.__get_active_accelerator_source()}"
+            f"订阅源={self._subscription_source}, 加速源={self._accelerator_prefix or '(不加速)'}"
         )
 
         if not (
             self._enabled
             or self._onlyonce
-            or self._apply_local_strm_once
+            or self._refresh_subscription_once
+            or self._apply_accelerator_once
             or self._backfill_once
             or self._detect_once
         ):
@@ -146,22 +146,31 @@ class ANiStrmHub(_PluginBase):
             )
             self._onlyonce = False
 
-        if self._apply_local_strm_once:
-            if self.__is_task_running("apply_local_strm"):
-                logger.warning("ANiStrmHub本地strm维护：上一次任务还在运行中，本次跳过排队，等它跑完再重新勾选")
+        if self._refresh_subscription_once:
+            if self.__is_task_running("refresh_subscription"):
+                logger.warning("ANiStrmHub刷新订阅源：上一次任务还在运行中，本次跳过排队，等它跑完再重新勾选")
             else:
-                logger.info(
-                    f"ANiStrmHub服务启动，立即应用本地strm维护：目标订阅源="
-                    f"{self._target_subscription_source or '(不变)'}，"
-                    f"目标加速源={self._target_accelerator_source or '(不加速)'}"
-                )
+                logger.info(f"ANiStrmHub服务启动，立即用当前订阅源刷新本地strm：{self._subscription_source}")
                 self._scheduler.add_job(
-                    func=self.__apply_local_strm_task,
+                    func=self.__refresh_subscription_task,
                     trigger="date",
                     run_date=datetime.now(tz=pytz.timezone(settings.TZ)) + timedelta(seconds=3),
-                    name="ANiStrmHub本地strm维护",
+                    name="ANiStrmHub刷新订阅源",
                 )
-            self._apply_local_strm_once = False
+            self._refresh_subscription_once = False
+
+        if self._apply_accelerator_once:
+            if self.__is_task_running("apply_accelerator"):
+                logger.warning("ANiStrmHub套用加速源：上一次任务还在运行中，本次跳过排队，等它跑完再重新勾选")
+            else:
+                logger.info(f"ANiStrmHub服务启动，立即给本地strm套用/还原加速源：{self._accelerator_prefix or '(还原裸链接)'}")
+                self._scheduler.add_job(
+                    func=self.__apply_accelerator_task,
+                    trigger="date",
+                    run_date=datetime.now(tz=pytz.timezone(settings.TZ)) + timedelta(seconds=3),
+                    name="ANiStrmHub套用加速源",
+                )
+            self._apply_accelerator_once = False
 
         if self._backfill_once:
             if self.__is_task_running("backfill"):
@@ -180,7 +189,7 @@ class ANiStrmHub(_PluginBase):
             if self.__is_task_running("detect"):
                 logger.warning("ANiStrmHub连通性探测：上一次任务还在运行中，本次跳过排队，等它跑完再重新勾选")
             else:
-                logger.info("ANiStrmHub服务启动，立即探测订阅源x加速源连通性矩阵")
+                logger.info("ANiStrmHub服务启动，立即探测订阅源连通性")
                 self._scheduler.add_job(
                     func=self.__detect_task,
                     trigger="date",
@@ -195,84 +204,56 @@ class ANiStrmHub(_PluginBase):
             self._scheduler.print_jobs()
             self._scheduler.start()
 
-    @staticmethod
-    def __parse_source_list(text: str) -> List[str]:
-        """解析多行列表配置(一行一个地址，#开头禁用，去重保序)。订阅源和加速源
-        共用同一套解析规则——这是5.0.0重构的核心：两者是完全对称的"列表+单选
-        生效项"模型，不再是订阅源多源聚合、加速源列表选择这两套不对称机制"""
-        items = []
-        for raw_line in (text or "").splitlines():
-            line = raw_line.strip()
-            if not line or line.startswith("#"):
-                continue
-            items.append(line.rstrip("/"))
-        return list(dict.fromkeys(items))
+    def __subscription_candidates(self, primary: str) -> List[str]:
+        """主订阅源优先，抓取失败时按顺序自动试内置容灾候选池——这一步完全
+        在后台完成，用户不需要理解"多源列表"这个概念，也不会像4.0.0那样把
+        多个源的内容混在一起用（那是bug的根因），每次运行始终只用其中一个"""
+        ordered = [primary] + [c for c in FALLBACK_SUBSCRIPTION_POOL if c != primary]
+        return list(dict.fromkeys(ordered))
 
-    def __parse_subscription_sources(self) -> List[str]:
-        return self.__parse_source_list(self._subscription_sources)
-
-    def __parse_accelerator_sources(self) -> List[str]:
-        return self.__parse_source_list(self._accelerator_sources)
-
-    def __get_active_subscription_source(self) -> Optional[str]:
-        """返回当前生效的订阅源：用户选中的那个(如果还在候选列表里)，否则
-        退化成列表第一个未禁用的。列表为空返回None。
-
-        同一时刻只有一个订阅源在被使用，不再像旧版那样多个源同时聚合、按
-        标题去重、谁先抓到内容就用谁——那套模型正是"一个本该被#禁用的失效
-        源意外生效，贡献内容后又被自动套上一层不相关加速前缀"这类bug的
-        成因。生效源连不上了也不会自动切换到列表里别的源，而是概览页的
-        连通性矩阵会清楚显示出来，由用户自己决定换哪个。"""
-        sources = self.__parse_subscription_sources()
-        if not sources:
+    def __resolve_accelerator_for_this_run(self, sample_link: str) -> Optional[str]:
+        """加速源现在只有一个配置值。用这一轮实际抓到的样本直链实测一次
+        "这个加速源套上这条直链"能不能连通——只测一次，不是每条目都测，
+        拉新番的速度不受影响；这一次检查就是从设计上避免"加速源套在一个
+        连不通的组合上批量生成坏链接"的安全网，取代4.0.0"完全不测"和
+        5.0.0部分场景"逐条测"这两个极端。探测不通过就本次任务不加速，
+        写入裸直链，不阻塞整个任务。"""
+        prefix = (self._accelerator_prefix or "").strip()
+        if not prefix:
             return None
-        if self._active_subscription_source and self._active_subscription_source in sources:
-            return self._active_subscription_source
-        return sources[0]
-
-    def __get_active_accelerator_source(self) -> Optional[str]:
-        """返回当前生效的加速源；None表示不加速，strm写裸直链"""
-        sources = self.__parse_accelerator_sources()
-        if not sources:
+        candidate = StrmRelinkService.build_proxied_url(sample_link, prefix)
+        latency_ms, fail_reason = self._relink_service.probe_latency_ms(candidate)
+        if latency_ms is None:
+            logger.warning(
+                f"ANiStrmHub任务：加速源{prefix}套上本次样本直链探测不可达({fail_reason})，"
+                f"本次任务不加速，写入裸直链"
+            )
             return None
-        if self._active_accelerator_source and self._active_accelerator_source in sources:
-            return self._active_accelerator_source
-        return sources[0]
-
-    def __build_subscription_options(self) -> List[Dict[str, str]]:
-        return [{"title": url, "value": url} for url in self.__parse_subscription_sources()]
-
-    def __build_accelerator_options(self) -> List[Dict[str, str]]:
-        return [{"title": url, "value": url} for url in self.__parse_accelerator_sources()]
+        logger.info(f"ANiStrmHub任务：加速源{prefix}探测可达({latency_ms}ms)，新生成的strm将套用")
+        return prefix
 
     def __finalize_strm_link(self, real_link: str) -> str:
-        """决定新生成的strm文件里最终写入的地址，__task和__backfill_task这两个
-        "生成新文件"的入口都调这一个函数，不各写各的。套用当前生效加速源
-        (没配置就是原始直链)。不需要"套壳后探测，不可达就回退裸链接"这类
-        运行时安全网——加速源永远只套在"当前生效订阅源"自己的直链上，这个
-        组合是否可达，用户在概览页连通性矩阵里已经能提前看到。"""
-        active_accelerator = self.__get_active_accelerator_source()
-        if active_accelerator:
-            return StrmRelinkService.build_proxied_url(real_link, active_accelerator)
+        """资源补齐用：套用当前配置的加速源(没配置就是原始直链)。资源补齐
+        本身对每个候选都会探测最终地址，天然有安全网，不需要像__task那样
+        额外做一次性的"这个组合能不能用"预检查。"""
+        accelerator = (self._accelerator_prefix or "").strip()
+        if accelerator:
+            return StrmRelinkService.build_proxied_url(real_link, accelerator)
         return real_link
 
     def __build_season_options(self) -> List[Dict[str, str]]:
-        """拉当前生效订阅源的样本条目，从里面提取当前RSS窗口内出现过的季度，
-        供配置页「拉取季度筛选」下拉用。跟honue原版的"季度多选"不是一回事——
-        原版靠的是目录扫描API(能列出所有历史季度文件夹)，那套接口已经确认
-        死了(见docs)；这里只能从RSS滚动窗口(近期约50~60条)里已经出现的
-        季度里选，选不到没在窗口内的老季度。"""
+        """拉当前配置订阅源的样本条目，从里面提取当前RSS窗口内出现过的季度，
+        供配置页「拉取季度筛选」下拉用。"""
         seasons = set()
-        active_source = self.__get_active_subscription_source()
-        if active_source:
-            try:
-                entries = self._client.fetch_one_source(active_source)
-            except Exception:
-                entries = []
-            for entry in entries:
-                match = SEASON_RE.search(entry.get("link", ""))
-                if match:
-                    seasons.add(match.group(1))
+        subscription = (self._subscription_source or "").strip() or DEFAULT_SUBSCRIPTION_SOURCE
+        try:
+            entries = self._client.fetch_one_source(subscription)
+        except Exception:
+            entries = []
+        for entry in entries:
+            match = SEASON_RE.search(entry.get("link", ""))
+            if match:
+                seasons.add(match.group(1))
         sorted_seasons = sorted(seasons, key=lambda s: tuple(map(int, s.split("-"))), reverse=True)
         return [
             {"title": "不筛选(全部)", "value": "all"},
@@ -310,23 +291,31 @@ class ANiStrmHub(_PluginBase):
 
     def __task(self):
         self.__save_task_status("task", "running", "进行中")
-        active_source = self.__get_active_subscription_source()
-        if not active_source:
-            logger.info("未配置任何订阅源，任务结束")
-            self.__save_task_status("task", "done", "未配置订阅源")
+        primary = (self._subscription_source or "").strip() or DEFAULT_SUBSCRIPTION_SOURCE
+
+        entries = None
+        used_source = None
+        tried = []
+        for candidate in self.__subscription_candidates(primary):
+            tried.append(candidate)
+            try:
+                entries = self._client.fetch_one_source(candidate)
+                used_source = candidate
+                break
+            except Exception as err:
+                logger.warning(f"ANiStrmHub任务：订阅源抓取失败，自动尝试下一个候选：{candidate} - {err}")
+                continue
+
+        if entries is None:
+            logger.warning(f"ANiStrmHub任务：全部{len(tried)}个候选订阅源均抓取失败，本次任务结束")
+            self.__save_task_status("task", "done", f"全部候选订阅源均不可用({len(tried)}个)")
             return
 
-        logger.info(f"ANiStrmHub任务开始：生效订阅源={active_source}，storage={self._storageplace}")
-
-        try:
-            entries = self._client.fetch_one_source(active_source)
-        except Exception as err:
-            logger.warning(f"ANiStrmHub任务：生效订阅源抓取失败，任务结束：{active_source} - {err}")
-            self.__save_task_status("task", "done", f"订阅源抓取失败：{err}")
-            return
+        if used_source != primary:
+            logger.warning(f"ANiStrmHub任务：主订阅源{primary}不可用，本次自动切到{used_source}")
 
         if not entries:
-            logger.warning("ANiStrmHub生效订阅源RSS无内容，本次任务结束")
+            logger.warning("ANiStrmHub订阅源RSS无内容，本次任务结束")
             self.__save_task_status("task", "done", "订阅源RSS无内容")
             return
 
@@ -336,9 +325,7 @@ class ANiStrmHub(_PluginBase):
             self.__save_task_status("task", "done", "季度筛选后无条目")
             return
 
-        active_accelerator = self.__get_active_accelerator_source()
-        if active_accelerator:
-            logger.info(f"ANiStrmHub任务：新生成的strm将自动套用加速源 {active_accelerator}")
+        resolved_accelerator = self.__resolve_accelerator_for_this_run(entries[0]["link"])
 
         total_created = 0
         total_exists = 0
@@ -349,20 +336,21 @@ class ANiStrmHub(_PluginBase):
             if StrmFileService.is_subtitle_file(title):
                 total_skipped += 1
                 continue
-            if StrmFileService.is_blacklisted(title, self._filename_blacklist):
-                logger.info(f"ANiStrmHub文件名命中黑名单，跳过：{title}")
+            if StrmFileService.is_blacklisted(title, NON_EPISODE_BLACKLIST):
+                logger.info(f"ANiStrmHub标题命中非正片关键词，跳过：{title}")
                 total_skipped += 1
                 continue
 
-            display_name = StrmFileService.clean_file_name(title, self._filename_remove)
             season = SEASON_RE.search(entry["link"])
-            relative_dir = season.group(1) if (self._season_dir and season) else None
+            relative_dir = season.group(1) if season else None
 
-            file_url = self.__finalize_strm_link(entry["link"])
+            file_url = entry["link"]
+            if resolved_accelerator:
+                file_url = StrmRelinkService.build_proxied_url(file_url, resolved_accelerator)
 
             status = self._strm_service.touch_strm_file(
                 storage_path=self._storageplace,
-                file_name=display_name,
+                file_name=title,
                 file_url=file_url,
                 relative_dir=relative_dir,
             )
@@ -374,63 +362,42 @@ class ANiStrmHub(_PluginBase):
                 total_failed += 1
 
         summary = (
-            f"订阅源{active_source}共{len(entries)}条，新增={total_created}，"
-            f"跳过(已存在)={total_exists}，跳过(字幕/黑名单)={total_skipped}，失败={total_failed}"
+            f"订阅源{used_source}共{len(entries)}条，新增={total_created}，"
+            f"跳过(已存在)={total_exists}，跳过(附属文件)={total_skipped}，失败={total_failed}"
         )
         logger.info(f"ANiStrmHub任务完成：{summary}")
         self.__save_task_status("task", "done", summary)
 
-    def __apply_local_strm_task(self):
-        """统一的本地strm批量维护：用"目标订阅源"+"目标加速源"两个选择器
-        表达所有组合，取代4.0.0四个分开的一次性任务(修复链接/一键换源/
-        一键加速/一键还原)：
-
-          目标订阅源=不变 + 目标加速源=不加速  等价于旧版"一键还原"
-          目标订阅源=不变 + 目标加速源=选中     等价于旧版"一键加速"
-          目标订阅源=选中 + 目标加速源=不加速  等价于旧版"一键切换来源"
-          目标订阅源=选中 + 目标加速源=选中     切换来源+加速一步到位(新)
-
-        每个文件先剥掉已知加速源前缀，还原出"当前底层直链"；再按目标订阅源
-        决定要不要换成另一个源给出的直链——标题还在该源RSS窗口内的优先精确
-        匹配，不在窗口内的用derive_prefix/extract_resource_path拼域名前缀；
-        最后按目标加速源决定要不要套壳。写入前实测确认最终地址可达才覆盖，
-        不可达保留原文件——这条安全机制从4.0.0延续下来。"""
-        self.__save_task_status("apply_local_strm", "running", "进行中")
+    def __refresh_subscription_task(self):
+        """用当前配置的这一个订阅源刷新本地已有的strm：标题还在RSS窗口内的
+        直接换成最新直链，不在窗口内的按路径迁移公式换成这个订阅源的域名
+        前缀。只有一个订阅源可选，不需要"目标订阅源"这种选择器概念。"""
+        self.__save_task_status("refresh_subscription", "running", "进行中")
         directory = Path(self._storageplace)
         if not directory.exists():
-            logger.warning(f"ANiStrmHub本地strm维护：目录不存在 {self._storageplace}")
-            self.__save_task_status("apply_local_strm", "done", "存储目录不存在")
+            logger.warning(f"ANiStrmHub刷新订阅源：目录不存在 {self._storageplace}")
+            self.__save_task_status("refresh_subscription", "done", "存储目录不存在")
             return
 
-        target_subscription = self._target_subscription_source or None
-        target_accelerator = self._target_accelerator_source or None
-        accelerator_prefixes = self.__parse_accelerator_sources()
+        subscription = (self._subscription_source or "").strip() or DEFAULT_SUBSCRIPTION_SOURCE
+        try:
+            entries = self._client.fetch_one_source(subscription)
+        except Exception as err:
+            logger.warning(f"ANiStrmHub刷新订阅源：抓取失败，任务结束：{subscription} - {err}")
+            self.__save_task_status("refresh_subscription", "done", f"订阅源抓取失败：{err}")
+            return
+        if not entries:
+            logger.warning(f"ANiStrmHub刷新订阅源：RSS无内容，任务结束：{subscription}")
+            self.__save_task_status("refresh_subscription", "done", "订阅源RSS无内容")
+            return
 
-        title_map: Dict[str, str] = {}
-        target_domain_prefix: Optional[str] = None
-        if target_subscription:
-            try:
-                entries = self._client.fetch_one_source(target_subscription)
-            except Exception as err:
-                logger.warning(
-                    f"ANiStrmHub本地strm维护：目标订阅源抓取失败，任务结束：{target_subscription} - {err}"
-                )
-                self.__save_task_status("apply_local_strm", "done", f"目标订阅源抓取失败：{err}")
-                return
-            if not entries:
-                logger.warning(f"ANiStrmHub本地strm维护：目标订阅源RSS无内容，任务结束：{target_subscription}")
-                self.__save_task_status("apply_local_strm", "done", "目标订阅源RSS无内容")
-                return
-            title_map = {
-                StrmFileService.clean_file_name(entry["title"], self._filename_remove): entry["link"]
-                for entry in entries
-            }
-            target_domain_prefix = StrmRelinkService.derive_prefix(entries[0]["link"])
+        title_map = {entry["title"]: entry["link"] for entry in entries}
+        domain_prefix = StrmRelinkService.derive_prefix(entries[0]["link"])
+        accelerator = (self._accelerator_prefix or "").strip()
 
         stats = {
             "标题精确匹配更新": 0,
-            "按订阅源迁移更新": 0,
-            "仅调整加速套壳": 0,
+            "路径迁移更新": 0,
             "无需更新": 0,
             "探测不可达(保留原文件)": 0,
             "无法识别(保留原文件)": 0,
@@ -440,40 +407,29 @@ class ANiStrmHub(_PluginBase):
             try:
                 old_content = strm_file.read_text(encoding="utf-8").strip()
             except Exception as err:
-                logger.warning(f"ANiStrmHub本地strm维护：读取失败，跳过 {strm_file.name} - {err}")
+                logger.warning(f"ANiStrmHub刷新订阅源：读取失败，跳过 {strm_file.name} - {err}")
                 stats["无法识别(保留原文件)"] += 1
                 continue
 
-            de_accelerated, _ = StrmRelinkService.strip_known_accelerator(old_content, accelerator_prefixes)
-
-            if target_subscription:
-                matched_link = title_map.get(strm_file.stem)
-                if matched_link:
-                    bare_link = matched_link
-                    match_kind = "标题精确匹配更新"
-                elif target_domain_prefix:
-                    resource_path = StrmRelinkService.extract_resource_path(de_accelerated)
-                    if not resource_path:
-                        stats["无法识别(保留原文件)"] += 1
-                        continue
-                    bare_link = target_domain_prefix + resource_path
-                    match_kind = "按订阅源迁移更新"
-                else:
+            matched_link = title_map.get(strm_file.stem)
+            if matched_link:
+                bare_link = matched_link
+                match_kind = "标题精确匹配更新"
+            elif domain_prefix:
+                # extract_resource_path对URL末尾的"季度/文件名?query"定位，
+                # 不管old_content当前有没有被套壳、被谁套壳都能定位到，不需要
+                # 先剥壳——这一段本身就跟域名/加速源无关
+                resource_path = StrmRelinkService.extract_resource_path(old_content)
+                if not resource_path:
                     stats["无法识别(保留原文件)"] += 1
                     continue
+                bare_link = domain_prefix + resource_path
+                match_kind = "路径迁移更新"
             else:
-                if not de_accelerated.startswith(("http://", "https://")):
-                    stats["无法识别(保留原文件)"] += 1
-                    continue
-                bare_link = de_accelerated
-                match_kind = "仅调整加速套壳"
+                stats["无法识别(保留原文件)"] += 1
+                continue
 
-            final_link = (
-                StrmRelinkService.build_proxied_url(bare_link, target_accelerator)
-                if target_accelerator
-                else bare_link
-            )
-
+            final_link = StrmRelinkService.build_proxied_url(bare_link, accelerator) if accelerator else bare_link
             if final_link == old_content:
                 stats["无需更新"] += 1
                 continue
@@ -483,29 +439,94 @@ class ANiStrmHub(_PluginBase):
             if latency_ms is not None:
                 strm_file.write_text(final_link, encoding="utf-8")
                 stats[match_kind] += 1
-                logger.info(f"ANiStrmHub本地strm维护：成功({latency_ms}ms) {strm_file.name}")
+                logger.info(f"ANiStrmHub刷新订阅源：成功({latency_ms}ms) {strm_file.name}")
             else:
                 logger.warning(
-                    f"ANiStrmHub本地strm维护：候选链接探测不可达({fail_reason})，保留原文件 {strm_file.name}"
+                    f"ANiStrmHub刷新订阅源：候选链接探测不可达({fail_reason})，保留原文件 {strm_file.name}"
                 )
                 stats["探测不可达(保留原文件)"] += 1
 
         summary = "，".join(f"{k}={v}" for k, v in stats.items())
-        logger.info(f"ANiStrmHub本地strm维护完成：{summary}")
-        self.__save_task_status("apply_local_strm", "done", summary)
+        logger.info(f"ANiStrmHub刷新订阅源完成：{summary}")
+        self.__save_task_status("refresh_subscription", "done", summary)
+
+    def __apply_accelerator_task(self):
+        """用当前配置的这一个加速源(留空=不加速)重新套用/还原本地全部strm。
+        只有一个加速源可选，"套上"和"去掉"是同一个操作依据accelerator_prefix
+        是否为空决定，不需要"一键加速"/"一键还原"两个分开的开关，也不需要
+        "目标加速源"这种选择器概念。
+
+        不管strm当前内容有没有被套壳、被谁套壳，都先用extract_resource_path
+        定位出跟域名无关的"季度/文件名?query"这一段，配上官方域名重建裸直链，
+        再按需要套用当前加速源——这样即使用户把加速源字段从A改成B、或者
+        直接清空，都能正确处理，不需要"记住"当初到底是哪个加速源套的壳。"""
+        self.__save_task_status("apply_accelerator", "running", "进行中")
+        directory = Path(self._storageplace)
+        if not directory.exists():
+            logger.warning(f"ANiStrmHub套用加速源：目录不存在 {self._storageplace}")
+            self.__save_task_status("apply_accelerator", "done", "存储目录不存在")
+            return
+
+        accelerator = (self._accelerator_prefix or "").strip()
+        stats = {
+            "已套上加速源": 0,
+            "已还原为裸链接": 0,
+            "无需更新": 0,
+            "探测不可达(保留原文件)": 0,
+            "无法识别(保留原文件)": 0,
+        }
+
+        for strm_file in sorted(directory.rglob("*.strm")):
+            try:
+                old_content = strm_file.read_text(encoding="utf-8").strip()
+            except Exception as err:
+                logger.warning(f"ANiStrmHub套用加速源：读取失败，跳过 {strm_file.name} - {err}")
+                stats["无法识别(保留原文件)"] += 1
+                continue
+
+            resource_path = StrmRelinkService.extract_resource_path(old_content)
+            if not resource_path:
+                stats["无法识别(保留原文件)"] += 1
+                continue
+            bare_link = f"{OFFICIAL_BASE_URL}/{resource_path}"
+
+            final_link = StrmRelinkService.build_proxied_url(bare_link, accelerator) if accelerator else bare_link
+            if final_link == old_content:
+                stats["无需更新"] += 1
+                continue
+
+            time.sleep(0.3)
+            latency_ms, fail_reason = self._relink_service.probe_latency_ms(final_link)
+            if latency_ms is not None:
+                strm_file.write_text(final_link, encoding="utf-8")
+                stats["已套上加速源" if accelerator else "已还原为裸链接"] += 1
+                logger.info(f"ANiStrmHub套用加速源：成功({latency_ms}ms) {strm_file.name}")
+            else:
+                logger.warning(
+                    f"ANiStrmHub套用加速源：候选链接探测不可达({fail_reason})，保留原文件 {strm_file.name}"
+                )
+                stats["探测不可达(保留原文件)"] += 1
+
+        summary = "，".join(f"{k}={v}" for k, v in stats.items())
+        logger.info(f"ANiStrmHub套用加速源完成：{summary}")
+        self.__save_task_status("apply_accelerator", "done", summary)
 
     def __backfill_task(self):
         """资源补齐：ani-download.xml这个RSS只是滚动窗口，只含近期资源，更早的
-        集数不在里面，但ANi同一部剧全部集数的直链只有集数数字不同，其余部分
-        (域名/季度目录/文件名其它属性/查询参数)完全一致——这是用户实测确认的：
-        把"- 11"手动改成"- 10"依然能播放，说明季度目录是按剧集首播月份命名，
-        不是按每一集实际上传日期命名。
+        集数不在里面，但ANi同一部剧全部集数的直链只有集数数字不同——这是用户
+        实测确认的：把"- 11"手动改成"- 10"依然能播放。
 
-        对本地已有的每部剧，从当前最早一集往前递减集数构造候选直链，严格串行
-        探测(不并发)、探测间隔sleep、单次任务设总探测数上限，一旦某一集探测
-        不可达就停止继续往前探测这部剧(假设更早的集数同样不可达或已下架，
-        没必要继续浪费请求)——这几条都是用户明确要求的限流设计，避免被
-        目标站点风控封IP。确认可达才写入，不是无脑改写。"""
+        季度目录不总是跟本地已有的最早一集相同：实测确认过一拳超人第三季
+        真实起点第25集、SPY×FAMILY第三季真实起点第38集都落在比本地当前
+        最早集更靠前的季度文件夹里。所以碰到当前季度文件夹探测不通，不能
+        直接弃剧——按跟当前季度的月份距离由近到远，尝试本地已知的其它季度
+        文件夹组合，全部试过还是不通才停止继续往前探测这部剧。命中的季度
+        会作为下一集的优先候选(大概率连续几集在同一个文件夹)。
+
+        对本地已有的每部剧，从当前最早一集往前递减集数构造候选，严格串行
+        探测(不并发)、探测间隔sleep、单次任务设总探测数上限、每集尝试的
+        季度候选数上限——这几条都是用户明确要求的限流设计，避免被目标站点
+        风控封IP。确认可达才写入，不是无脑改写。"""
         self.__save_task_status("backfill", "running", "进行中")
         directory = Path(self._storageplace)
         if not directory.exists():
@@ -515,11 +536,21 @@ class ANiStrmHub(_PluginBase):
 
         max_probes_total = 30
         max_back_per_series = 20
+        max_season_candidates_per_episode = 4
         probe_interval_sec = 1.5
 
         series_min_ep: Dict[str, Tuple[int, Path]] = {}
+        known_seasons: Set[str] = set()
         for strm_file in sorted(directory.rglob("*.strm")):
             stem = strm_file.stem
+            try:
+                content = strm_file.read_text(encoding="utf-8").strip()
+            except Exception:
+                content = ""
+            season_match = SEASON_RE.search(content)
+            if season_match:
+                known_seasons.add(season_match.group(1))
+
             match = EPISODE_NUM_RE.search(stem)
             if not match:
                 continue
@@ -545,6 +576,9 @@ class ANiStrmHub(_PluginBase):
             except Exception:
                 continue
 
+            season_match = SEASON_RE.search(ref_content)
+            current_season = season_match.group(1) if season_match else None
+
             for offset in range(1, max_back_per_series + 1):
                 candidate_ep = min_ep - offset
                 if candidate_ep < 1:
@@ -552,67 +586,97 @@ class ANiStrmHub(_PluginBase):
                 if total_probed >= max_probes_total:
                     break
 
-                candidate_link = StrmRelinkService.build_episode_variant_link(ref_content, candidate_ep)
                 candidate_title = StrmRelinkService.build_title_variant(ref_file.stem, candidate_ep)
-                if not candidate_link or not candidate_title:
+                if not candidate_title:
                     break
-
                 candidate_path = ref_file.with_name(f"{candidate_title}.strm")
                 if candidate_path.exists():
                     # 这一集本地已经有了(之前补过/正常拉过)，不用重新探测，
                     # 继续往前查更早的集数
                     continue
 
-                final_link = self.__finalize_strm_link(candidate_link)
+                season_candidates: List[str] = []
+                if current_season:
+                    season_candidates.append(current_season)
+                others = known_seasons - {current_season} if current_season else set(known_seasons)
+                for season in sorted(others, key=lambda s: StrmRelinkService.season_distance(s, current_season or s)):
+                    season_candidates.append(season)
+                    if len(season_candidates) >= max_season_candidates_per_episode:
+                        break
 
-                time.sleep(probe_interval_sec)
-                total_probed += 1
-                latency_ms, fail_reason = self._relink_service.probe_latency_ms(final_link)
-                if latency_ms is None:
+                found = False
+                for season_option in season_candidates:
+                    if total_probed >= max_probes_total:
+                        break
+                    if season_option == current_season:
+                        link_with_season = ref_content
+                    else:
+                        link_with_season = StrmRelinkService.build_season_variant_link(ref_content, season_option)
+                    if not link_with_season:
+                        continue
+                    candidate_link = StrmRelinkService.build_episode_variant_link(link_with_season, candidate_ep)
+                    if not candidate_link:
+                        continue
+
+                    final_link = self.__finalize_strm_link(candidate_link)
+                    time.sleep(probe_interval_sec)
+                    total_probed += 1
+                    latency_ms, fail_reason = self._relink_service.probe_latency_ms(final_link)
+                    if latency_ms is not None:
+                        try:
+                            candidate_path.write_text(final_link, encoding="utf-8")
+                            total_created += 1
+                            found = True
+                            current_season = season_option
+                            logger.info(
+                                f"ANiStrmHub资源补齐：成功补上第{candidate_ep}集"
+                                f"(季度={season_option}，{latency_ms}ms) {candidate_path.name}"
+                            )
+                        except Exception as err:
+                            logger.warning(f"ANiStrmHub资源补齐：写入失败 {candidate_path.name} - {err}")
+                        break
+                    logger.debug(
+                        f"ANiStrmHub资源补齐：{ref_file.stem} 第{candidate_ep}集在季度{season_option}"
+                        f"不可达({fail_reason})，尝试下一个候选季度"
+                    )
+
+                if not found:
                     logger.info(
-                        f"ANiStrmHub资源补齐：{ref_file.stem} 回溯到第{candidate_ep}集不可达"
-                        f"({fail_reason})，停止继续往前探测这部剧"
+                        f"ANiStrmHub资源补齐：{ref_file.stem} 回溯到第{candidate_ep}集，"
+                        f"尝试过的{len(season_candidates)}个季度文件夹均不可达，停止继续往前探测这部剧"
                     )
                     break
-
-                try:
-                    candidate_path.write_text(final_link, encoding="utf-8")
-                    total_created += 1
-                    logger.info(
-                        f"ANiStrmHub资源补齐：成功补上第{candidate_ep}集({latency_ms}ms) {candidate_path.name}"
-                    )
-                except Exception as err:
-                    logger.warning(f"ANiStrmHub资源补齐：写入失败 {candidate_path.name} - {err}")
 
         summary = f"探测{total_probed}次，成功补齐{total_created}集"
         logger.info(f"ANiStrmHub资源补齐完成：{summary}")
         self.__save_task_status("backfill", "done", summary)
 
     def __detect_task(self):
-        """概览页连通性矩阵：对每个未禁用的订阅源取一条样本直链，测"直连"，
-        再测"套上每个未禁用的加速源"之后的连通情况。行=订阅源，列=[直连,
-        加速源1,加速源2,...]。这张矩阵直接回答"该选哪个订阅源+哪个加速源
-        组合"——这正是重构前那次td.ee坏链接真正需要的诊断工具：用户看一眼
-        矩阵就知道某个源/某个组合连不通，不用等生成出坏链接才发现。顺带
-        统计本地strm按"订阅源+加速源"分类的分布。"""
+        """探测当前配置的订阅源(以及内置容灾候选池，仅作只读诊断展示，不是
+        要用户管理的配置项)分别的直连情况，以及套上当前配置加速源之后的
+        连通情况，顺带统计本地strm按"订阅源+加速源"分类的分布。"""
         self.__save_task_status("detect", "running", "进行中")
-        subscription_urls = self.__parse_subscription_sources()
-        accelerator_prefixes = self.__parse_accelerator_sources()
-        if not subscription_urls:
-            logger.warning("ANiStrmHub连通性探测：未配置任何订阅源，任务结束")
-            self.__save_task_status("detect", "done", "未配置订阅源")
-            return
+        primary = (self._subscription_source or "").strip() or DEFAULT_SUBSCRIPTION_SOURCE
+        candidates = self.__subscription_candidates(primary)
+        accelerator = (self._accelerator_prefix or "").strip()
 
         rows = []
-        domain_to_source: Dict[str, str] = {}
-        for sub_url in subscription_urls:
-            row: Dict[str, Any] = {"subscription": sub_url, "rss_ok": False, "error": None, "columns": []}
+        domain_to_label: Dict[str, str] = {}
+        for idx, url in enumerate(candidates):
+            label = "当前配置" if idx == 0 else f"内置容灾候选{idx}"
+            row: Dict[str, Any] = {
+                "subscription": url,
+                "label": label,
+                "rss_ok": False,
+                "error": None,
+                "columns": [],
+            }
             try:
-                entries = self._client.fetch_one_source(sub_url)
+                entries = self._client.fetch_one_source(url)
             except Exception as err:
                 row["error"] = str(err)
                 rows.append(row)
-                logger.warning(f"ANiStrmHub连通性探测：{sub_url} RSS抓取失败 - {err}")
+                logger.warning(f"ANiStrmHub连通性探测：{url} RSS抓取失败 - {err}")
                 continue
 
             row["rss_ok"] = True
@@ -622,39 +686,35 @@ class ANiStrmHub(_PluginBase):
                 continue
 
             sample_link = entries[0]["link"]
-            sample_domain = urlparse(sample_link).netloc
-            domain_to_source[sample_domain] = sub_url
+            domain_to_label[urlparse(sample_link).netloc] = label
 
             time.sleep(0.3)
             latency_ms, fail_reason = self._relink_service.probe_latency_ms(sample_link)
             row["columns"].append({"label": "直连", "latency_ms": latency_ms, "error": fail_reason})
 
-            for prefix in accelerator_prefixes:
-                candidate = StrmRelinkService.build_proxied_url(sample_link, prefix)
+            if accelerator:
+                candidate = StrmRelinkService.build_proxied_url(sample_link, accelerator)
                 time.sleep(0.3)
                 latency_ms, fail_reason = self._relink_service.probe_latency_ms(candidate)
-                row["columns"].append({"label": prefix, "latency_ms": latency_ms, "error": fail_reason})
+                row["columns"].append({"label": "加速后", "latency_ms": latency_ms, "error": fail_reason})
 
             rows.append(row)
 
         checked_at = datetime.now(tz=pytz.timezone(settings.TZ)).strftime("%Y-%m-%d %H:%M:%S")
-        self.save_data(
-            "connectivity_matrix",
-            {"checked_at": checked_at, "rows": rows},
-        )
+        self.save_data("connectivity_matrix", {"checked_at": checked_at, "rows": rows})
 
         distribution = StrmRelinkService.scan_local_distribution(
-            self._storageplace, domain_to_source, accelerator_prefixes
+            self._storageplace, domain_to_label, [accelerator] if accelerator else []
         )
         self.save_data("local_distribution", {"checked_at": checked_at, **distribution})
 
-        summary = f"{len(subscription_urls)}个订阅源 x {len(accelerator_prefixes)}个加速源，本地strm共{distribution.get('total', 0)}个"
+        summary = f"{len(candidates)}个候选订阅源，本地strm共{distribution.get('total', 0)}个"
         logger.info(f"ANiStrmHub连通性探测完成：{summary}")
         self.__save_task_status("detect", "done", summary)
 
     def __save_task_status(self, task_key: str, status: str, summary: str = ""):
-        """记录一次性任务(拉取/维护/补齐/探测)的运行状态，供详情页展示进度，
-        也用来防止上一次还没跑完时被重复排队"""
+        """记录一次性任务的运行状态，供详情页展示进度，也用来防止上一次
+        还没跑完时被重复排队"""
         all_status = self.get_data("task_status") or {}
         all_status[task_key] = {
             "status": status,  # running / done / failed
@@ -676,10 +736,10 @@ class ANiStrmHub(_PluginBase):
         return []
 
     def get_api(self) -> List[Dict[str, Any]]:
-        """当前插件不注册后端API，探测/维护都走配置开关+详情页缓存展示。
-        5.0.0重构时移除了4.0.0的Relay转发实验性功能(本地局域网代理转发
-        规划到以后再做，会设计成"加速源列表里的一种类型"，不是这次这种
-        独立整体开关模式)。"""
+        """当前插件不注册后端API。如果社区加速源都不稳定，可以自己用GOST/
+        Nginx等工具搭一个"Proxy Everything"风格的反向代理，把这个反代地址
+        当成"加速源"填进配置里即可——不需要插件在自己进程里重造一遍转发，
+        这也是0.6.0移除4.0.0"Relay转发"实验性功能的原因，详见README。"""
         return []
 
     @staticmethod
@@ -775,21 +835,21 @@ class ANiStrmHub(_PluginBase):
                             },
                         ],
                     },
-                    self.__section_title("生成规则（可选）"),
                     {
                         "component": "VRow",
                         "content": [
                             {
                                 "component": "VCol",
-                                "props": {"cols": 12, "md": 4},
+                                "props": {"cols": 12, "md": 7},
                                 "content": [
                                     {
                                         "component": "VTextField",
                                         "props": {
-                                            "model": "filename_remove",
-                                            "label": "文件名删除字符串（@分隔）",
-                                            "placeholder": "ANSUB@NC-Raw",
-                                            "hint": "从生成的strm文件名里删掉这些子串，不影响标题匹配",
+                                            "model": "subscription_source",
+                                            "label": "订阅源（ANi的RSS地址）",
+                                            "placeholder": DEFAULT_SUBSCRIPTION_SOURCE,
+                                            "hint": "只填一个你信得过的地址就行。这个地址抓取失败时，会自动依次"
+                                            "尝试内置的几个备用镜像，不用你手动切换",
                                             "persistent-hint": True,
                                         },
                                     }
@@ -797,159 +857,44 @@ class ANiStrmHub(_PluginBase):
                             },
                             {
                                 "component": "VCol",
-                                "props": {"cols": 12, "md": 4},
+                                "props": {"cols": 12, "md": 5},
                                 "content": [
                                     {
-                                        "component": "VTextField",
+                                        "component": "VSelect",
                                         "props": {
-                                            "model": "filename_blacklist",
-                                            "label": "文件名黑名单（@分隔）",
-                                            "placeholder": "预告@PV@NCOP",
-                                            "hint": "标题命中关键词则跳过，不生成strm",
+                                            "model": "season_filter",
+                                            "label": "拉取季度筛选",
+                                            "items": self.__build_season_options(),
+                                            "multiple": True,
+                                            "chips": True,
+                                            "clearable": True,
+                                            "hint": "只在订阅源当前RSS窗口内筛选，默认「不筛选」处理全部",
                                             "persistent-hint": True,
                                         },
                                     }
                                 ],
                             },
+                        ],
+                    },
+                    {
+                        "component": "VRow",
+                        "content": [
                             {
                                 "component": "VCol",
-                                "props": {"cols": 12, "md": 4},
+                                "props": {"cols": 12, "md": 7},
                                 "content": [
                                     {
-                                        "component": "VSwitch",
+                                        "component": "VTextField",
                                         "props": {
-                                            "model": "season_dir",
-                                            "label": "按季度分子目录存放",
+                                            "model": "accelerator_prefix",
+                                            "label": "加速源（国内直连不通时配代理/反代地址，留空=不加速）",
+                                            "placeholder": "https://pro.pili.cc.cd",
+                                            "hint": "把strm链接整体包一层这个地址。每次拉新番前会自动测一次"
+                                            "这个地址能不能用，测不通当次就不加速、写裸直链，不会生成"
+                                            "连不上的坏链接",
+                                            "persistent-hint": True,
                                         },
                                     }
-                                ],
-                            },
-                        ],
-                    },
-                    {
-                        "component": "VCard",
-                        "props": {"variant": "tonal", "color": "primary", "class": "mt-4"},
-                        "content": [
-                            {
-                                "component": "VCardTitle",
-                                "props": {"class": "text-subtitle-1"},
-                                "text": "订阅源管理——添加多个候选，只有一个在生效",
-                            },
-                            {
-                                "component": "VCardText",
-                                "content": [
-                                    {
-                                        "component": "VRow",
-                                        "content": [
-                                            {
-                                                "component": "VCol",
-                                                "props": {"cols": 12, "md": 7},
-                                                "content": [
-                                                    {
-                                                        "component": "VTextarea",
-                                                        "props": {
-                                                            "model": "subscription_sources",
-                                                            "label": "订阅源列表（一行一个RSS地址）",
-                                                            "rows": 6,
-                                                            "placeholder": DEFAULT_SUBSCRIPTION_SOURCES,
-                                                            "hint": "行首加 # 表示禁用这个源(已知连不上)，不要把 # 开头的行"
-                                                            "删掉/改掉，不然那些已知失效的域名会被重新启用",
-                                                            "persistent-hint": True,
-                                                        },
-                                                    }
-                                                ],
-                                            },
-                                            {
-                                                "component": "VCol",
-                                                "props": {"cols": 12, "md": 5},
-                                                "content": [
-                                                    {
-                                                        "component": "VSelect",
-                                                        "props": {
-                                                            "model": "active_subscription_source",
-                                                            "label": "当前生效订阅源",
-                                                            "items": self.__build_subscription_options(),
-                                                            "clearable": True,
-                                                            "hint": "拉新番只从这一个源抓取，不选则默认用列表第一个未禁用的。"
-                                                            "先「探测连通性」看哪个能连再选",
-                                                            "persistent-hint": True,
-                                                        },
-                                                    },
-                                                    {
-                                                        "component": "VSelect",
-                                                        "props": {
-                                                            "model": "season_filter",
-                                                            "label": "拉取季度筛选",
-                                                            "items": self.__build_season_options(),
-                                                            "multiple": True,
-                                                            "chips": True,
-                                                            "clearable": True,
-                                                            "class": "mt-2",
-                                                            "hint": "只在生效订阅源当前RSS窗口内筛选，默认「不筛选」处理全部",
-                                                            "persistent-hint": True,
-                                                        },
-                                                    },
-                                                ],
-                                            },
-                                        ],
-                                    },
-                                ],
-                            },
-                        ],
-                    },
-                    {
-                        "component": "VCard",
-                        "props": {"variant": "tonal", "color": "warning", "class": "mt-4"},
-                        "content": [
-                            {
-                                "component": "VCardTitle",
-                                "props": {"class": "text-subtitle-1"},
-                                "text": "加速源管理——国内直连不通ANi官方域名时，配代理/反代地址让strm能连上",
-                            },
-                            {
-                                "component": "VCardText",
-                                "content": [
-                                    {
-                                        "component": "VRow",
-                                        "content": [
-                                            {
-                                                "component": "VCol",
-                                                "props": {"cols": 12, "md": 7},
-                                                "content": [
-                                                    {
-                                                        "component": "VTextarea",
-                                                        "props": {
-                                                            "model": "accelerator_sources",
-                                                            "label": "加速源列表（一行一个代理/加速地址）",
-                                                            "rows": 3,
-                                                            "placeholder": "https://pro.pili.cc.cd",
-                                                            "hint": "把strm链接整体包一层这个地址，格式是「加速地址+原链接」，"
-                                                            "行首加#表示禁用",
-                                                            "persistent-hint": True,
-                                                        },
-                                                    }
-                                                ],
-                                            },
-                                            {
-                                                "component": "VCol",
-                                                "props": {"cols": 12, "md": 5},
-                                                "content": [
-                                                    {
-                                                        "component": "VSelect",
-                                                        "props": {
-                                                            "model": "active_accelerator_source",
-                                                            "label": "当前生效加速源",
-                                                            "items": self.__build_accelerator_options(),
-                                                            "clearable": True,
-                                                            "hint": "留空=不加速，strm写裸直链。选中后，新拉的番自动套上这个"
-                                                            "加速源，不用手动跑「本地strm维护」",
-                                                            "persistent-hint": True,
-                                                        },
-                                                    }
-                                                ],
-                                            },
-                                        ],
-                                    },
                                 ],
                             },
                         ],
@@ -971,47 +916,26 @@ class ANiStrmHub(_PluginBase):
                                         "content": [
                                             {
                                                 "component": "VCol",
-                                                "props": {"cols": 12, "md": 4},
-                                                "content": [
-                                                    {
-                                                        "component": "VSelect",
-                                                        "props": {
-                                                            "model": "target_subscription_source",
-                                                            "label": "目标订阅源",
-                                                            "items": self.__build_subscription_options(),
-                                                            "clearable": True,
-                                                            "hint": "不选=保持当前来源不变",
-                                                            "persistent-hint": True,
-                                                        },
-                                                    }
-                                                ],
-                                            },
-                                            {
-                                                "component": "VCol",
-                                                "props": {"cols": 12, "md": 4},
-                                                "content": [
-                                                    {
-                                                        "component": "VSelect",
-                                                        "props": {
-                                                            "model": "target_accelerator_source",
-                                                            "label": "目标加速源",
-                                                            "items": self.__build_accelerator_options(),
-                                                            "clearable": True,
-                                                            "hint": "不选=不加速(还原成裸直链)",
-                                                            "persistent-hint": True,
-                                                        },
-                                                    }
-                                                ],
-                                            },
-                                            {
-                                                "component": "VCol",
-                                                "props": {"cols": 12, "md": 4},
+                                                "props": {"cols": 12, "md": 6},
                                                 "content": [
                                                     {
                                                         "component": "VSwitch",
                                                         "props": {
-                                                            "model": "apply_local_strm_once",
-                                                            "label": "立即应用到本地strm",
+                                                            "model": "refresh_subscription_once",
+                                                            "label": "用当前订阅源刷新本地strm",
+                                                        },
+                                                    }
+                                                ],
+                                            },
+                                            {
+                                                "component": "VCol",
+                                                "props": {"cols": 12, "md": 6},
+                                                "content": [
+                                                    {
+                                                        "component": "VSwitch",
+                                                        "props": {
+                                                            "model": "apply_accelerator_once",
+                                                            "label": "套用/还原当前加速源",
                                                         },
                                                     }
                                                 ],
@@ -1021,11 +945,10 @@ class ANiStrmHub(_PluginBase):
                                     {
                                         "component": "div",
                                         "props": {"class": "text-caption mt-2"},
-                                        "text": "两个选择器搭配使用：目标订阅源不变+目标加速源选中=批量套壳加速；"
-                                        "目标订阅源不变+目标加速源不选=还原成裸直链；目标订阅源选中+目标加速源"
-                                        "不选=批量切换到指定来源；两个都选=切换来源同时加速。标题还在目标订阅源"
-                                        "当前RSS窗口内的优先精确匹配换最新直链，不在窗口内的按路径迁移公式换源。"
-                                        "写入前实测探测确认可达才覆盖，探测不通过的保留原文件不动。",
+                                        "text": "刷新订阅源：标题还在RSS窗口内的直接换成最新直链，不在窗口内的按"
+                                        "路径迁移公式换成当前订阅源的域名。套用/还原加速源：加速源填了就套上，"
+                                        "留空就还原成裸链接。两个都实测探测确认可达才覆盖写入，探测不通过的"
+                                        "保留原文件不动。运行状态见下方详情页。",
                                     },
                                 ],
                             },
@@ -1064,11 +987,10 @@ class ANiStrmHub(_PluginBase):
                                     {
                                         "component": "div",
                                         "props": {"class": "text-caption mt-2"},
-                                        "text": "ani-download.xml只是滚动窗口，只含近期资源；ANi同一部剧全部集数的直链"
-                                        "只有集数数字不同，季度目录按首播月份命名。对本地已有的剧，从最早一集"
-                                        "往前递减集数构造候选直链，严格串行探测+限流(固定间隔+单次任务探测数上限)，"
-                                        "一旦某一集探测不可达就停止这部剧继续往前查，避免高频请求被目标站点风控封IP。"
-                                        "确认可达才写入，不是无脑改写。手动触发，不进定时任务，运行状态见下方详情页。",
+                                        "text": "对本地已有的剧，从最早一集往前递减集数构造候选直链；同一部剧更早的"
+                                        "集数不一定在同一个季度文件夹（实测确认过有的剧真实起点在更早的月份），"
+                                        "碰到当前文件夹探测不通会按月份距离尝试其它已知文件夹，不会一碰壁就弃剧。"
+                                        "严格串行探测+限流，确认可达才写入，手动触发，不进定时任务。",
                                     },
                                 ],
                             },
@@ -1081,7 +1003,7 @@ class ANiStrmHub(_PluginBase):
                             {
                                 "component": "VCardTitle",
                                 "props": {"class": "text-subtitle-1"},
-                                "text": "连通性探测——订阅源 x 加速源 矩阵",
+                                "text": "连通性探测",
                             },
                             {
                                 "component": "VCardText",
@@ -1097,7 +1019,7 @@ class ANiStrmHub(_PluginBase):
                                                         "component": "VSwitch",
                                                         "props": {
                                                             "model": "detect_once",
-                                                            "label": "立即探测连通性矩阵",
+                                                            "label": "立即探测连通性",
                                                         },
                                                     }
                                                 ],
@@ -1107,9 +1029,8 @@ class ANiStrmHub(_PluginBase):
                                     {
                                         "component": "div",
                                         "props": {"class": "text-caption mt-2"},
-                                        "text": "对每个未禁用的订阅源取一条样本直链，测「直连」，再测「套上每个未禁用"
-                                        "的加速源」之后的连通情况，结果列成一张矩阵在下方详情页展示。选订阅源/"
-                                        "加速源之前先跑一次这个，看清楚哪个组合真的能连，不要凭感觉选。",
+                                        "text": "测你配置的订阅源直连情况、套上加速源之后的连通情况，顺带列出内置"
+                                        "容灾候选池当前谁能连（仅供参考，不需要你选）。结果在下方详情页展示。",
                                     },
                                 ],
                             },
@@ -1128,9 +1049,20 @@ class ANiStrmHub(_PluginBase):
                                         "props": {
                                             "type": "info",
                                             "variant": "tonal",
-                                            "text": "抓取ANi的RSS（ani-download.xml），生成strm文件\n"
+                                            "text": "抓取ANi的RSS（ani-download.xml），生成strm文件，按季度自动分子目录存放\n"
                                             "配合目录监控使用，strm文件创建在/downloads/strm\n"
                                             "通过目录监控转移到link媒体库文件夹 如/downloads/link/strm mp会完成刮削",
+                                            "style": "white-space: pre-line;",
+                                        },
+                                    },
+                                    {
+                                        "component": "VAlert",
+                                        "props": {
+                                            "type": "info",
+                                            "variant": "tonal",
+                                            "text": "国内直连不稳定时，除了填社区加速源(如pili/op5)，也可以自己用GOST/"
+                                            "Nginx等工具搭一个反向代理，把反代地址当成加速源填进去——不需要插件"
+                                            "额外支持，用法跟社区加速源完全一样。",
                                             "style": "white-space: pre-line;",
                                         },
                                     },
@@ -1155,17 +1087,11 @@ class ANiStrmHub(_PluginBase):
             "use_proxy": True,
             "onlyonce": False,
             "storageplace": "/downloads/strm",
-            "filename_remove": "",
-            "filename_blacklist": "",
-            "season_dir": False,
             "season_filter": ["all"],
-            "subscription_sources": DEFAULT_SUBSCRIPTION_SOURCES,
-            "active_subscription_source": None,
-            "accelerator_sources": "",
-            "active_accelerator_source": None,
-            "target_subscription_source": None,
-            "target_accelerator_source": None,
-            "apply_local_strm_once": False,
+            "subscription_source": DEFAULT_SUBSCRIPTION_SOURCE,
+            "accelerator_prefix": "",
+            "refresh_subscription_once": False,
+            "apply_accelerator_once": False,
             "backfill_once": False,
             "detect_once": False,
             "cron": "20 22,23,0,1 * * *",
@@ -1179,17 +1105,11 @@ class ANiStrmHub(_PluginBase):
                 "cron": self._cron,
                 "onlyonce": self._onlyonce,
                 "storageplace": self._storageplace,
-                "filename_remove": self._filename_remove,
-                "filename_blacklist": self._filename_blacklist,
-                "season_dir": self._season_dir,
                 "season_filter": self._season_filter,
-                "subscription_sources": self._subscription_sources,
-                "active_subscription_source": self._active_subscription_source,
-                "accelerator_sources": self._accelerator_sources,
-                "active_accelerator_source": self._active_accelerator_source,
-                "target_subscription_source": self._target_subscription_source,
-                "target_accelerator_source": self._target_accelerator_source,
-                "apply_local_strm_once": self._apply_local_strm_once,
+                "subscription_source": self._subscription_source,
+                "accelerator_prefix": self._accelerator_prefix,
+                "refresh_subscription_once": self._refresh_subscription_once,
+                "apply_accelerator_once": self._apply_accelerator_once,
                 "backfill_once": self._backfill_once,
                 "detect_once": self._detect_once,
             }
@@ -1197,9 +1117,10 @@ class ANiStrmHub(_PluginBase):
 
     TASK_LABELS = {
         "task": "拉取新番生成strm",
-        "apply_local_strm": "本地strm维护",
+        "refresh_subscription": "刷新订阅源",
+        "apply_accelerator": "套用/还原加速源",
         "backfill": "资源补齐(回溯集数)",
-        "detect": "连通性矩阵探测",
+        "detect": "连通性探测",
     }
 
     def get_page(self) -> List[dict]:
@@ -1274,9 +1195,8 @@ class ANiStrmHub(_PluginBase):
                     "props": {
                         "type": "info",
                         "variant": "tonal",
-                        "text": "还没有探测数据。去插件配置页勾选「立即探测连通性矩阵」跑一次，"
-                        "这里会显示每个订阅源直连、以及套上每个加速源之后分别能不能连，"
-                        "还有本地已生成的strm按订阅源+加速源的分布。",
+                        "text": "还没有探测数据。去插件配置页勾选「立即探测连通性」跑一次，这里会显示"
+                        "订阅源直连、套上加速源之后能不能连，还有本地已生成的strm按订阅源+加速源的分布。",
                     },
                 }
             )
@@ -1328,7 +1248,9 @@ class ANiStrmHub(_PluginBase):
                             {
                                 "component": "VCol",
                                 "props": {"cols": 12, "md": 3},
-                                "content": [{"component": "span", "text": row.get("subscription")}],
+                                "content": [
+                                    {"component": "span", "text": f"{row.get('label')}：{row.get('subscription')}"}
+                                ],
                             },
                             {
                                 "component": "VCol",
@@ -1345,8 +1267,7 @@ class ANiStrmHub(_PluginBase):
                     "content": [
                         {
                             "component": "VCardTitle",
-                            "text": f"订阅源 x 加速源 连通性矩阵（探测于 "
-                            f"{connectivity_matrix.get('checked_at', '未知时间')}）",
+                            "text": f"连通性探测（探测于 {connectivity_matrix.get('checked_at', '未知时间')}）",
                         },
                         {
                             "component": "VCardText",
@@ -1419,11 +1340,9 @@ class ANiStrmHub(_PluginBase):
 
 
 class AniRssAggregator:
-    """按URL抓取并解析单个ANi RSS源(ani-download.xml格式)。
-
-    5.0.0起不再持有"数据源列表"这个状态——订阅源改成"列表+单选生效"模型后，
-    具体拉哪个源由调用方(ANiStrmHub)决定，这里只负责"给一个URL，抓取解析成
-    条目列表"这一件事，供生效订阅源和本地strm维护里的目标订阅源共用。"""
+    """按URL抓取并解析单个ANi RSS源(ani-download.xml格式)。不持有"数据源
+    列表"这个状态——具体拉哪个源由调用方(ANiStrmHub)决定，这里只负责
+    "给一个URL，抓取解析成条目列表"这一件事。"""
 
     def __init__(self, use_proxy: bool = False):
         self._use_proxy = use_proxy
@@ -1507,23 +1426,11 @@ class StrmFileService:
 
     @staticmethod
     def is_blacklisted(title: str, blacklist_config: str) -> bool:
-        """借鉴shanhai2333/ANiStrmPro：文件名命中黑名单关键词(@分隔，如"预告@PV@NCOP")则跳过"""
+        """标题命中黑名单关键词(@分隔)则跳过，不生成strm"""
         if not blacklist_config:
             return False
         keywords = [kw.strip() for kw in blacklist_config.split("@") if kw.strip()]
         return any(kw in title for kw in keywords)
-
-    @staticmethod
-    def clean_file_name(title: str, remove_config: str) -> str:
-        """借鉴shanhai2333/ANiStrmPro：从文件名里删除配置的子串(@分隔，如"ANSUB@NC-Raw")"""
-        if not remove_config:
-            return title
-        cleaned = title
-        for token in remove_config.split("@"):
-            token = token.strip()
-            if token:
-                cleaned = cleaned.replace(token, "")
-        return cleaned or title
 
     def touch_strm_file(
         self,
@@ -1560,20 +1467,19 @@ class StrmFileService:
 
 
 class StrmRelinkService:
-    """本地strm链接的构造/探测/归类工具集，供「拉新番」「本地strm维护」
-    「资源补齐」「连通性探测」共用。
+    """本地strm链接的构造/探测/归类工具集。
 
     核心转换公式：
     1. 域名替换（derive_prefix + extract_resource_path）：ANi各镜像的直链
        结构是 {前缀}/{季度}/{文件名}?d=mp4，其中"季度/文件名?d=mp4"这一段
-       在所有镜像间完全一致，只有前缀（域名，以及是否带resources.ani.rip
-       中间路径）不同。本地strm维护里"切换到目标订阅源"用的就是这个公式。
+       在所有镜像间完全一致，只有前缀（域名）不同。"刷新订阅源"用的就是
+       这个公式。
     2. 前缀拼接（build_proxied_url）：把原始链接整体包一层反代前缀，格式仿
        "Proxy Everything"这类通用反代工具的用法，保留原host不做域名替换。
-       加速源套壳用的是这个公式，跟上面的域名替换是两种不同的转换，不要
-       混用。
-    3. strip_known_accelerator是build_proxied_url的逆运算，本地strm维护里
-       用来判断一个strm当前是不是已经被某个已知加速源包过壳。
+       加速源套壳用的是这个公式，两者不要混用。
+    3. strip_known_accelerator是build_proxied_url的逆运算。
+    4. build_season_variant_link/build_episode_variant_link是资源补齐用的
+       候选构造：分别替换季度目录和集数数字，其余部分原样保留。
     """
 
     SEASON_PATH_RE = re.compile(r"(\d{4}-\d{1,2}/.+)$")
@@ -1601,11 +1507,7 @@ class StrmRelinkService:
 
         例：原链接 https://resources.ani.rip/2025-10/xxx?d=mp4，
         代理前缀 https://pro.pili.cc.cd，
-        结果 https://pro.pili.cc.cd/resources.ani.rip/2025-10/xxx?d=mp4
-
-        跟derive_prefix/extract_resource_path那套"域名替换"(丢掉原host)是
-        两种不同的转换——这个是"前缀拼接"(保留原host)，按用户实测确认的
-        真实反代格式来，两者不要混用。"""
+        结果 https://pro.pili.cc.cd/resources.ani.rip/2025-10/xxx?d=mp4"""
         proxy_prefix = proxy_prefix.rstrip("/")
         if original_link.startswith(proxy_prefix + "/"):
             return original_link  # 已经套过这层代理，不重复叠加
@@ -1650,18 +1552,41 @@ class StrmRelinkService:
         new_path = quote(parsed.path, safe="/")
         return urlunparse((parsed.scheme, parsed.netloc, new_path, parsed.params, parsed.query, parsed.fragment))
 
+    @staticmethod
+    def build_season_variant_link(link: str, new_season: str) -> Optional[str]:
+        """资源补齐用：把直链里的季度目录换成new_season，其余部分原样保留。
+        季度目录是纯ASCII(yyyy-m格式)，不涉及URL编码，直接在原始字符串上
+        替换即可，不需要像集数那样先unquote再quote。"""
+        match = SEASON_RE.search(link)
+        if not match:
+            return None
+        return f"{link[:match.start(1)]}{new_season}{link[match.end(1):]}"
+
+    @staticmethod
+    def season_distance(season_a: str, season_b: str) -> int:
+        """两个yyyy-m季度目录之间相差多少个月，资源补齐按这个距离由近到远
+        尝试候选季度文件夹——同一部剧更早的集数大概率落在离当前季度不太远
+        的月份里，优先试近的能省探测次数。"""
+
+        def _month_index(season: str) -> int:
+            year, month = season.split("-")
+            return int(year) * 12 + int(month)
+
+        return abs(_month_index(season_a) - _month_index(season_b))
+
     def probe_latency_ms(self, url: str) -> Tuple[Optional[float], Optional[str]]:
-        """探测直链能不能连通、连通要多久（只请求1个字节，类似ping）。
-        返回(延迟ms, None)表示成功；返回(None, 失败原因)表示不可达——原因写清楚
-        具体HTTP状态码或异常信息，不能只留一句"不可达"就没了，不然出问题
-        没法分清到底是链接真死了、单纯超时、还是被限流，这个坑已经踩过。"""
+        """探测直链能不能连通、连通要多久，同时校验响应内容是不是真的视频
+        数据——只看HTTP状态码不够：服务器完全可能返回200/206但吐的是错误页
+        (html/json)，这个坑已经在真实排查中确认过。返回(延迟ms, None)表示
+        成功；返回(None, 失败原因)表示不可达——原因写清楚具体HTTP状态码/
+        内容校验失败/异常信息，不能只留一句"不可达"就没了。"""
         try:
             # 注意：get_res(url, headers=...)里的headers会整体替换掉RequestUtils构造时
             # 设置的默认header(包括UA)，不是合并。必须用update_headers()把Range头合并
             # 进去，否则探测请求会变成没有UA的裸请求，容易被目标站点当可疑流量拦截(403)，
             # 导致本来可达的链接被误判为不可达——这个坑已经在联调时实测踩过。
             request_utils = self._request_factory()
-            request_utils.update_headers({"Range": "bytes=0-0"})
+            request_utils.update_headers({"Range": f"bytes=0-{PROBE_RANGE_BYTES - 1}"})
             start = time.monotonic()
             response = request_utils.get_res(url)
             elapsed_ms = (time.monotonic() - start) * 1000
@@ -1669,9 +1594,37 @@ class StrmRelinkService:
                 return None, "无响应(连接失败或超时)"
             if response.status_code not in (200, 206):
                 return None, f"HTTP {response.status_code}"
+            if not self._looks_like_video(response):
+                return None, "响应内容不是视频数据(HTTP状态码正常但可能是错误页)"
             return round(elapsed_ms, 1), None
         except Exception as err:
             return None, f"异常:{err}"
+
+    @staticmethod
+    def _looks_like_video(response: Any) -> bool:
+        """两层校验：1. Content-Type声明的类型不是网页/JSON这类格式；
+        2. 内容开头不是明显的错误页标记，且尽量匹配已知视频容器的魔数字节
+        (mp4/mov的'ftyp'box在偏移4字节处，webm/mkv的EBML头在开头)。ANi的
+        直链固定是mp4容器，遇到不认识的格式但也没有错误页特征时保守放行，
+        避免对没见过的容器类型误杀。"""
+        try:
+            content_type = str(response.headers.get("Content-Type", "") or "").split(";")[0].strip().lower()
+        except Exception:
+            content_type = ""
+        if content_type in NON_VIDEO_CONTENT_TYPES:
+            return False
+
+        content = response.content or b""
+        if not content:
+            return False
+        stripped = content.lstrip()[:20].lower()
+        if any(stripped.startswith(marker) for marker in HTML_LIKE_PREFIXES):
+            return False
+        if content[4:8] == b"ftyp":
+            return True
+        if content[:4] == b"\x1a\x45\xdf\xa3":
+            return True
+        return True
 
     def probe_speed_kbps(self, url: str, chunk_bytes: Optional[int] = None) -> Optional[float]:
         """下载一小段(默认1MB)实测网速，不是下载整部视频。只应该在已经确认
@@ -1703,13 +1656,13 @@ class StrmRelinkService:
         accelerator_prefixes: List[str],
     ) -> Dict[str, Any]:
         """扫描本地strm，对每个文件归类成"订阅源X + 加速源Y"或"订阅源X 裸链"，
-        用于详情页展示分布。domain_to_source是"样本域名 -> 订阅源RSS地址"的
-        映射，来自__detect_task当次探测各订阅源拿到的样本直链——不认识的域名
+        用于详情页展示分布。domain_to_source是"样本域名 -> 标签"的映射，
+        来自__detect_task当次探测各候选订阅源拿到的样本直链——不认识的域名
         直接用域名本身当标签。"""
-        directory = Path(storage_path)
+        directory = Path(storage_path) if storage_path else None
         by_category: Dict[str, int] = {}
         total = 0
-        if not directory.exists():
+        if not directory or not directory.exists():
             return {"total": 0, "by_category": {}}
 
         for strm_file in directory.rglob("*.strm"):
