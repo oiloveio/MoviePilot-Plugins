@@ -64,8 +64,8 @@ class ANiStrmHub(_PluginBase):
     plugin_desc = "填一个订阅源+一个加速地址即可，自动抓取ANi新番资源生成strm文件，mp刮削入库，媒体服务器直连播放"
     plugin_icon = "https://raw.githubusercontent.com/oiloveio/MoviePilot-Plugins/main/icons/anistrmhub.png"
     plugin_version = "0.7.0"
-    plugin_author = "oiloveio,honue"
-    author_url = "https://github.com/honue"
+    plugin_author = "oiloveio"
+    author_url = "https://github.com/oiloveio"
     plugin_config_prefix = "anistrmhub_"
     plugin_order = 15
     auth_level = 2
@@ -1211,7 +1211,7 @@ class ANiStrmHub(_PluginBase):
                                             "type": "info",
                                             "variant": "tonal",
                                             "text": "emby容器需要设置代理，docker的环境变量必须要有http_proxy代理变量，大小写敏感，否则无法提取媒体信息，具体见readme.\n"
-                                            "https://github.com/honue/MoviePilot-Plugins",
+                                            "https://github.com/oiloveio/MoviePilot-Plugins",
                                             "style": "white-space: pre-line;",
                                         },
                                     },

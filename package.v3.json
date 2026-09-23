@@ -5,7 +5,7 @@
     "labels": "strm,动漫",
     "version": "0.7.0",
     "icon": "https://raw.githubusercontent.com/oiloveio/MoviePilot-Plugins/main/icons/anistrmhub.png",
-    "author": "oiloveio,honue",
+    "author": "oiloveio",
     "level": 2,
     "system_version": ">=3.0.0",
     "history": {
