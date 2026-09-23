@@ -13,6 +13,8 @@ from app.plugins.anistrmhub import (
     AniRssAggregator,
     EPISODE_NUM_RE,
     FALLBACK_SUBSCRIPTION_POOL,
+    LAYOUT_BY_TITLE,
+    LAYOUT_FLAT,
     OFFICIAL_BASE_URL,
     StrmFileService,
     StrmRelinkService,
@@ -379,6 +381,170 @@ class TestFilenameHelpers:
         assert StrmFileService.is_blacklisted("随便什么标题", "") is False
 
 
+class TestExtractSeriesTitle:
+    @pytest.mark.parametrize(
+        "file_name,expected",
+        [
+            ("[ANi] 盡墳王 - 11 [1080P][Baha][WEB-DL][AAC AVC][CHT]", "盡墳王"),
+            (
+                "[ANi] SPY×FAMILY 間諜家家酒 Season 3 - 46 [1080P][Baha][WEB-DL][AAC AVC][CHT]",
+                "SPY×FAMILY 間諜家家酒 Season 3",
+            ),
+            # 半集：集数不是整数，只认整数的EPISODE_NUM_RE会漏掉，这里要能切出剧名
+            ("[ANi] 史萊姆 第四季 - 12.5 [1080P][Baha][WEB-DL][AAC AVC][CHT]", "史萊姆 第四季"),
+            # 剧场版：集数位置压根不是数字
+            ("[ANi] 某劇場版 - 電影 [1080P][Baha][WEB-DL][AAC AVC][CHT]", "某劇場版"),
+            # 剧名自带" - "：贪婪匹配取最后一个分隔点，不能把剧名截成前半截
+            ("[ANi] Fate - Grand Order - 10 [1080P][Baha][WEB-DL][AAC AVC][CHT]", "Fate - Grand Order"),
+            # 文件名尾部带.mp4不影响剧名切分
+            ("[ANi] 一拳超人 第三季 - 25 [1080P][Baha][WEB-DL][AAC AVC][CHT].mp4", "一拳超人 第三季"),
+            # 没有发布组标签也能切
+            ("沒有發布組標籤 - 03 [1080P][Baha]", "沒有發布組標籤"),
+        ],
+    )
+    def test_extracts_series_title(self, file_name, expected):
+        assert StrmFileService.extract_series_title(file_name) == expected
+
+    def test_returns_none_for_unrecognized_name(self):
+        assert StrmFileService.extract_series_title("完全不符合格式的名字") is None
+
+    def test_safe_dir_name_blocks_path_separators(self):
+        assert StrmFileService.safe_dir_name("剧名/带斜杠") == "剧名_带斜杠"
+        assert StrmFileService.safe_dir_name("  两边空格  ") == "两边空格"
+
+
+class TestResolveRelativeDir:
+    def test_flat_layout_returns_none(self):
+        plugin = ANiStrmHub()
+        plugin._strm_layout = LAYOUT_FLAT
+        result = getattr(plugin, "_ANiStrmHub__resolve_relative_dir")(
+            "[ANi] 盡墳王 - 11 [1080P][Baha][WEB-DL][AAC AVC][CHT]"
+        )
+        assert result is None
+
+    def test_by_title_layout_returns_series_folder(self):
+        plugin = ANiStrmHub()
+        plugin._strm_layout = LAYOUT_BY_TITLE
+        result = getattr(plugin, "_ANiStrmHub__resolve_relative_dir")(
+            "[ANi] 盡墳王 - 11 [1080P][Baha][WEB-DL][AAC AVC][CHT]"
+        )
+        assert result == "盡墳王"
+
+    def test_by_title_layout_falls_back_to_root_when_unrecognized(self):
+        plugin = ANiStrmHub()
+        plugin._strm_layout = LAYOUT_BY_TITLE
+        result = getattr(plugin, "_ANiStrmHub__resolve_relative_dir")("完全不符合格式的名字")
+        assert result is None
+
+
+class TestRegroupLocalStrmTask:
+    RAW_NAMES = [
+        "[ANi] 盡墳王 - 11 [1080P][Baha][WEB-DL][AAC AVC][CHT].strm",
+        "[ANi] 盡墳王 - 10 [1080P][Baha][WEB-DL][AAC AVC][CHT].strm",
+        "[ANi] 一拳超人 第三季 - 25 [1080P][Baha][WEB-DL][AAC AVC][CHT].strm",
+    ]
+
+    def _seed_flat(self, tmp_path):
+        for name in self.RAW_NAMES:
+            (tmp_path / name).write_text("https://resources.ani.rip/2026-7/x?d=mp4", encoding="utf-8")
+
+    def test_groups_flat_files_into_series_folders(self, tmp_path):
+        plugin = ANiStrmHub()
+        plugin._storageplace = str(tmp_path)
+        plugin._strm_layout = LAYOUT_BY_TITLE
+        self._seed_flat(tmp_path)
+
+        getattr(plugin, "_ANiStrmHub__regroup_local_strm_task")()
+
+        assert (tmp_path / "盡墳王").is_dir()
+        assert len(list((tmp_path / "盡墳王").glob("*.strm"))) == 2
+        assert len(list((tmp_path / "一拳超人 第三季").glob("*.strm"))) == 1
+        assert list(tmp_path.glob("*.strm")) == []
+        status = plugin.get_data("task_status")["regroup"]
+        assert "已归档=3" in status["summary"]
+
+    def test_flattens_series_folders_back_to_root(self, tmp_path):
+        plugin = ANiStrmHub()
+        plugin._storageplace = str(tmp_path)
+        plugin._strm_layout = LAYOUT_FLAT
+        series_dir = tmp_path / "盡墳王"
+        series_dir.mkdir()
+        (series_dir / self.RAW_NAMES[0]).write_text("https://resources.ani.rip/2026-7/x?d=mp4", encoding="utf-8")
+
+        getattr(plugin, "_ANiStrmHub__regroup_local_strm_task")()
+
+        assert (tmp_path / self.RAW_NAMES[0]).exists()
+        # 搬空的子目录要清理掉，不留一堆空文件夹
+        assert not series_dir.exists()
+
+    def test_migrates_out_of_legacy_season_folders(self, tmp_path):
+        # 历史版本按"季度目录"存放过，重新归档要能把这些文件也收进剧名文件夹
+        plugin = ANiStrmHub()
+        plugin._storageplace = str(tmp_path)
+        plugin._strm_layout = LAYOUT_BY_TITLE
+        season_dir = tmp_path / "2026-7"
+        season_dir.mkdir()
+        (season_dir / self.RAW_NAMES[0]).write_text("https://resources.ani.rip/2026-7/x?d=mp4", encoding="utf-8")
+
+        getattr(plugin, "_ANiStrmHub__regroup_local_strm_task")()
+
+        assert (tmp_path / "盡墳王" / self.RAW_NAMES[0]).exists()
+        assert not season_dir.exists()
+
+    def test_already_correct_position_is_untouched(self, tmp_path):
+        plugin = ANiStrmHub()
+        plugin._storageplace = str(tmp_path)
+        plugin._strm_layout = LAYOUT_BY_TITLE
+        series_dir = tmp_path / "盡墳王"
+        series_dir.mkdir()
+        (series_dir / self.RAW_NAMES[0]).write_text("https://resources.ani.rip/2026-7/x?d=mp4", encoding="utf-8")
+
+        getattr(plugin, "_ANiStrmHub__regroup_local_strm_task")()
+
+        assert (series_dir / self.RAW_NAMES[0]).exists()
+        status = plugin.get_data("task_status")["regroup"]
+        assert "位置已正确=1" in status["summary"]
+
+    def test_unrecognized_name_flattens_to_root_instead_of_being_left_behind(self, tmp_path):
+        plugin = ANiStrmHub()
+        plugin._storageplace = str(tmp_path)
+        plugin._strm_layout = LAYOUT_BY_TITLE
+        season_dir = tmp_path / "2026-7"
+        season_dir.mkdir()
+        (season_dir / "完全不符合格式的名字.strm").write_text("https://x.example/y?d=mp4", encoding="utf-8")
+
+        getattr(plugin, "_ANiStrmHub__regroup_local_strm_task")()
+
+        assert (tmp_path / "完全不符合格式的名字.strm").exists()
+        status = plugin.get_data("task_status")["regroup"]
+        assert "识别不出剧名(平铺到根目录)=1" in status["summary"]
+
+    def test_existing_target_is_not_overwritten(self, tmp_path):
+        plugin = ANiStrmHub()
+        plugin._storageplace = str(tmp_path)
+        plugin._strm_layout = LAYOUT_BY_TITLE
+        (tmp_path / self.RAW_NAMES[0]).write_text("新的内容", encoding="utf-8")
+        series_dir = tmp_path / "盡墳王"
+        series_dir.mkdir()
+        (series_dir / self.RAW_NAMES[0]).write_text("早就在文件夹里的内容", encoding="utf-8")
+
+        getattr(plugin, "_ANiStrmHub__regroup_local_strm_task")()
+
+        assert (series_dir / self.RAW_NAMES[0]).read_text(encoding="utf-8") == "早就在文件夹里的内容"
+        assert (tmp_path / self.RAW_NAMES[0]).read_text(encoding="utf-8") == "新的内容"
+        status = plugin.get_data("task_status")["regroup"]
+        assert "目标已存在(保留原文件)=1" in status["summary"]
+
+    def test_storage_dir_missing_is_a_noop(self, tmp_path):
+        plugin = ANiStrmHub()
+        plugin._storageplace = str(tmp_path / "does-not-exist")
+
+        getattr(plugin, "_ANiStrmHub__regroup_local_strm_task")()
+
+        status = plugin.get_data("task_status")["regroup"]
+        assert status["summary"] == "存储目录不存在"
+
+
 class TestSeasonFilter:
     ENTRIES = [
         {"title": "a", "link": "https://x.example/2026-7/a.mp4?d=mp4"},
@@ -512,7 +678,7 @@ class TestMainTask:
         getattr(plugin, "_ANiStrmHub__task")()
 
         plugin._client.fetch_one_source.assert_called_once_with("https://a.example/rss.xml")
-        written = (tmp_path / "2026-7" / "示例.strm").read_text(encoding="utf-8")
+        written = (tmp_path / "示例.strm").read_text(encoding="utf-8")
         assert written == "https://resources.ani.rip/2026-7/ep.mp4?d=mp4"
 
     def test_falls_back_to_pool_when_primary_fetch_fails(self, tmp_path):
@@ -529,7 +695,7 @@ class TestMainTask:
 
         getattr(plugin, "_ANiStrmHub__task")()
 
-        assert (tmp_path / "2026-7" / "示例.strm").exists()
+        assert (tmp_path / "示例.strm").exists()
         status = plugin.get_data("task_status")["task"]
         assert status["status"] == "done"
 
@@ -557,7 +723,7 @@ class TestMainTask:
 
         getattr(plugin, "_ANiStrmHub__task")()
 
-        written = (tmp_path / "2026-7" / "示例.strm").read_text(encoding="utf-8")
+        written = (tmp_path / "示例.strm").read_text(encoding="utf-8")
         assert written == "https://resources.ani.rip/2026-7/ep.mp4?d=mp4"
 
     def test_accelerator_applied_when_precheck_succeeds(self, tmp_path):
@@ -572,8 +738,46 @@ class TestMainTask:
 
         getattr(plugin, "_ANiStrmHub__task")()
 
-        written = (tmp_path / "2026-7" / "示例.strm").read_text(encoding="utf-8")
+        written = (tmp_path / "示例.strm").read_text(encoding="utf-8")
         assert written == "https://pro.pili.cc.cd/resources.ani.rip/2026-7/ep.mp4?d=mp4"
+
+    def test_flat_layout_writes_into_storage_root(self, tmp_path):
+        plugin = ANiStrmHub()
+        plugin._subscription_source = "https://a.example/rss.xml"
+        plugin._storageplace = str(tmp_path)
+        plugin._strm_layout = LAYOUT_FLAT
+        plugin._client.fetch_one_source = MagicMock(
+            return_value=[
+                {
+                    "title": "[ANi] 盡墳王 - 11 [1080P][Baha][WEB-DL][AAC AVC][CHT]",
+                    "link": "https://resources.ani.rip/2026-7/ep.mp4?d=mp4",
+                }
+            ]
+        )
+
+        getattr(plugin, "_ANiStrmHub__task")()
+
+        assert (tmp_path / "[ANi] 盡墳王 - 11 [1080P][Baha][WEB-DL][AAC AVC][CHT].strm").exists()
+
+    def test_by_title_layout_writes_into_series_folder(self, tmp_path):
+        plugin = ANiStrmHub()
+        plugin._subscription_source = "https://a.example/rss.xml"
+        plugin._storageplace = str(tmp_path)
+        plugin._strm_layout = LAYOUT_BY_TITLE
+        plugin._client.fetch_one_source = MagicMock(
+            return_value=[
+                {
+                    "title": "[ANi] 盡墳王 - 11 [1080P][Baha][WEB-DL][AAC AVC][CHT]",
+                    "link": "https://resources.ani.rip/2026-7/ep.mp4?d=mp4",
+                }
+            ]
+        )
+
+        getattr(plugin, "_ANiStrmHub__task")()
+
+        assert (
+            tmp_path / "盡墳王" / "[ANi] 盡墳王 - 11 [1080P][Baha][WEB-DL][AAC AVC][CHT].strm"
+        ).exists()
 
     def test_skips_subtitle_and_blacklisted_entries(self, tmp_path):
         plugin = ANiStrmHub()
@@ -881,6 +1085,28 @@ class TestBackfillTask:
         getattr(plugin, "_ANiStrmHub__backfill_task")()
 
         assert existing_10.read_text() == "https://already-have.example/ep10?d=mp4"
+
+    def test_backfilled_file_stays_in_reference_files_folder(self, tmp_path, monkeypatch):
+        # 资源补齐用ref_file.with_name()，天然跟参照文件同目录——按番剧名称
+        # 聚合时补出来的集数会落在同一个剧名文件夹里，不会掉到根目录，
+        # 所以这个任务不需要自己再解析一遍剧名(各写各的正是分裂的来源)
+        monkeypatch.setattr(time, "sleep", lambda *_: None)
+        plugin = self._make_plugin(reachable_down_to=10)
+        plugin._storageplace = str(tmp_path)
+        plugin._strm_layout = LAYOUT_BY_TITLE
+        series_dir = tmp_path / "示例"
+        series_dir.mkdir()
+        existing = series_dir / "[ANi] 示例 - 11 [1080P][Baha][WEB-DL][AAC AVC][CHT].strm"
+        existing.write_text(
+            "https://pro.pili.cc.cd/resources.ani.rip/2026-7/"
+            "%5BANi%5D%20%E7%A4%BA%E4%BE%8B%20-%2011%20%5B1080P%5D%5BBaha%5D%5BWEB-DL%5D%5BAAC%20AVC%5D%5BCHT%5D?d=mp4",
+            encoding="utf-8",
+        )
+
+        getattr(plugin, "_ANiStrmHub__backfill_task")()
+
+        assert (series_dir / "[ANi] 示例 - 10 [1080P][Baha][WEB-DL][AAC AVC][CHT].strm").exists()
+        assert list(tmp_path.glob("*.strm")) == []
 
     def test_no_recognizable_series_is_a_noop(self, tmp_path):
         plugin = ANiStrmHub()

@@ -40,6 +40,17 @@ SEASON_RE = re.compile(r"/(\d{4}-\d{1,2})/")
 # 匹配ANi标题/文件名里的集数，形如" - 11 ["，用于资源补齐时定位并替换集数数字。
 # 要求前有"-"后有"["，避免误命中季度目录(yyyy-mm)或分辨率(1080P)里的数字。
 EPISODE_NUM_RE = re.compile(r"(-\s*)(\d{1,4})(\s*\[)")
+# 从ANi标题里切出剧名，用于"按番剧名称聚合"的目录归档。ANi命名格式固定是
+# "[ANi] 剧名 - 集数 [1080P][Baha]..."，剧名就是开头的发布组标签之后、
+# " - 集数 ["之前那一段。两个要点：
+# 1. 集数不一定是整数——真实数据里有"- 12.5 ["(半集)和"- 電影 ["(剧场版)，
+#    所以不能复用只认整数的EPISODE_NUM_RE，这里用"- 任意非方括号内容 ["；
+# 2. 剧名本身可能含" - "(比如"Fate - Grand Order")，所以剧名部分用贪婪
+#    匹配，取最后一个" - xxx ["当分隔点，不会把剧名截断成前半截。
+SERIES_TITLE_RE = re.compile(r"^(?:\[[^\]]+\]\s*)?(.+)\s+-\s+[^\[\]]+\s*\[")
+# strm存放方式
+LAYOUT_FLAT = "flat"
+LAYOUT_BY_TITLE = "by_title"
 
 # 探测连通性时校验响应内容用：光看HTTP状态码不够，服务器完全可能返回200但
 # 吐的是错误页(html/json)。这几个是明显的"这不是视频数据"标记。
@@ -52,7 +63,7 @@ class ANiStrmHub(_PluginBase):
     plugin_name = "ANiStrmHub"
     plugin_desc = "填一个订阅源+一个加速地址即可，自动抓取ANi新番资源生成strm文件，mp刮削入库，媒体服务器直连播放"
     plugin_icon = "https://raw.githubusercontent.com/oiloveio/MoviePilot-Plugins/main/icons/anistrmhub.png"
-    plugin_version = "0.6.0"
+    plugin_version = "0.7.0"
     plugin_author = "oiloveio,honue"
     author_url = "https://github.com/honue"
     plugin_config_prefix = "anistrmhub_"
@@ -65,12 +76,14 @@ class ANiStrmHub(_PluginBase):
     _onlyonce = False
     _storageplace = None
     _season_filter: List[str] = ["all"]
+    _strm_layout = LAYOUT_FLAT
 
     _subscription_source = DEFAULT_SUBSCRIPTION_SOURCE
     _accelerator_prefix = ""
 
     _refresh_subscription_once = False
     _apply_accelerator_once = False
+    _regroup_once = False
     _backfill_once = False
     _detect_once = False
     _scheduler: Optional[BackgroundScheduler] = None
@@ -92,12 +105,14 @@ class ANiStrmHub(_PluginBase):
         self._onlyonce = config.get("onlyonce", False)
         self._storageplace = config.get("storageplace") or "/downloads/strm"
         self._season_filter = config.get("season_filter") or ["all"]
+        self._strm_layout = config.get("strm_layout") or LAYOUT_FLAT
 
         self._subscription_source = (config.get("subscription_source") or "").strip() or DEFAULT_SUBSCRIPTION_SOURCE
         self._accelerator_prefix = (config.get("accelerator_prefix") or "").strip()
 
         self._refresh_subscription_once = config.get("refresh_subscription_once", False)
         self._apply_accelerator_once = config.get("apply_accelerator_once", False)
+        self._regroup_once = config.get("regroup_once", False)
         self._backfill_once = config.get("backfill_once", False)
         self._detect_once = config.get("detect_once", False)
 
@@ -113,6 +128,7 @@ class ANiStrmHub(_PluginBase):
             or self._onlyonce
             or self._refresh_subscription_once
             or self._apply_accelerator_once
+            or self._regroup_once
             or self._backfill_once
             or self._detect_once
         ):
@@ -167,6 +183,19 @@ class ANiStrmHub(_PluginBase):
                     name="ANiStrmHub套用加速源",
                 )
             self._apply_accelerator_once = False
+
+        if self._regroup_once:
+            if self.__is_task_running("regroup"):
+                logger.warning("ANiStrmHub重新归档：上一次任务还在运行中，本次跳过排队，等它跑完再重新勾选")
+            else:
+                logger.info(f"ANiStrmHub服务启动，立即按当前存放方式重新归档本地strm：{self._strm_layout}")
+                self._scheduler.add_job(
+                    func=self.__regroup_local_strm_task,
+                    trigger="date",
+                    run_date=datetime.now(tz=pytz.timezone(settings.TZ)) + timedelta(seconds=3),
+                    name="ANiStrmHub重新归档",
+                )
+            self._regroup_once = False
 
         if self._backfill_once:
             if self.__is_task_running("backfill"):
@@ -227,6 +256,23 @@ class ANiStrmHub(_PluginBase):
             return None
         logger.info(f"ANiStrmHub任务：加速源{prefix}探测可达({latency_ms}ms)，新生成的strm将套用")
         return prefix
+
+    def __resolve_relative_dir(self, file_name: str) -> Optional[str]:
+        """按当前"strm存放方式"决定这个文件该放在storageplace下的哪个子目录：
+        平铺返回None(直接放根目录)，按番剧名称聚合返回剧名目录。
+
+        决定目录的逻辑只有这一处——拉新番(__task)和一键重新归档
+        (__regroup_local_strm_task)都调它；资源补齐用ref_file.with_name()
+        天然跟参照文件同目录、刷新订阅源/套用加速源都是原地改写内容不挪
+        位置，所以那三个任务不需要各自再解析一遍剧名(各写各的正是"同一部剧
+        一半在文件夹里一半在根目录"这类分裂的来源)。"""
+        if self._strm_layout != LAYOUT_BY_TITLE:
+            return None
+        series = StrmFileService.extract_series_title(file_name)
+        if not series:
+            logger.info(f"ANiStrmHub：识别不出剧名，这个文件平铺到根目录：{file_name}")
+            return None
+        return StrmFileService.safe_dir_name(series)
 
     def __finalize_strm_link(self, real_link: str) -> str:
         """资源补齐用：套用当前配置的加速源(没配置就是原始直链)。资源补齐
@@ -337,8 +383,7 @@ class ANiStrmHub(_PluginBase):
                 total_skipped += 1
                 continue
 
-            season = SEASON_RE.search(entry["link"])
-            relative_dir = season.group(1) if season else None
+            relative_dir = self.__resolve_relative_dir(title)
 
             file_url = entry["link"]
             if resolved_accelerator:
@@ -506,6 +551,68 @@ class ANiStrmHub(_PluginBase):
         summary = "，".join(f"{k}={v}" for k, v in stats.items())
         logger.info(f"ANiStrmHub套用加速源完成：{summary}")
         self.__save_task_status("apply_accelerator", "done", summary)
+
+    def __regroup_local_strm_task(self):
+        """按当前「strm存放方式」把本地已有的strm重新归档：选"按番剧名称
+        聚合"就把散在根目录(以及历史版本留下的季度目录)里的文件搬进
+        {剧名}/子目录，选"平铺"就把{剧名}/子目录里的文件搬回根目录。
+
+        只移动文件，不改文件内容，不发任何网络请求——改存放方式是纯本地
+        整理，跟链接能不能连通是两回事，没必要在这里探测。目标位置已经有
+        同名文件时保留原文件不动，不覆盖。搬完清理掉空掉的子目录。"""
+        self.__save_task_status("regroup", "running", "进行中")
+        directory = Path(self._storageplace) if self._storageplace else None
+        if not directory or not directory.exists():
+            logger.warning(f"ANiStrmHub重新归档：目录不存在 {self._storageplace}")
+            self.__save_task_status("regroup", "done", "存储目录不存在")
+            return
+
+        stats = {
+            "已归档": 0,
+            "位置已正确": 0,
+            "识别不出剧名(平铺到根目录)": 0,
+            "目标已存在(保留原文件)": 0,
+            "移动失败": 0,
+        }
+
+        # 先整体取出文件列表再搬，避免边遍历边改目录结构
+        for strm_file in sorted(directory.rglob("*.strm")):
+            relative_dir = self.__resolve_relative_dir(strm_file.stem)
+            unrecognized = self._strm_layout == LAYOUT_BY_TITLE and relative_dir is None
+            target_dir = directory / relative_dir if relative_dir else directory
+            target = target_dir / strm_file.name
+
+            if target == strm_file:
+                stats["位置已正确"] += 1
+                continue
+            if target.exists():
+                logger.warning(f"ANiStrmHub重新归档：目标位置已有同名文件，保留原文件 {strm_file.name}")
+                stats["目标已存在(保留原文件)"] += 1
+                continue
+
+            try:
+                target_dir.mkdir(parents=True, exist_ok=True)
+                strm_file.rename(target)
+                stats["识别不出剧名(平铺到根目录)" if unrecognized else "已归档"] += 1
+                logger.debug(f"ANiStrmHub重新归档：{strm_file.name} -> {target.parent.name or '根目录'}")
+            except Exception as err:
+                logger.warning(f"ANiStrmHub重新归档：移动失败 {strm_file.name} - {err}")
+                stats["移动失败"] += 1
+
+        # 自底向上清理空目录：rmdir只对空目录成功，非空的直接跳过
+        removed_dirs = 0
+        for child in sorted(directory.rglob("*"), reverse=True):
+            if not child.is_dir():
+                continue
+            try:
+                child.rmdir()
+                removed_dirs += 1
+            except OSError:
+                continue
+
+        summary = "，".join(f"{k}={v}" for k, v in stats.items()) + f"，清理空目录={removed_dirs}"
+        logger.info(f"ANiStrmHub重新归档完成：{summary}")
+        self.__save_task_status("regroup", "done", summary)
 
     def __backfill_task(self):
         """资源补齐：ani-download.xml这个RSS只是滚动窗口，只含近期资源，更早的
@@ -817,7 +924,7 @@ class ANiStrmHub(_PluginBase):
                             },
                             {
                                 "component": "VCol",
-                                "props": {"cols": 12, "md": 6},
+                                "props": {"cols": 12, "md": 3},
                                 "content": [
                                     {
                                         "component": "VTextField",
@@ -825,6 +932,25 @@ class ANiStrmHub(_PluginBase):
                                             "model": "storageplace",
                                             "label": "Strm存储地址",
                                             "placeholder": "/downloads/strm",
+                                        },
+                                    }
+                                ],
+                            },
+                            {
+                                "component": "VCol",
+                                "props": {"cols": 12, "md": 3},
+                                "content": [
+                                    {
+                                        "component": "VSelect",
+                                        "props": {
+                                            "model": "strm_layout",
+                                            "label": "strm存放方式",
+                                            "items": [
+                                                {"title": "平铺（全部放在存储目录下）", "value": LAYOUT_FLAT},
+                                                {"title": "按番剧名称聚合（每部剧一个文件夹）", "value": LAYOUT_BY_TITLE},
+                                            ],
+                                            "hint": "改了之后勾选下方「重新归档本地strm」，把已有文件搬到新位置",
+                                            "persistent-hint": True,
                                         },
                                     }
                                 ],
@@ -936,6 +1062,19 @@ class ANiStrmHub(_PluginBase):
                                                     }
                                                 ],
                                             },
+                                            {
+                                                "component": "VCol",
+                                                "props": {"cols": 12, "md": 6},
+                                                "content": [
+                                                    {
+                                                        "component": "VSwitch",
+                                                        "props": {
+                                                            "model": "regroup_once",
+                                                            "label": "按存放方式重新归档本地strm",
+                                                        },
+                                                    }
+                                                ],
+                                            },
                                         ],
                                     },
                                     {
@@ -943,8 +1082,10 @@ class ANiStrmHub(_PluginBase):
                                         "props": {"class": "text-caption mt-2"},
                                         "text": "刷新订阅源：标题还在RSS窗口内的直接换成最新直链，不在窗口内的按"
                                         "路径迁移公式换成当前订阅源的域名。套用/还原加速源：加速源填了就套上，"
-                                        "留空就还原成裸链接。两个都实测探测确认可达才覆盖写入，探测不通过的"
-                                        "保留原文件不动。运行状态见下方详情页。",
+                                        "留空就还原成裸链接。这两个都实测探测确认可达才覆盖写入，探测不通过的"
+                                        "保留原文件不动。重新归档：按上面选的「strm存放方式」把已有文件搬到"
+                                        "对应位置(纯本地移动，不改内容不发请求)，改了存放方式之后跑一次即可。"
+                                        "运行状态见下方详情页。",
                                     },
                                 ],
                             },
@@ -1045,7 +1186,9 @@ class ANiStrmHub(_PluginBase):
                                         "props": {
                                             "type": "info",
                                             "variant": "tonal",
-                                            "text": "抓取ANi的RSS（ani-download.xml），生成strm文件，按季度自动分子目录存放\n"
+                                            "text": "抓取ANi的RSS（ani-download.xml），生成strm文件\n"
+                                            "存放方式选「按番剧名称聚合」时每部剧一个文件夹，Emby/Jellyfin刮削更干净；"
+                                            "多季度的剧季度信息本来就在标题里，会自然分成不同文件夹，不需要额外套Season子目录\n"
                                             "配合目录监控使用，strm文件创建在/downloads/strm\n"
                                             "通过目录监控转移到link媒体库文件夹 如/downloads/link/strm mp会完成刮削",
                                             "style": "white-space: pre-line;",
@@ -1084,10 +1227,12 @@ class ANiStrmHub(_PluginBase):
             "onlyonce": False,
             "storageplace": "/downloads/strm",
             "season_filter": ["all"],
+            "strm_layout": LAYOUT_FLAT,
             "subscription_source": DEFAULT_SUBSCRIPTION_SOURCE,
             "accelerator_prefix": "",
             "refresh_subscription_once": False,
             "apply_accelerator_once": False,
+            "regroup_once": False,
             "backfill_once": False,
             "detect_once": False,
             "cron": "20 22,23,0,1 * * *",
@@ -1102,10 +1247,12 @@ class ANiStrmHub(_PluginBase):
                 "onlyonce": self._onlyonce,
                 "storageplace": self._storageplace,
                 "season_filter": self._season_filter,
+                "strm_layout": self._strm_layout,
                 "subscription_source": self._subscription_source,
                 "accelerator_prefix": self._accelerator_prefix,
                 "refresh_subscription_once": self._refresh_subscription_once,
                 "apply_accelerator_once": self._apply_accelerator_once,
+                "regroup_once": self._regroup_once,
                 "backfill_once": self._backfill_once,
                 "detect_once": self._detect_once,
             }
@@ -1115,6 +1262,7 @@ class ANiStrmHub(_PluginBase):
         "task": "拉取新番生成strm",
         "refresh_subscription": "刷新订阅源",
         "apply_accelerator": "套用/还原加速源",
+        "regroup": "按存放方式重新归档",
         "backfill": "资源补齐(回溯集数)",
         "detect": "连通性探测",
     }
@@ -1427,6 +1575,26 @@ class StrmFileService:
             return False
         keywords = [kw.strip() for kw in blacklist_config.split("@") if kw.strip()]
         return any(kw in title for kw in keywords)
+
+    @staticmethod
+    def extract_series_title(file_name: str) -> Optional[str]:
+        """从ANi的完整标题/文件名里切出剧名，"按番剧名称聚合"存放和"一键
+        重新归档"共用这一个函数——解析规则只有这一份，以后规则要改只改
+        这里，不会出现同一部剧一半在文件夹里一半在根目录的分裂。
+
+        识别不出来返回None，调用方应当把这种文件平铺到根目录而不是瞎猜
+        一个目录名。"""
+        match = SERIES_TITLE_RE.search(file_name)
+        if not match:
+            return None
+        return match.group(1).strip() or None
+
+    @staticmethod
+    def safe_dir_name(name: str) -> str:
+        """剧名转目录名。真实数据(2650个文件)核对过：ANi的剧名里没有文件
+        系统非法字符，也没有超长的，所以只挡住路径分隔符防止意外建出多层
+        目录，不做过度清洗。"""
+        return name.replace("/", "_").replace("\\", "_").strip()
 
     def touch_strm_file(
         self,
