@@ -846,21 +846,32 @@ class ANiStrmHub(_PluginBase):
         return []
 
     @staticmethod
-    def __section_title(text: str) -> dict:
+    def __row(cells: List[Tuple[int, dict]]) -> dict:
+        """一行表单控件：cells是(占几列, 控件)的列表，md以上按给定列宽并排，
+        窄屏自动堆叠成一列。配置页的每一行都走这个函数，保证列宽/间距一致，
+        不会出现一个开关独占一整行、右边大片空白这种排版。"""
         return {
             "component": "VRow",
             "content": [
+                {"component": "VCol", "props": {"cols": 12, "md": width}, "content": [component]}
+                for width, component in cells
+            ],
+        }
+
+    @staticmethod
+    def __config_card(title: str, rows: List[dict]) -> dict:
+        """配置分区卡片：统一用描边卡而不是填色卡，避免几种背景色堆在一起
+        显得吵；需要提示"这是会动文件的操作"时才另外用带色卡。"""
+        return {
+            "component": "VCard",
+            "props": {"variant": "outlined", "class": "mb-4"},
+            "content": [
                 {
-                    "component": "VCol",
-                    "props": {"cols": 12},
-                    "content": [
-                        {
-                            "component": "div",
-                            "props": {"class": "text-subtitle-1 font-weight-bold mt-3 mb-1"},
-                            "text": text,
-                        }
-                    ],
-                }
+                    "component": "VCardTitle",
+                    "props": {"class": "text-subtitle-1 font-weight-bold"},
+                    "text": title,
+                },
+                {"component": "VCardText", "content": rows},
             ],
         }
 
@@ -869,355 +880,199 @@ class ANiStrmHub(_PluginBase):
             {
                 "component": "VForm",
                 "content": [
-                    self.__section_title("核心设置——拉取新番生成strm"),
-                    {
-                        "component": "VRow",
-                        "content": [
-                            {
-                                "component": "VCol",
-                                "props": {"cols": 12, "md": 4},
-                                "content": [
-                                    {
-                                        "component": "VSwitch",
-                                        "props": {"model": "enabled", "label": "启用插件（按执行周期定时拉取）"},
-                                    }
-                                ],
-                            },
-                            {
-                                "component": "VCol",
-                                "props": {"cols": 12, "md": 4},
-                                "content": [
-                                    {
-                                        "component": "VSwitch",
-                                        "props": {"model": "onlyonce", "label": "立即运行一次"},
-                                    }
-                                ],
-                            },
-                            {
-                                "component": "VCol",
-                                "props": {"cols": 12, "md": 4},
-                                "content": [
-                                    {
-                                        "component": "VSwitch",
-                                        "props": {"model": "use_proxy", "label": "使用代理"},
-                                    }
-                                ],
-                            },
+                    self.__config_card(
+                        "基本设置",
+                        [
+                            self.__row(
+                                [
+                                    (4, {"component": "VSwitch", "props": {"model": "enabled", "label": "启用插件"}}),
+                                    (4, {"component": "VSwitch", "props": {"model": "onlyonce", "label": "立即运行一次"}}),
+                                    (4, {"component": "VSwitch", "props": {"model": "use_proxy", "label": "使用代理"}}),
+                                ]
+                            ),
+                            self.__row(
+                                [
+                                    (
+                                        4,
+                                        {
+                                            "component": "VTextField",
+                                            "props": {
+                                                "model": "cron",
+                                                "label": "执行周期",
+                                                "placeholder": "20 22,23,0,1 * * *",
+                                            },
+                                        },
+                                    ),
+                                    (
+                                        4,
+                                        {
+                                            "component": "VTextField",
+                                            "props": {
+                                                "model": "storageplace",
+                                                "label": "Strm存储地址",
+                                                "placeholder": "/downloads/strm",
+                                            },
+                                        },
+                                    ),
+                                    (
+                                        4,
+                                        {
+                                            "component": "VSelect",
+                                            "props": {
+                                                "model": "strm_layout",
+                                                "label": "strm存放方式",
+                                                "items": [
+                                                    {"title": "平铺", "value": LAYOUT_FLAT},
+                                                    {"title": "按番剧名称聚合", "value": LAYOUT_BY_TITLE},
+                                                ],
+                                                "hint": "改后运行下方「重新归档」",
+                                                "persistent-hint": True,
+                                            },
+                                        },
+                                    ),
+                                ]
+                            ),
                         ],
-                    },
-                    {
-                        "component": "VRow",
-                        "content": [
-                            {
-                                "component": "VCol",
-                                "props": {"cols": 12, "md": 6},
-                                "content": [
-                                    {
-                                        "component": "VTextField",
-                                        "props": {
-                                            "model": "cron",
-                                            "label": "执行周期",
-                                            "placeholder": "20 22,23,0,1 * * *",
+                    ),
+                    self.__config_card(
+                        "订阅与加速",
+                        [
+                            self.__row(
+                                [
+                                    (
+                                        8,
+                                        {
+                                            "component": "VTextField",
+                                            "props": {
+                                                "model": "subscription_source",
+                                                "label": "订阅源",
+                                                "placeholder": DEFAULT_SUBSCRIPTION_SOURCE,
+                                                "hint": "抓取失败时自动尝试内置备用镜像",
+                                                "persistent-hint": True,
+                                            },
                                         },
-                                    }
-                                ],
-                            },
-                            {
-                                "component": "VCol",
-                                "props": {"cols": 12, "md": 3},
-                                "content": [
-                                    {
-                                        "component": "VTextField",
-                                        "props": {
-                                            "model": "storageplace",
-                                            "label": "Strm存储地址",
-                                            "placeholder": "/downloads/strm",
+                                    ),
+                                    (
+                                        4,
+                                        {
+                                            "component": "VSelect",
+                                            "props": {
+                                                "model": "season_filter",
+                                                "label": "拉取季度筛选",
+                                                "items": self.__build_season_options(),
+                                                "multiple": True,
+                                                "chips": True,
+                                                "clearable": True,
+                                            },
                                         },
-                                    }
-                                ],
-                            },
-                            {
-                                "component": "VCol",
-                                "props": {"cols": 12, "md": 3},
-                                "content": [
-                                    {
-                                        "component": "VSelect",
-                                        "props": {
-                                            "model": "strm_layout",
-                                            "label": "strm存放方式",
-                                            "items": [
-                                                {"title": "平铺（全部放在存储目录下）", "value": LAYOUT_FLAT},
-                                                {"title": "按番剧名称聚合（每部剧一个文件夹）", "value": LAYOUT_BY_TITLE},
-                                            ],
-                                            "hint": "改了之后勾选下方「重新归档本地strm」，把已有文件搬到新位置",
-                                            "persistent-hint": True,
+                                    ),
+                                ]
+                            ),
+                            self.__row(
+                                [
+                                    (
+                                        8,
+                                        {
+                                            "component": "VTextField",
+                                            "props": {
+                                                "model": "accelerator_prefix",
+                                                "label": "加速源",
+                                                "placeholder": "https://pro.pili.cc.cd",
+                                                "hint": "留空=不加速；每次拉取前自动验证可用性",
+                                                "persistent-hint": True,
+                                            },
                                         },
-                                    }
-                                ],
-                            },
+                                    ),
+                                ]
+                            ),
                         ],
-                    },
-                    {
-                        "component": "VRow",
-                        "content": [
-                            {
-                                "component": "VCol",
-                                "props": {"cols": 12, "md": 7},
-                                "content": [
-                                    {
-                                        "component": "VTextField",
-                                        "props": {
-                                            "model": "subscription_source",
-                                            "label": "订阅源（ANi的RSS地址）",
-                                            "placeholder": DEFAULT_SUBSCRIPTION_SOURCE,
-                                            "hint": "只填一个你信得过的地址就行。这个地址抓取失败时，会自动依次"
-                                            "尝试内置的几个备用镜像，不用你手动切换",
-                                            "persistent-hint": True,
-                                        },
-                                    }
-                                ],
-                            },
-                            {
-                                "component": "VCol",
-                                "props": {"cols": 12, "md": 5},
-                                "content": [
-                                    {
-                                        "component": "VSelect",
-                                        "props": {
-                                            "model": "season_filter",
-                                            "label": "拉取季度筛选",
-                                            "items": self.__build_season_options(),
-                                            "multiple": True,
-                                            "chips": True,
-                                            "clearable": True,
-                                            "hint": "只在订阅源当前RSS窗口内筛选，默认「不筛选」处理全部",
-                                            "persistent-hint": True,
-                                        },
-                                    }
-                                ],
-                            },
-                        ],
-                    },
-                    {
-                        "component": "VRow",
-                        "content": [
-                            {
-                                "component": "VCol",
-                                "props": {"cols": 12, "md": 7},
-                                "content": [
-                                    {
-                                        "component": "VTextField",
-                                        "props": {
-                                            "model": "accelerator_prefix",
-                                            "label": "加速源（国内直连不通时配代理/反代地址，留空=不加速）",
-                                            "placeholder": "https://pro.pili.cc.cd",
-                                            "hint": "把strm链接整体包一层这个地址。每次拉新番前会自动测一次"
-                                            "这个地址能不能用，测不通当次就不加速、写裸直链，不会生成"
-                                            "连不上的坏链接",
-                                            "persistent-hint": True,
-                                        },
-                                    }
-                                ],
-                            },
-                        ],
-                    },
+                    ),
                     {
                         "component": "VCard",
-                        "props": {"variant": "tonal", "color": "info", "class": "mt-4"},
+                        "props": {"variant": "tonal", "color": "warning", "class": "mb-4"},
                         "content": [
                             {
                                 "component": "VCardTitle",
-                                "props": {"class": "text-subtitle-1"},
-                                "text": "本地strm维护——批量调整已生成的strm，可能耗时几分钟",
+                                "props": {"class": "text-subtitle-1 font-weight-bold"},
+                                "text": "维护操作",
                             },
                             {
                                 "component": "VCardText",
                                 "content": [
-                                    {
-                                        "component": "VRow",
-                                        "content": [
-                                            {
-                                                "component": "VCol",
-                                                "props": {"cols": 12, "md": 6},
-                                                "content": [
-                                                    {
-                                                        "component": "VSwitch",
-                                                        "props": {
-                                                            "model": "refresh_subscription_once",
-                                                            "label": "用当前订阅源刷新本地strm",
-                                                        },
-                                                    }
-                                                ],
-                                            },
-                                            {
-                                                "component": "VCol",
-                                                "props": {"cols": 12, "md": 6},
-                                                "content": [
-                                                    {
-                                                        "component": "VSwitch",
-                                                        "props": {
-                                                            "model": "apply_accelerator_once",
-                                                            "label": "套用/还原当前加速源",
-                                                        },
-                                                    }
-                                                ],
-                                            },
-                                            {
-                                                "component": "VCol",
-                                                "props": {"cols": 12, "md": 6},
-                                                "content": [
-                                                    {
-                                                        "component": "VSwitch",
-                                                        "props": {
-                                                            "model": "regroup_once",
-                                                            "label": "按存放方式重新归档本地strm",
-                                                        },
-                                                    }
-                                                ],
-                                            },
-                                        ],
-                                    },
+                                    self.__row(
+                                        [
+                                            (
+                                                4,
+                                                {
+                                                    "component": "VSwitch",
+                                                    "props": {
+                                                        "model": "refresh_subscription_once",
+                                                        "label": "刷新订阅源",
+                                                    },
+                                                },
+                                            ),
+                                            (
+                                                4,
+                                                {
+                                                    "component": "VSwitch",
+                                                    "props": {
+                                                        "model": "apply_accelerator_once",
+                                                        "label": "套用/还原加速源",
+                                                    },
+                                                },
+                                            ),
+                                            (
+                                                4,
+                                                {
+                                                    "component": "VSwitch",
+                                                    "props": {"model": "regroup_once", "label": "重新归档"},
+                                                },
+                                            ),
+                                        ]
+                                    ),
+                                    self.__row(
+                                        [
+                                            (
+                                                4,
+                                                {
+                                                    "component": "VSwitch",
+                                                    "props": {"model": "backfill_once", "label": "补齐老集数"},
+                                                },
+                                            ),
+                                            (
+                                                4,
+                                                {
+                                                    "component": "VSwitch",
+                                                    "props": {"model": "detect_once", "label": "探测连通性"},
+                                                },
+                                            ),
+                                        ]
+                                    ),
                                     {
                                         "component": "div",
-                                        "props": {"class": "text-caption mt-2"},
-                                        "text": "刷新订阅源：标题还在RSS窗口内的直接换成最新直链，不在窗口内的按"
-                                        "路径迁移公式换成当前订阅源的域名。套用/还原加速源：加速源填了就套上，"
-                                        "留空就还原成裸链接。这两个都实测探测确认可达才覆盖写入，探测不通过的"
-                                        "保留原文件不动。重新归档：按上面选的「strm存放方式」把已有文件搬到"
-                                        "对应位置(纯本地移动，不改内容不发请求)，改了存放方式之后跑一次即可。"
-                                        "运行状态见下方详情页。",
+                                        "props": {"class": "text-caption", "style": "white-space: pre-line;"},
+                                        "text": "手动触发，可能耗时几分钟，运行状态见详情页\n"
+                                        "刷新订阅源 / 套用还原加速源：改写 strm 链接，实测可达才覆盖\n"
+                                        "重新归档：按「strm存放方式」移动文件，不改内容\n"
+                                        "补齐老集数：回溯 RSS 窗口之外的早期集数，串行限流探测",
                                     },
                                 ],
                             },
                         ],
                     },
                     {
-                        "component": "VCard",
-                        "props": {"variant": "tonal", "color": "purple", "class": "mt-4"},
-                        "content": [
-                            {
-                                "component": "VCardTitle",
-                                "props": {"class": "text-subtitle-1"},
-                                "text": "资源补齐——把RSS滚动窗口之外的老集数找回来",
-                            },
-                            {
-                                "component": "VCardText",
-                                "content": [
-                                    {
-                                        "component": "VRow",
-                                        "content": [
-                                            {
-                                                "component": "VCol",
-                                                "props": {"cols": 12, "md": 4},
-                                                "content": [
-                                                    {
-                                                        "component": "VSwitch",
-                                                        "props": {
-                                                            "model": "backfill_once",
-                                                            "label": "立即回溯补齐老集数",
-                                                        },
-                                                    }
-                                                ],
-                                            },
-                                        ],
-                                    },
-                                    {
-                                        "component": "div",
-                                        "props": {"class": "text-caption mt-2"},
-                                        "text": "对本地已有的剧，从最早一集往前递减集数构造候选直链；同一部剧更早的"
-                                        "集数不一定在同一个季度文件夹（实测确认过有的剧真实起点在更早的月份），"
-                                        "碰到当前文件夹探测不通会按月份距离尝试其它已知文件夹，不会一碰壁就弃剧。"
-                                        "严格串行探测+限流，确认可达才写入，手动触发，不进定时任务。",
-                                    },
-                                ],
-                            },
-                        ],
-                    },
-                    {
-                        "component": "VCard",
-                        "props": {"variant": "tonal", "color": "success", "class": "mt-4"},
-                        "content": [
-                            {
-                                "component": "VCardTitle",
-                                "props": {"class": "text-subtitle-1"},
-                                "text": "连通性探测",
-                            },
-                            {
-                                "component": "VCardText",
-                                "content": [
-                                    {
-                                        "component": "VRow",
-                                        "content": [
-                                            {
-                                                "component": "VCol",
-                                                "props": {"cols": 12, "md": 4},
-                                                "content": [
-                                                    {
-                                                        "component": "VSwitch",
-                                                        "props": {
-                                                            "model": "detect_once",
-                                                            "label": "立即探测连通性",
-                                                        },
-                                                    }
-                                                ],
-                                            },
-                                        ],
-                                    },
-                                    {
-                                        "component": "div",
-                                        "props": {"class": "text-caption mt-2"},
-                                        "text": "测你配置的订阅源直连情况、套上加速源之后的连通情况，顺带列出内置"
-                                        "容灾候选池当前谁能连（仅供参考，不需要你选）。结果在下方详情页展示。",
-                                    },
-                                ],
-                            },
-                        ],
-                    },
-                    self.__section_title("使用说明"),
-                    {
-                        "component": "VRow",
-                        "content": [
-                            {
-                                "component": "VCol",
-                                "props": {"cols": 12},
-                                "content": [
-                                    {
-                                        "component": "VAlert",
-                                        "props": {
-                                            "type": "info",
-                                            "variant": "tonal",
-                                            "text": "抓取ANi的RSS（ani-download.xml），生成strm文件\n"
-                                            "存放方式选「按番剧名称聚合」时每部剧一个文件夹，Emby/Jellyfin刮削更干净；"
-                                            "多季度的剧季度信息本来就在标题里，会自然分成不同文件夹，不需要额外套Season子目录\n"
-                                            "配合目录监控使用，strm文件创建在/downloads/strm\n"
-                                            "通过目录监控转移到link媒体库文件夹 如/downloads/link/strm mp会完成刮削",
-                                            "style": "white-space: pre-line;",
-                                        },
-                                    },
-                                    {
-                                        "component": "VAlert",
-                                        "props": {
-                                            "type": "info",
-                                            "variant": "tonal",
-                                            "text": "国内直连不稳定时，除了填社区加速源(如pili/op5)，也可以自己用GOST/"
-                                            "Nginx等工具搭一个反向代理，把反代地址当成加速源填进去——不需要插件"
-                                            "额外支持，用法跟社区加速源完全一样。",
-                                            "style": "white-space: pre-line;",
-                                        },
-                                    },
-                                    {
-                                        "component": "VAlert",
-                                        "props": {
-                                            "type": "info",
-                                            "variant": "tonal",
-                                            "text": "emby容器需要设置代理，docker的环境变量必须要有http_proxy代理变量，大小写敏感，否则无法提取媒体信息，具体见readme.\n"
-                                            "https://github.com/oiloveio/MoviePilot-Plugins",
-                                            "style": "white-space: pre-line;",
-                                        },
-                                    },
-                                ],
-                            }
-                        ],
+                        "component": "VAlert",
+                        "props": {
+                            "type": "info",
+                            "variant": "tonal",
+                            "density": "compact",
+                            "style": "white-space: pre-line;",
+                            "text": "生成的 strm 建议配合「目录监控」转移到媒体库目录，由 MoviePilot 刮削\n"
+                            "存放方式选「按番剧名称聚合」时每部剧一个文件夹，Emby/Jellyfin 刮削更干净\n"
+                            "Emby 容器需额外设置小写 http_proxy 环境变量，否则无法提取媒体信息\n"
+                            "社区加速源不稳定时，可用 GOST/Nginx 自建反代填入加速源\n"
+                            "详细说明：https://github.com/oiloveio/MoviePilot-Plugins",
+                        },
                     },
                 ],
             }
