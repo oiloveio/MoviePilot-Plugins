@@ -15,10 +15,10 @@ from app.sdk.config import settings
 from app.sdk.logging import logger
 from app.sdk.network import RequestUtils
 
-# 唯一默认订阅源。0.6.0起订阅源不再是用户要管理的"列表"，用户只填一个自己
-# 认可的地址；下面这个内置候选池是抓取失败时后台自动依次尝试的容灾兜底，
-# 不作为UI概念暴露——4.0.0"多源同时聚合谁先抓到用谁"和5.0.0"列表+选择器"
-# 都是把这件事暴露成用户要理解的概念，这正是复杂度跟需求不匹配的地方。
+# 唯一默认订阅源。0.6.0起订阅源只有一个配置值，下面这个内置候选池是抓取
+# 失败时后台自动依次尝试的容灾兜底，不作为UI概念暴露——0.4.0的"多源同时
+# 聚合谁先抓到用谁"和0.5.0的"列表+选择器"都把容灾暴露成了需要理解的概念，
+# 复杂度与实际需求不匹配。
 DEFAULT_SUBSCRIPTION_SOURCE = "https://api.pili.cc.cd/ani-download.xml"
 # ANi官方直链域名，用于"还原成裸链接"时重建地址——不管当前strm内容被套了
 # 几层壳，extract_resource_path()都能从URL末尾定位出跟域名无关的"季度/
@@ -31,8 +31,8 @@ FALLBACK_SUBSCRIPTION_POOL: Tuple[str, ...] = (
     "https://api.ani.rip/ani-download.xml",
 )
 
-# 非正片附属文件的标题关键词，硬编码常量不再让用户自己配置——预告/OP/ED这类
-# 标记在几乎所有ANi/fansub命名习惯里含义固定，没必要为此暴露一个配置项
+# 非正片附属文件的标题关键词，固定常量不再作为配置项——预告/OP/ED这类标记
+# 在几乎所有ANi/fansub命名习惯里含义固定，没必要为此暴露一个配置项
 NON_EPISODE_BLACKLIST = "预告@PV@NCOP@NCED"
 SUBTITLE_EXTENSIONS = (".srt", ".vtt", ".ass", ".ssa")
 # 从直链里提取季度目录，如 .../2026-7/xxx.mp4 -> 2026-7
@@ -231,8 +231,8 @@ class ANiStrmHub(_PluginBase):
 
     def __subscription_candidates(self, primary: str) -> List[str]:
         """主订阅源优先，抓取失败时按顺序自动试内置容灾候选池——这一步完全
-        在后台完成，用户不需要理解"多源列表"这个概念，也不会像4.0.0那样把
-        多个源的内容混在一起用（那是bug的根因），每次运行始终只用其中一个"""
+        在后台完成，不需要理解"多源列表"这个概念，也不会像0.4.0那样把多个源
+        的内容混在一起用(那是坏链接的根因)，每次运行始终只用其中一个"""
         ordered = [primary] + [c for c in FALLBACK_SUBSCRIPTION_POOL if c != primary]
         return list(dict.fromkeys(ordered))
 
@@ -499,8 +499,8 @@ class ANiStrmHub(_PluginBase):
 
         不管strm当前内容有没有被套壳、被谁套壳，都先用extract_resource_path
         定位出跟域名无关的"季度/文件名?query"这一段，配上官方域名重建裸直链，
-        再按需要套用当前加速源——这样即使用户把加速源字段从A改成B、或者
-        直接清空，都能正确处理，不需要"记住"当初到底是哪个加速源套的壳。"""
+        再按需要套用当前加速源——这样加速源字段从A改成B、或者直接清空，都能
+        正确处理，不需要"记住"当初到底是哪个加速源套的壳。"""
         self.__save_task_status("apply_accelerator", "running", "进行中")
         directory = Path(self._storageplace)
         if not directory.exists():
@@ -616,8 +616,8 @@ class ANiStrmHub(_PluginBase):
 
     def __backfill_task(self):
         """资源补齐：ani-download.xml这个RSS只是滚动窗口，只含近期资源，更早的
-        集数不在里面，但ANi同一部剧全部集数的直链只有集数数字不同——这是用户
-        实测确认的：把"- 11"手动改成"- 10"依然能播放。
+        集数不在里面，但ANi同一部剧全部集数的直链只有集数数字不同——实测确认
+        把"- 11"改成"- 10"依然能播放。
 
         季度目录不总是跟本地已有的最早一集相同：实测确认过一拳超人第三季
         真实起点第25集、SPY×FAMILY第三季真实起点第38集都落在比本地当前
@@ -628,8 +628,8 @@ class ANiStrmHub(_PluginBase):
 
         对本地已有的每部剧，从当前最早一集往前递减集数构造候选，严格串行
         探测(不并发)、探测间隔sleep、单次任务设总探测数上限、每集尝试的
-        季度候选数上限——这几条都是用户明确要求的限流设计，避免被目标站点
-        风控封IP。确认可达才写入，不是无脑改写。"""
+        季度候选数上限——这几条限流设计是为了避免被目标站点风控封IP。确认
+        可达才写入，不做无验证的批量改写。"""
         self.__save_task_status("backfill", "running", "进行中")
         directory = Path(self._storageplace)
         if not directory.exists():
@@ -756,7 +756,7 @@ class ANiStrmHub(_PluginBase):
 
     def __detect_task(self):
         """探测当前配置的订阅源(以及内置容灾候选池，仅作只读诊断展示，不是
-        要用户管理的配置项)分别的直连情况，以及套上当前配置加速源之后的
+        需要维护的配置项)分别的直连情况，以及套上当前配置加速源之后的
         连通情况，顺带统计本地strm按"订阅源+加速源"分类的分布。"""
         self.__save_task_status("detect", "running", "进行中")
         primary = (self._subscription_source or "").strip() or DEFAULT_SUBSCRIPTION_SOURCE
@@ -1474,8 +1474,8 @@ class ANiStrmHub(_PluginBase):
                 self._scheduler.remove_all_jobs()
                 if self._scheduler.running:
                     # 注意：shutdown()默认wait=True，会阻塞等正在跑的job(比如探测/维护
-                    # 这类耗时几分钟的一次性任务)跑完才返回。用户保存配置会先走到这里，
-                    # 如果上一次任务还没跑完，保存动作会被卡住——这是实测踩过的真bug，
+                    # 这类耗时几分钟的一次性任务)跑完才返回。保存配置会先走到这里，
+                    # 如果上一次任务还没跑完，保存动作会被卡住——实测踩过的真bug，
                     # 必须wait=False：不等，让旧job在自己的线程里跑完，保存立即返回。
                     self._scheduler.shutdown(wait=False)
                 self._scheduler = None
