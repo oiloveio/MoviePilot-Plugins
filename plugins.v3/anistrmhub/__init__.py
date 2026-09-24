@@ -15,18 +15,19 @@ from app.sdk.config import settings
 from app.sdk.logging import logger
 from app.sdk.network import RequestUtils
 
-# 内置订阅源，以可选项的形式展示给用户，用哪个由用户自己选，插件不在后台
-# 自动切换。订阅源分两类：社区镜像下发的视频直链已经自带镜像方的加速；
-# ANi 官方下发的是未加速的官方直链，需要自己配置加速源。默认给新用户
-# 已加速的镜像，开箱即用。
+# 内置订阅源：只作为首次安装时「订阅源列表」的初始内容，列表完全由用户维护，
+# 可增删改——内置地址日后失效时用户直接删掉或替换，不依赖插件更新。用哪个
+# 由用户选，插件不在后台自动切换。订阅源分两类：社区镜像下发的视频直链已经
+# 自带镜像方的加速；ANi 官方下发的是未加速的官方直链，需要自己配置加速源。
+# 默认给新用户已加速的镜像，开箱即用。
 BUILTIN_SUBSCRIPTIONS: Tuple[Tuple[str, str], ...] = (
     ("https://api.pili.cc.cd/ani-download.xml", "pili 镜像（已加速）"),
     ("https://aniapi.op5.de5.net/ani-download.xml", "op5 镜像（已加速）"),
     ("https://api.ani.rip/ani-download.xml", "ANi 官方（未加速）"),
 )
 DEFAULT_SUBSCRIPTION_SOURCE = BUILTIN_SUBSCRIPTIONS[0][0]
-# 内置加速源，同样只作为可选项展示。这两个就是上面两个镜像自带加速所用的
-# 反代节点，也可以单独套在官方订阅源的直链上使用。
+# 内置加速源：同样只作为「加速源列表」的初始内容。这两个就是上面两个镜像
+# 自带加速所用的反代节点，也可以单独套在官方订阅源的直链上使用。
 BUILTIN_ACCELERATORS: Tuple[Tuple[str, str], ...] = (
     ("https://pro.pili.cc.cd", "pili 节点"),
     ("https://pro.op5.de5.net", "op5 节点"),
@@ -82,7 +83,7 @@ class ANiStrmHub(_PluginBase):
     plugin_name = "ANiStrmHub"
     plugin_desc = "开箱即用的ANi新番strm生成：内置已加速订阅源，也可选官方源自配加速；mp刮削入库，媒体服务器直连播放"
     plugin_icon = "https://raw.githubusercontent.com/oiloveio/MoviePilot-Plugins/main/icons/anistrmhub.png"
-    plugin_version = "0.9.0"
+    plugin_version = "0.10.0"
     plugin_author = "oiloveio"
     author_url = "https://github.com/oiloveio"
     plugin_config_prefix = "anistrmhub_"
@@ -99,6 +100,8 @@ class ANiStrmHub(_PluginBase):
 
     _subscription_source = DEFAULT_SUBSCRIPTION_SOURCE
     _accelerator_prefix = ""
+    _subscription_list = "\n".join(url for url, _ in BUILTIN_SUBSCRIPTIONS)
+    _accelerator_list = "\n".join(prefix for prefix, _ in BUILTIN_ACCELERATORS)
 
     _refresh_subscription_once = False
     _regroup_once = False
@@ -125,8 +128,20 @@ class ANiStrmHub(_PluginBase):
         self._season_filter = config.get("season_filter") or ["all"]
         self._strm_layout = config.get("strm_layout") or LAYOUT_FLAT
 
-        self._subscription_source = (config.get("subscription_source") or "").strip() or DEFAULT_SUBSCRIPTION_SOURCE
-        self._accelerator_prefix = (config.get("accelerator_prefix") or "").strip()
+        # 首次安装(键不存在)用默认订阅源；用户留空保存时按列表第一条，见__active_subscription
+        subscription_source = config.get("subscription_source")
+        self._subscription_source = DEFAULT_SUBSCRIPTION_SOURCE if subscription_source is None else subscription_source.strip()
+        self._accelerator_prefix = (config.get("accelerator_prefix") or "").strip().rstrip("/")
+        # 列表键不存在(首次安装)才填入内置地址；用户清空列表后保存的是空字符串，
+        # 尊重用户的选择，不再自动补回
+        subscription_list = config.get("subscription_list")
+        self._subscription_list = (
+            "\n".join(url for url, _ in BUILTIN_SUBSCRIPTIONS) if subscription_list is None else subscription_list
+        )
+        accelerator_list = config.get("accelerator_list")
+        self._accelerator_list = (
+            "\n".join(prefix for prefix, _ in BUILTIN_ACCELERATORS) if accelerator_list is None else accelerator_list
+        )
 
         self._refresh_subscription_once = config.get("refresh_subscription_once", False)
         self._regroup_once = config.get("regroup_once", False)
@@ -222,6 +237,47 @@ class ANiStrmHub(_PluginBase):
                 logger.error(f"ANiStrmHub{task_name}：任务异常终止 - {err}")
                 self.__save_task_status(task_key, "done", f"任务异常终止：{err}")
 
+    @staticmethod
+    def parse_url_lines(text: Optional[str], strip_slash: bool = False) -> List[str]:
+        """解析用户维护的地址列表：一行一个，# 开头为注释，忽略空行和非http(s)
+        开头的行，去重并保持用户填写的顺序。加速源是拼接前缀，strip_slash=True
+        去掉末尾的/，避免拼出双斜杠。"""
+        urls: List[str] = []
+        for line in (text or "").splitlines():
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            if not line.lower().startswith(("http://", "https://")):
+                logger.warning(f"ANiStrmHub：地址列表中忽略无效行（需以http://或https://开头）：{line}")
+                continue
+            urls.append(line.rstrip("/") if strip_slash else line)
+        return list(dict.fromkeys(urls))
+
+    def __subscription_options(self) -> List[str]:
+        """订阅源下拉选项 = 用户维护的列表；当前选中的即使不在列表里也保留"""
+        options = self.parse_url_lines(self._subscription_list)
+        current = (self._subscription_source or "").strip()
+        return list(dict.fromkeys(([current] if current else []) + options))
+
+    def __accelerator_options(self) -> List[str]:
+        options = self.parse_url_lines(self._accelerator_list, strip_slash=True)
+        current = (self._accelerator_prefix or "").strip()
+        return list(dict.fromkeys(([current] if current else []) + options))
+
+    @staticmethod
+    def __display_name(url: str, builtin: Tuple[Tuple[str, str], ...]) -> str:
+        """内置地址显示内置名称，自定义地址显示域名"""
+        return dict(builtin).get(url) or (urlparse(url).netloc or url)
+
+    def __active_subscription(self) -> str:
+        """当前生效的订阅源：用户选定的那个；没选时取订阅源列表第一条；
+        列表也为空返回空字符串，由调用方报"未配置订阅源"，不回退到代码里的内置地址。"""
+        current = (self._subscription_source or "").strip()
+        if current:
+            return current
+        listed = self.parse_url_lines(self._subscription_list)
+        return listed[0] if listed else ""
+
     def __check_accelerator_for_this_run(self, sample_link: str) -> Optional[str]:
         """加速源现在只有一个配置值。用这一轮实际抓到的样本直链实测一次
         "这个加速源套上这条直链"能不能连通——只测一次，不是每条目都测，
@@ -269,9 +325,9 @@ class ANiStrmHub(_PluginBase):
         """拉当前配置订阅源的样本条目，从里面提取当前RSS窗口内出现过的季度，
         供配置页「拉取季度筛选」下拉用。"""
         seasons = set()
-        subscription = (self._subscription_source or "").strip() or DEFAULT_SUBSCRIPTION_SOURCE
+        subscription = self.__active_subscription()
         try:
-            entries = self._client.fetch_one_source(subscription)
+            entries = self._client.fetch_one_source(subscription) if subscription else []
         except Exception:
             entries = []
         for entry in entries:
@@ -315,7 +371,11 @@ class ANiStrmHub(_PluginBase):
 
     def __task(self):
         self.__save_task_status("task", "running", "进行中")
-        used_source = (self._subscription_source or "").strip() or DEFAULT_SUBSCRIPTION_SOURCE
+        used_source = self.__active_subscription()
+        if not used_source:
+            logger.warning("ANiStrmHub订阅同步：未配置订阅源，本次任务结束")
+            self.__save_task_status("task", "done", "未配置订阅源")
+            return
         try:
             entries = self._client.fetch_one_source(used_source)
         except Exception as err:
@@ -490,7 +550,11 @@ class ANiStrmHub(_PluginBase):
             self.__save_task_status("refresh_subscription", "done", "存储目录不存在")
             return
 
-        subscription = (self._subscription_source or "").strip() or DEFAULT_SUBSCRIPTION_SOURCE
+        subscription = self.__active_subscription()
+        if not subscription:
+            logger.warning("ANiStrmHub重建直链：未配置订阅源，任务结束")
+            self.__save_task_status("refresh_subscription", "done", "未配置订阅源")
+            return
         try:
             entries = self._client.fetch_one_source(subscription)
         except Exception as err:
@@ -732,24 +796,23 @@ class ANiStrmHub(_PluginBase):
         2. 播放线路：取一条真实视频直链，分别测官方直链、各内置加速节点和用户
            自定义的加速源，每条线路测首包耗时和持续下载速度——这才决定媒体
            服务器起播快慢、播放卡不卡。
-        内置订阅源和加速节点只作为参照一起测，结果标注"当前使用"和"最快"，
-        换不换由用户在配置里决定，插件不自动切换。
+        用户维护的订阅源列表、加速源列表里的每个地址都会一起测，结果标注
+        "当前使用"和"最快"，换不换由用户在配置里决定，插件不自动切换。
 
         视频探测不走MP代理(播放器本身不经过它)。只手动触发不进定时任务，每条
         线路只下载开头几MB、线路之间间隔请求，避免被目标站点风控。"""
         self.__save_task_status("detect", "running", "进行中")
-        configured = (self._subscription_source or "").strip() or DEFAULT_SUBSCRIPTION_SOURCE
+        configured = self.__active_subscription()
         accelerator = (self._accelerator_prefix or "").strip().rstrip("/")
-        builtin_names = dict(BUILTIN_SUBSCRIPTIONS)
 
         subscriptions: List[Dict[str, Any]] = []
         configured_sample: Optional[Dict[str, str]] = None
         fallback_sample: Optional[Dict[str, str]] = None
         extra_nodes: List[str] = []
-        for url in dict.fromkeys([configured] + [u for u, _ in BUILTIN_SUBSCRIPTIONS]):
+        for url in dict.fromkeys(([configured] if configured else []) + self.parse_url_lines(self._subscription_list)):
             row: Dict[str, Any] = {
                 "url": url,
-                "label": builtin_names.get(url, "自定义订阅源"),
+                "label": self.__display_name(url, BUILTIN_SUBSCRIPTIONS),
                 "current": url == configured,
                 "ok": False,
                 "entries": 0,
@@ -794,12 +857,15 @@ class ANiStrmHub(_PluginBase):
 
         routes: List[Dict[str, Any]] = []
         if sample:
-            accelerator_names = dict(BUILTIN_ACCELERATORS)
             plan: List[Tuple[str, Optional[str]]] = [("官方直链", None)]
-            for prefix in dict.fromkeys([p for p, _ in BUILTIN_ACCELERATORS] + ([accelerator] if accelerator else []) + extra_nodes):
-                if prefix is None or any(prefix == existing for _, existing in plan):
+            listed = self.parse_url_lines(self._accelerator_list, strip_slash=True)
+            for prefix in dict.fromkeys(([accelerator] if accelerator else []) + listed + extra_nodes):
+                if any(prefix == existing for _, existing in plan):
                     continue
-                label = accelerator_names.get(prefix) or ("自定义加速源" if prefix == accelerator else "镜像节点")
+                if prefix in listed or prefix == accelerator:
+                    label = self.__display_name(prefix, BUILTIN_ACCELERATORS)
+                else:
+                    label = f"镜像节点 {urlparse(prefix).netloc}"
                 plan.append((label, prefix))
             for label, prefix in plan:
                 url = StrmRelinkService.compose_link(sample["link"], prefix) if prefix else StrmRelinkService.to_official_link(sample["link"])
@@ -862,7 +928,7 @@ class ANiStrmHub(_PluginBase):
         """根据测速结果给出一句可执行的建议，只建议不自动改。其他线路快出30%
         以上才建议更换，避免单次测速的波动导致来回改配置。"""
         if not routes:
-            return "error", "当前订阅源和内置订阅源都没有拿到样本直链，无法测试播放线路"
+            return "error", "订阅源列表中的地址都没有拿到样本直链，无法测试播放线路"
         reachable = [r for r in routes if r.get("error") is None and r.get("speed_kbps")]
         if not reachable:
             return "error", "所有播放线路均不可达，请检查网络"
@@ -876,7 +942,7 @@ class ANiStrmHub(_PluginBase):
             if has_accelerator:
                 steps.append("清空加速源")
             if not source_is_official:
-                steps.append("将订阅源改为「ANi 官方（未加速）」")
+                steps.append("将订阅源改为 ANi 官方源")
             return "可" + "，并".join(steps) + "，直接使用官方直链"
 
         if not current:
@@ -1015,21 +1081,74 @@ class ANiStrmHub(_PluginBase):
                             self.__row(
                                 [
                                     (
-                                        8,
+                                        6,
                                         {
                                             "component": "VCombobox",
                                             "props": {
                                                 "model": "subscription_source",
-                                                "label": "订阅源",
-                                                "items": [url for url, _ in BUILTIN_SUBSCRIPTIONS],
-                                                "placeholder": DEFAULT_SUBSCRIPTION_SOURCE,
-                                                "hint": "可选内置源或填写自定义地址；镜像源的视频链接已自带加速",
+                                                "label": "当前订阅源",
+                                                "items": self.__subscription_options(),
+                                                "placeholder": "选择或输入 RSS 地址",
+                                                "hint": "从下方列表选择，也可直接输入地址",
                                                 "persistent-hint": True,
                                             },
                                         },
                                     ),
                                     (
-                                        4,
+                                        6,
+                                        {
+                                            "component": "VCombobox",
+                                            "props": {
+                                                "model": "accelerator_prefix",
+                                                "label": "当前加速源",
+                                                "items": self.__accelerator_options(),
+                                                "clearable": True,
+                                                "placeholder": "留空不加速",
+                                                "hint": "留空=使用订阅源自带线路；填写后改用该加速源",
+                                                "persistent-hint": True,
+                                            },
+                                        },
+                                    ),
+                                ]
+                            ),
+                            self.__row(
+                                [
+                                    (
+                                        6,
+                                        {
+                                            "component": "VTextarea",
+                                            "props": {
+                                                "model": "subscription_list",
+                                                "label": "订阅源列表",
+                                                "rows": 3,
+                                                "auto-grow": True,
+                                                "placeholder": "一行一个 RSS 地址",
+                                                "hint": "一行一个，# 开头为注释；可自由增删改",
+                                                "persistent-hint": True,
+                                            },
+                                        },
+                                    ),
+                                    (
+                                        6,
+                                        {
+                                            "component": "VTextarea",
+                                            "props": {
+                                                "model": "accelerator_list",
+                                                "label": "加速源列表",
+                                                "rows": 3,
+                                                "auto-grow": True,
+                                                "placeholder": "一行一个反代前缀，如 https://pro.pili.cc.cd",
+                                                "hint": "一行一个，# 开头为注释；可自由增删改",
+                                                "persistent-hint": True,
+                                            },
+                                        },
+                                    ),
+                                ]
+                            ),
+                            self.__row(
+                                [
+                                    (
+                                        6,
                                         {
                                             "component": "VSelect",
                                             "props": {
@@ -1042,34 +1161,14 @@ class ANiStrmHub(_PluginBase):
                                             },
                                         },
                                     ),
-                                ]
-                            ),
-                            self.__row(
-                                [
                                     (
-                                        8,
-                                        {
-                                            "component": "VCombobox",
-                                            "props": {
-                                                "model": "accelerator_prefix",
-                                                "label": "加速源",
-                                                "items": [prefix for prefix, _ in BUILTIN_ACCELERATORS],
-                                                "clearable": True,
-                                                "placeholder": "留空不加速",
-                                                "hint": "留空=使用订阅源自带线路；填写后改用该加速源",
-                                                "persistent-hint": True,
-                                            },
-                                        },
-                                    ),
-                                    (
-                                        4,
+                                        6,
                                         {
                                             "component": "div",
                                             "props": {"class": "text-caption", "style": "white-space: pre-line;"},
-                                            "text": "内置订阅源："
-                                            + "、".join(name for _, name in BUILTIN_SUBSCRIPTIONS)
-                                            + "\n内置加速源："
-                                            + "、".join(f"{name} {prefix}" for prefix, name in BUILTIN_ACCELERATORS),
+                                            "text": "首次安装已填入内置地址：pili、op5 镜像（已加速）与 ANi 官方（未加速），"
+                                            "失效时直接在列表中删除或替换\n"
+                                            "列表改动保存后，下拉框即出现新地址；「连通性检测」会逐个实测列表中的地址",
                                         },
                                     ),
                                 ]
@@ -1137,6 +1236,8 @@ class ANiStrmHub(_PluginBase):
             "strm_layout": LAYOUT_FLAT,
             "subscription_source": DEFAULT_SUBSCRIPTION_SOURCE,
             "accelerator_prefix": "",
+            "subscription_list": "\n".join(url for url, _ in BUILTIN_SUBSCRIPTIONS),
+            "accelerator_list": "\n".join(prefix for prefix, _ in BUILTIN_ACCELERATORS),
             "refresh_subscription_once": False,
             "regroup_once": False,
             "backfill_once": False,
@@ -1156,6 +1257,8 @@ class ANiStrmHub(_PluginBase):
                 "strm_layout": self._strm_layout,
                 "subscription_source": self._subscription_source,
                 "accelerator_prefix": self._accelerator_prefix,
+                "subscription_list": self._subscription_list,
+                "accelerator_list": self._accelerator_list,
                 "refresh_subscription_once": self._refresh_subscription_once,
                 "regroup_once": self._regroup_once,
                 "backfill_once": self._backfill_once,

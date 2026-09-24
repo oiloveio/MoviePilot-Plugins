@@ -715,6 +715,61 @@ class TestCheckAcceleratorForRun:
         assert result == "HTTP 403"
 
 
+class TestUserMaintainedLists:
+    def test_parse_url_lines_skips_comments_invalid_and_duplicates(self):
+        text = "https://a.example/rss.xml\n\n# 备注\nnot-a-url\nhttps://a.example/rss.xml\n  https://b.example/rss.xml  "
+        assert ANiStrmHub.parse_url_lines(text) == ["https://a.example/rss.xml", "https://b.example/rss.xml"]
+
+    def test_parse_url_lines_strips_trailing_slash_for_prefixes(self):
+        assert ANiStrmHub.parse_url_lines("https://proxy.example/\n", strip_slash=True) == ["https://proxy.example"]
+
+    def test_first_install_prefills_builtin_lists(self):
+        plugin = ANiStrmHub()
+        plugin.init_plugin({})
+        assert ANiStrmHub.parse_url_lines(plugin._subscription_list) == [u for u, _ in BUILTIN_SUBSCRIPTIONS]
+        assert ANiStrmHub.parse_url_lines(plugin._accelerator_list) == [p for p, _ in BUILTIN_ACCELERATORS]
+
+    def test_user_cleared_list_is_not_refilled(self):
+        plugin = ANiStrmHub()
+        plugin.init_plugin({"subscription_list": "", "accelerator_list": ""})
+        assert plugin._subscription_list == "" and plugin._accelerator_list == ""
+
+    def test_empty_selection_uses_first_listed_source(self, tmp_path):
+        plugin = ANiStrmHub()
+        plugin.init_plugin({"subscription_source": "", "subscription_list": "https://my-mirror.example/rss.xml"})
+        plugin._storageplace = str(tmp_path)
+        plugin._client.fetch_one_source = MagicMock(return_value=[])
+
+        getattr(plugin, "_ANiStrmHub__task")()
+
+        plugin._client.fetch_one_source.assert_called_once_with("https://my-mirror.example/rss.xml")
+
+    def test_nothing_configured_reports_instead_of_using_builtin(self, tmp_path):
+        plugin = ANiStrmHub()
+        plugin.init_plugin({"subscription_source": "", "subscription_list": ""})
+        plugin._storageplace = str(tmp_path)
+        plugin._client.fetch_one_source = MagicMock()
+
+        getattr(plugin, "_ANiStrmHub__task")()
+
+        plugin._client.fetch_one_source.assert_not_called()
+        assert plugin.get_data("task_status")["task"]["summary"] == "未配置订阅源"
+
+    def test_custom_entries_appear_in_form_options(self):
+        plugin = ANiStrmHub()
+        plugin.init_plugin(
+            {
+                "subscription_list": "https://my-mirror.example/ani-download.xml",
+                "accelerator_list": "https://my-proxy.example/",
+                "subscription_source": "https://my-mirror.example/ani-download.xml",
+            }
+        )
+        form_text = str(plugin.get_form()[0])
+        assert "'items': ['https://my-mirror.example/ani-download.xml']" in form_text
+        assert "'items': ['https://my-proxy.example']" in form_text
+        assert "api.pili.cc.cd" not in form_text
+
+
 class TestBuiltinOptions:
     def test_default_subscription_is_accelerated_mirror(self):
         # 新用户开箱即用：默认订阅源是自带加速的镜像，不需要再配加速源
@@ -724,6 +779,7 @@ class TestBuiltinOptions:
 
     def test_builtin_options_listed_in_form(self):
         plugin = ANiStrmHub()
+        plugin.init_plugin({})
         form_text = str(plugin.get_form()[0])
         for url, _ in BUILTIN_SUBSCRIPTIONS:
             assert url in form_text
@@ -1464,8 +1520,24 @@ class TestDetectTask:
         getattr(plugin, "_ANiStrmHub__detect_task")()
 
         routes = plugin.get_data("detect_result")["routes"]
-        assert [r["label"] for r in routes] == ["官方直链", "pili 节点", "op5 节点", "自定义加速源"]
-        assert routes[-1]["current"] is True
+        assert [r["label"] for r in routes] == ["官方直链", "my-proxy.example", "pili 节点", "op5 节点"]
+        assert routes[1]["current"] is True
+
+    def test_uses_user_maintained_lists_not_hardcoded_builtins(self, tmp_path, monkeypatch):
+        # 内置地址失效后用户把它从列表删掉、换成自己的地址：检测只测列表里的地址
+        self.LINKS = {**self.LINKS, "https://my-mirror.example/ani-download.xml": self.LINKS["https://api.ani.rip/ani-download.xml"]}
+        speeds = {**self.SPEEDS, "https://my-proxy.example": 900.0}
+        plugin = self._make_plugin(
+            tmp_path, monkeypatch, "https://my-mirror.example/ani-download.xml", "https://my-proxy.example", speeds
+        )
+        plugin._subscription_list = "https://my-mirror.example/ani-download.xml\n# 旧的失效地址\n"
+        plugin._accelerator_list = "https://my-proxy.example"
+
+        getattr(plugin, "_ANiStrmHub__detect_task")()
+
+        result = plugin.get_data("detect_result")
+        assert [row["url"] for row in result["subscriptions"]] == ["https://my-mirror.example/ani-download.xml"]
+        assert [r["display"] for r in result["routes"]] == ["https://resources.ani.rip", "https://my-proxy.example"]
 
     def test_recommends_faster_route_without_switching(self, tmp_path, monkeypatch):
         speeds = {"https://resources.ani.rip": 300.0, "https://pro.pili.cc.cd": 500.0, "https://pro.op5.de5.net": 2000.0}
