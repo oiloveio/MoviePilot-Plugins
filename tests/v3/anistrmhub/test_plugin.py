@@ -15,6 +15,7 @@ from app.plugins.anistrmhub import (
     EPISODE_NUM_RE,
     BUILTIN_ACCELERATORS,
     BUILTIN_SUBSCRIPTIONS,
+    DEFAULT_SUBSCRIPTION_SOURCE,
     LAYOUT_BY_TITLE,
     MAX_CONSECUTIVE_PROBE_FAILURES,
     LAYOUT_FLAT,
@@ -715,15 +716,165 @@ class TestCheckAcceleratorForRun:
         assert result == "HTTP 403"
 
 
+class TestUserMaintainedLists:
+    def test_parse_url_lines_skips_comments_invalid_and_duplicates(self):
+        text = "https://a.example/rss.xml\n\n# 备注\nnot-a-url\nhttps://a.example/rss.xml\n  https://b.example/rss.xml  "
+        assert ANiStrmHub.parse_url_lines(text) == ["https://a.example/rss.xml", "https://b.example/rss.xml"]
+
+    def test_parse_url_lines_strips_trailing_slash_for_prefixes(self):
+        assert ANiStrmHub.parse_url_lines("https://proxy.example/\n", strip_slash=True) == ["https://proxy.example"]
+
+    def test_first_install_prefills_builtin_lists(self):
+        plugin = ANiStrmHub()
+        plugin.init_plugin({})
+        assert ANiStrmHub.parse_url_lines(plugin._subscription_list) == [u for u, _ in BUILTIN_SUBSCRIPTIONS]
+        assert ANiStrmHub.parse_url_lines(plugin._accelerator_list) == [p for p, _ in BUILTIN_ACCELERATORS]
+
+    def test_user_cleared_list_is_not_refilled(self):
+        plugin = ANiStrmHub()
+        plugin.init_plugin(
+            {"subscription_source": None, "accelerator_prefix": None, "subscription_list": [], "accelerator_list": []}
+        )
+        assert plugin._subscription_list == [] and plugin._accelerator_list == []
+        # 清空当前订阅源(前端存 null)不能被当成"首次安装"而回退到默认地址
+        assert plugin._subscription_source == ""
+
+    def test_typed_custom_address_persists_into_list(self):
+        plugin = ANiStrmHub()
+        plugin.init_plugin(
+            {
+                "subscription_source": "https://my-mirror.example/rss.xml",
+                "accelerator_prefix": "https://my-proxy.example/",
+                "subscription_list": [u for u, _ in BUILTIN_SUBSCRIPTIONS],
+                "accelerator_list": [p for p, _ in BUILTIN_ACCELERATORS],
+            }
+        )
+        assert plugin._subscription_list[-1] == "https://my-mirror.example/rss.xml"
+        assert plugin._accelerator_list[-1] == "https://my-proxy.example"
+        saved = plugin.get_config()
+        assert "https://my-mirror.example/rss.xml" in saved["subscription_list"]
+
+        # 之后切回别的订阅源，自定义地址依然保留在列表里，直到用户删除
+        plugin.init_plugin({**saved, "subscription_source": DEFAULT_SUBSCRIPTION_SOURCE})
+        assert "https://my-mirror.example/rss.xml" in plugin._subscription_list
+
+    def test_upgrade_from_single_value_config_keeps_custom_accelerator(self):
+        # 0.9.0 的配置里没有列表键：填入内置地址，并把原来手动输入的加速源并进列表
+        plugin = ANiStrmHub()
+        plugin.init_plugin({"subscription_source": DEFAULT_SUBSCRIPTION_SOURCE, "accelerator_prefix": "https://my-proxy.example"})
+        assert plugin._accelerator_list == [p for p, _ in BUILTIN_ACCELERATORS] + ["https://my-proxy.example"]
+
+    def test_empty_selection_uses_first_listed_source(self, tmp_path):
+        plugin = ANiStrmHub()
+        plugin.init_plugin({"subscription_source": "", "subscription_list": "https://my-mirror.example/rss.xml"})
+        plugin._storageplace = str(tmp_path)
+        plugin._client.fetch_one_source = MagicMock(return_value=[])
+
+        getattr(plugin, "_ANiStrmHub__task")()
+
+        plugin._client.fetch_one_source.assert_called_once_with("https://my-mirror.example/rss.xml")
+
+    def test_nothing_configured_reports_instead_of_using_builtin(self, tmp_path):
+        plugin = ANiStrmHub()
+        plugin.init_plugin({"subscription_source": "", "subscription_list": ""})
+        plugin._storageplace = str(tmp_path)
+        plugin._client.fetch_one_source = MagicMock()
+
+        getattr(plugin, "_ANiStrmHub__task")()
+
+        plugin._client.fetch_one_source.assert_not_called()
+        assert plugin.get_data("task_status")["task"]["summary"] == "未配置订阅源"
+
+    def test_custom_entries_appear_in_manager_list(self):
+        plugin = ANiStrmHub()
+        plugin.init_plugin(
+            {
+                "subscription_list": ["https://my-mirror.example/ani-download.xml"],
+                "accelerator_list": ["https://my-proxy.example/"],
+                "subscription_source": "https://my-mirror.example/ani-download.xml",
+                "accelerator_prefix": "",
+            }
+        )
+        form_text = str(plugin.get_form()[0])
+        assert "'text': 'https://my-mirror.example/ani-download.xml'" in form_text
+        assert "'text': 'https://my-proxy.example'" in form_text
+        assert "'text': '自定义'" in form_text
+        # 用户删掉的内置地址不会出现在页面的列表里
+        assert "'text': 'https://api.pili.cc.cd/ani-download.xml'" not in form_text
+
+
+class TestSourceManagerForm:
+    """配置页地址管理列表的结构：依赖 MoviePilot 前端 FormRender 支持的
+    show 表达式与 on* 事件函数"""
+
+    def _find_all(self, node, predicate, found=None):
+        found = [] if found is None else found
+        if isinstance(node, dict):
+            if predicate(node):
+                found.append(node)
+            for value in node.values():
+                self._find_all(value, predicate, found)
+        elif isinstance(node, list):
+            for item in node:
+                self._find_all(item, predicate, found)
+        return found
+
+    def _form(self):
+        plugin = ANiStrmHub()
+        plugin.init_plugin({})
+        return plugin.get_form()
+
+    def test_every_saved_address_has_delete_button(self):
+        form, _ = self._form()
+        deletes = self._find_all(form, lambda n: n.get("component") == "VBtn" and n.get("props", {}).get("title") == "删除")
+        assert len(deletes) == len(BUILTIN_SUBSCRIPTIONS) + len(BUILTIN_ACCELERATORS)
+        # 回归：图标要放在子组件里，放在 VBtn 的 icon 属性上会被 FormRender 的默认插槽盖掉
+        assert deletes[0]["content"][0] == {"component": "VIcon", "props": {"icon": "mdi-delete-outline", "size": "small"}}
+        handler = deletes[0]["props"]["onClick"]
+        assert "subscription_list" in handler and "splice" in handler
+
+    def test_elements_with_show_have_no_style(self):
+        # 回归：FormRender 处理 show 时往 parsedProps.style 上设 display。style 为字符串
+        # 时隐藏直接失效；为对象时被就地修改、Vue 比较引用相同跳过更新。已在移植的
+        # FormRender + Vuetify 3.7.3 页面上实测复现，带 show 的元素一律不能设 style
+        form, _ = self._form()
+        with_show = self._find_all(form, lambda n: "show" in n.get("props", {}))
+        assert with_show
+        assert all("style" not in node["props"] for node in with_show)
+
+    def test_builtin_rows_tagged_builtin_with_notes(self):
+        form, _ = self._form()
+        chip_texts = [n.get("text") for n in self._find_all(form, lambda n: n.get("component") == "VChip")]
+        assert chip_texts.count("内置") == len(BUILTIN_SUBSCRIPTIONS) + len(BUILTIN_ACCELERATORS)
+        assert "ANi 官方" in chip_texts and "视频链接已加速" in chip_texts and "视频链接未加速" in chip_texts
+
+    def test_picker_items_follow_list_and_store_plain_url(self):
+        form, _ = self._form()
+        picker = self._find_all(form, lambda n: n.get("props", {}).get("model") == "subscription_source")[0]["props"]
+        assert picker["items"].startswith("{{ (subscription_list || []).map(")
+        assert picker["return-object"] is False and picker["item-props"] is True
+
+    def test_default_model_lists_are_arrays(self):
+        _, model = self._form()
+        assert model["subscription_list"] == [u for u, _ in BUILTIN_SUBSCRIPTIONS]
+        assert model["accelerator_list"] == [p for p, _ in BUILTIN_ACCELERATORS]
+
+    def test_accelerator_notice_says_it_is_for_playback_links(self):
+        form, _ = self._form()
+        texts = [n["props"]["text"] for n in self._find_all(form, lambda n: n.get("component") == "VAlert" and "text" in n.get("props", {}))]
+        assert any("只作用于 strm 中的视频播放链接" in t and "不影响订阅源" in t for t in texts)
+
+
 class TestBuiltinOptions:
     def test_default_subscription_is_accelerated_mirror(self):
         # 新用户开箱即用：默认订阅源是自带加速的镜像，不需要再配加速源
         link_prefix = "https://pro.pili.cc.cd/resources.ani.rip/2026-7/ep.mp4?d=mp4"
-        assert BUILTIN_SUBSCRIPTIONS[0][0] == "https://api.pili.cc.cd/ani-download.xml"
+        assert DEFAULT_SUBSCRIPTION_SOURCE == "https://api.pili.cc.cd/ani-download.xml"
         assert StrmRelinkService.embedded_accelerator(link_prefix) == BUILTIN_ACCELERATORS[0][0]
 
     def test_builtin_options_listed_in_form(self):
         plugin = ANiStrmHub()
+        plugin.init_plugin({})
         form_text = str(plugin.get_form()[0])
         for url, _ in BUILTIN_SUBSCRIPTIONS:
             assert url in form_text
@@ -1464,8 +1615,24 @@ class TestDetectTask:
         getattr(plugin, "_ANiStrmHub__detect_task")()
 
         routes = plugin.get_data("detect_result")["routes"]
-        assert [r["label"] for r in routes] == ["官方直链", "pili 节点", "op5 节点", "自定义加速源"]
-        assert routes[-1]["current"] is True
+        assert [r["label"] for r in routes] == ["官方直链", "my-proxy.example", "pili 节点", "op5 节点"]
+        assert routes[1]["current"] is True
+
+    def test_uses_user_maintained_lists_not_hardcoded_builtins(self, tmp_path, monkeypatch):
+        # 内置地址失效后用户把它从列表删掉、换成自己的地址：检测只测列表里的地址
+        self.LINKS = {**self.LINKS, "https://my-mirror.example/ani-download.xml": self.LINKS["https://api.ani.rip/ani-download.xml"]}
+        speeds = {**self.SPEEDS, "https://my-proxy.example": 900.0}
+        plugin = self._make_plugin(
+            tmp_path, monkeypatch, "https://my-mirror.example/ani-download.xml", "https://my-proxy.example", speeds
+        )
+        plugin._subscription_list = "https://my-mirror.example/ani-download.xml\n# 旧的失效地址\n"
+        plugin._accelerator_list = "https://my-proxy.example"
+
+        getattr(plugin, "_ANiStrmHub__detect_task")()
+
+        result = plugin.get_data("detect_result")
+        assert [row["url"] for row in result["subscriptions"]] == ["https://my-mirror.example/ani-download.xml"]
+        assert [r["display"] for r in result["routes"]] == ["https://resources.ani.rip", "https://my-proxy.example"]
 
     def test_recommends_faster_route_without_switching(self, tmp_path, monkeypatch):
         speeds = {"https://resources.ani.rip": 300.0, "https://pro.pili.cc.cd": 500.0, "https://pro.op5.de5.net": 2000.0}
