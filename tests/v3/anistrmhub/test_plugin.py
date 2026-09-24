@@ -1732,14 +1732,22 @@ class _FakeRequestUtils:
         return _FakeRequestUtils.upstream
 
 
-class TestLocalRelay:
+class _RelayHarness:
+    """中转测试公共部分：按 MoviePilot 注册插件接口的方式挂载路由"""
+
     ADDRESS = "http://192.168.1.10:3000"
+    TOKEN = "k3y-For-Test_0123"
     VIDEO_PATH = "resources.ani.rip/2026-7/%5BANi%5D%20%E7%A4%BA%E4%BE%8B%20-%2001%20%5B1080P%5D.mp4"
 
     def _plugin(self, **config):
         plugin = ANiStrmHub()
-        plugin.init_plugin({"relay_enabled": True, "relay_address": self.ADDRESS, **config})
+        plugin.init_plugin({"relay_enabled": True, "relay_address": self.ADDRESS, "relay_token": self.TOKEN, **config})
         return plugin
+
+    def _url(self, token="__default__", path=None):
+        token = self.TOKEN if token == "__default__" else token
+        middle = f"{token}/" if token else ""
+        return f"/api/v1/plugin/ANiStrmHub/relay/{middle}{path or self.VIDEO_PATH}"
 
     def _client(self, plugin, monkeypatch, upstream=None, client_ip="192.168.1.50"):
         import app.plugins.anistrmhub as module
@@ -1758,6 +1766,9 @@ class TestLocalRelay:
             app.add_api_route(**api)
         return TestClient(app, client=(client_ip, 50000))
 
+
+
+class TestLocalRelay(_RelayHarness):
     def test_disabled_registers_no_api(self):
         plugin = ANiStrmHub()
         plugin.init_plugin({})
@@ -1768,9 +1779,56 @@ class TestLocalRelay:
         assert api[0]["path"] == "/relay/{path:path}"
         assert api[0]["allow_anonymous"] is True and set(api[0]["methods"]) == {"GET", "HEAD"}
 
-    def test_relay_prefix_joins_address_and_api_path(self):
-        assert self._plugin().relay_prefix() == "http://192.168.1.10:3000/api/v1/plugin/ANiStrmHub/relay"
+    def test_lan_address_prefix_has_no_token(self):
+        plugin = self._plugin(relay_token="abc123")
+        assert plugin.relay_prefix() == "http://192.168.1.10:3000/api/v1/plugin/ANiStrmHub/relay"
         assert self._plugin(relay_address="").relay_prefix() is None
+
+    def test_public_address_prefix_carries_token(self):
+        plugin = self._plugin(relay_token="abc123", relay_address="https://mp.example.com:8443")
+        assert plugin.relay_prefix() == "https://mp.example.com:8443/api/v1/plugin/ANiStrmHub/relay/abc123"
+
+    @pytest.mark.parametrize(
+        "host,expected",
+        [("192.168.1.10", True), ("10.0.0.2", True), ("127.0.0.1", True), ("::1", True), ("localhost", True),
+         ("nas", True), ("mp.example.com", False), ("8.8.8.8", False), ("", False)],
+    )
+    def test_is_lan_host(self, host, expected):
+        assert ANiStrmHub.is_lan_host(host) is expected
+
+    def test_token_generated_once_and_persisted(self):
+        plugin = self._plugin(relay_token="")
+        token = plugin._relay_token
+        assert len(token) >= 16 and plugin.get_config()["relay_token"] == token
+        again = ANiStrmHub()
+        again.init_plugin(plugin.get_config())
+        assert again._relay_token == token
+
+    def test_reset_token_replaces_relay_entry_and_current_accelerator(self):
+        old = self._plugin(relay_token="old-token")
+        # 页面上当前加速源为旧中转地址，点「重置密钥」后保存提交的配置
+        saved = {**old.get_config(), "accelerator_prefix": old.relay_prefix(), "relay_token": ""}
+        plugin = ANiStrmHub()
+        plugin.init_plugin(saved)
+        assert plugin._relay_token not in ("", "old-token")
+        relay_entries = [u for u in plugin._accelerator_list if "/relay" in u]
+        assert relay_entries == [plugin.relay_prefix()]
+        assert plugin._accelerator_prefix == plugin.relay_prefix()
+
+    def test_upgrade_from_tokenless_public_relay_prefix(self):
+        # 0.11.0 的中转地址不带密钥：公网地址升级后，列表与当前加速源都换成带密钥的地址
+        legacy = "https://mp.example.com:8443/api/v1/plugin/ANiStrmHub/relay"
+        plugin = ANiStrmHub()
+        plugin.init_plugin(
+            {
+                "relay_enabled": True,
+                "relay_address": "https://mp.example.com:8443",
+                "accelerator_prefix": legacy,
+                "accelerator_list": ["https://pro.pili.cc.cd", legacy],
+            }
+        )
+        assert legacy not in plugin._accelerator_list
+        assert plugin._accelerator_prefix == plugin.relay_prefix() != legacy
 
     def test_relay_address_added_to_accelerator_list_and_persisted(self):
         plugin = self._plugin()
@@ -1797,20 +1855,12 @@ class TestLocalRelay:
     def test_relay_target_only_allows_ani_videos(self, raw_path, query, expected):
         assert ANiStrmHub.relay_target(raw_path, query) == expected
 
-    @pytest.mark.parametrize(
-        "host,expected",
-        [("192.168.1.50", True), ("10.0.0.2", True), ("127.0.0.1", True), ("::ffff:192.168.1.2", True),
-         ("8.8.8.8", False), ("testclient", False), ("", False)],
-    )
-    def test_is_lan_client(self, host, expected):
-        assert ANiStrmHub.is_lan_client(host) is expected
-
     def test_streams_video_and_forwards_range(self, monkeypatch):
         upstream = _FakeUpstream()
         client = self._client(self._plugin(), monkeypatch, upstream)
 
         response = client.get(
-            f"/api/v1/plugin/ANiStrmHub/relay/{self.VIDEO_PATH}?d=mp4", headers={"Range": "bytes=0-1015"}
+            self._url() + "?d=mp4", headers={"Range": "bytes=0-1015"}
         )
 
         assert response.status_code == 206
@@ -1831,12 +1881,12 @@ class TestLocalRelay:
 
         monkeypatch.setattr(module.settings, "PROXY", {"http": "http://192.168.1.2:7890", "https": "http://192.168.1.2:7890"})
         client = self._client(self._plugin(), monkeypatch, _FakeUpstream())
-        client.get(f"/api/v1/plugin/ANiStrmHub/relay/{self.VIDEO_PATH}")
+        client.get(self._url())
         assert _FakeRequestUtils.calls[0]["proxies"]["https"] == "http://192.168.1.2:7890"
 
     def test_custom_relay_proxy_overrides(self, monkeypatch):
         client = self._client(self._plugin(relay_proxy="socks5://192.168.1.2:7891"), monkeypatch, _FakeUpstream())
-        client.get(f"/api/v1/plugin/ANiStrmHub/relay/{self.VIDEO_PATH}")
+        client.get(self._url())
         assert _FakeRequestUtils.calls[0]["proxies"] == {
             "http": "socks5://192.168.1.2:7891",
             "https": "socks5://192.168.1.2:7891",
@@ -1846,7 +1896,7 @@ class TestLocalRelay:
         upstream = _FakeUpstream(headers={"Content-Type": "video/mp4", "Content-Range": "bytes 0-1015/1016"})
         client = self._client(self._plugin(), monkeypatch, upstream)
 
-        response = client.get(f"/api/v1/plugin/ANiStrmHub/relay/{self.VIDEO_PATH}")
+        response = client.get(self._url())
 
         assert response.status_code == 200
         assert response.headers["content-length"] == "1016"
@@ -1858,7 +1908,7 @@ class TestLocalRelay:
         upstream = _FakeUpstream(headers={"Content-Type": "video/mp4", "Content-Range": "bytes 0-0/435525972"})
         client = self._client(self._plugin(), monkeypatch, upstream)
 
-        response = client.head(f"/api/v1/plugin/ANiStrmHub/relay/{self.VIDEO_PATH}")
+        response = client.head(self._url())
 
         assert response.status_code == 200 and response.content == b""
         assert response.headers["content-length"] == "435525972"
@@ -1866,30 +1916,19 @@ class TestLocalRelay:
         assert _FakeRequestUtils.calls[0]["headers"]["Range"] == "bytes=0-0"
         assert upstream.closed
 
-    def test_rejects_public_client(self, monkeypatch):
-        client = self._client(self._plugin(), monkeypatch, _FakeUpstream(), client_ip="8.8.8.8")
-        assert client.get(f"/api/v1/plugin/ANiStrmHub/relay/{self.VIDEO_PATH}").status_code == 403
-        assert _FakeRequestUtils.calls == []
-
-    def test_rejects_public_client_behind_moviepilot_nginx(self, monkeypatch):
-        # 经 MoviePilot 自带 nginx 转发时来源是 127.0.0.1，真实地址在 X-Real-IP
-        client = self._client(self._plugin(), monkeypatch, _FakeUpstream(), client_ip="127.0.0.1")
-        response = client.get(f"/api/v1/plugin/ANiStrmHub/relay/{self.VIDEO_PATH}", headers={"X-Real-IP": "8.8.8.8"})
-        assert response.status_code == 403
-
     def test_rejects_non_ani_target(self, monkeypatch):
         client = self._client(self._plugin(), monkeypatch, _FakeUpstream())
-        assert client.get("/api/v1/plugin/ANiStrmHub/relay/evil.example/2026-7/x.mp4").status_code == 403
+        assert client.get(self._url(path="evil.example/2026-7/x.mp4")).status_code == 403
         assert _FakeRequestUtils.calls == []
 
     def test_upstream_unreachable_returns_502(self, monkeypatch):
         client = self._client(self._plugin(), monkeypatch, None)
-        assert client.get(f"/api/v1/plugin/ANiStrmHub/relay/{self.VIDEO_PATH}").status_code == 502
+        assert client.get(self._url()).status_code == 502
 
     def test_upstream_error_status_passed_through(self, monkeypatch):
         upstream = _FakeUpstream(status_code=404, headers={"Content-Type": "text/html"})
         client = self._client(self._plugin(), monkeypatch, upstream)
-        assert client.get(f"/api/v1/plugin/ANiStrmHub/relay/{self.VIDEO_PATH}").status_code == 404
+        assert client.get(self._url()).status_code == 404
         assert upstream.closed
 
     def test_relay_row_tagged_in_form(self):
@@ -1944,3 +1983,140 @@ class TestV2Compatibility:
         assert plugin.get_api()[0]["path"] == "/relay/{path:path}"
         plugin.get_form()
         plugin.get_page()
+
+
+class TestRelayAccessControl(_RelayHarness):
+    """访问规则：带正确密钥任何来源都放行；不带密钥只在确认来自局域网时放行。
+    局域网 = 访问地址(Host)是局域网地址，且整条转发链都是局域网地址"""
+
+    LAN_HOST = "192.168.1.10:3000"
+    PUBLIC_HOST = "mp.example.com:8443"
+
+    def _get(self, monkeypatch, client_ip, host, token=None, headers=None):
+        client = self._client(self._plugin(), monkeypatch, _FakeUpstream(), client_ip=client_ip)
+        return client.get(self._url(token=token) + "?d=mp4", headers={"Host": host, "Range": "bytes=0-1015", **(headers or {})})
+
+    def test_home_device_without_token_is_streamed(self, monkeypatch):
+        assert self._get(monkeypatch, "192.168.1.50", self.LAN_HOST).status_code == 206
+        # 经 MoviePilot 自带 nginx：直接连接方 127.0.0.1，真实来源在 X-Real-IP
+        response = self._get(monkeypatch, "127.0.0.1", self.LAN_HOST, headers={"X-Real-IP": "192.168.1.50"})
+        assert response.status_code == 206
+
+    def test_public_domain_via_reverse_proxy_without_token_rejected(self, monkeypatch):
+        # 回归：外网经 Lucky 反代访问，来源地址是反代的局域网地址，0.11.0 因此放行。
+        # 已实测 Lucky 会把公网域名作为 Host 传给 MoviePilot
+        response = self._get(
+            monkeypatch, "127.0.0.1", self.PUBLIC_HOST, headers={"X-Real-IP": "192.168.1.1", "X-Forwarded-For": "192.168.1.1"}
+        )
+        assert response.status_code == 403
+        assert _FakeRequestUtils.calls == []
+
+    def test_public_domain_with_token_is_streamed(self, monkeypatch):
+        response = self._get(monkeypatch, "127.0.0.1", self.PUBLIC_HOST, token=self.TOKEN, headers={"X-Real-IP": "192.168.1.1"})
+        assert response.status_code == 206
+        assert _FakeRequestUtils.calls[0]["url"] == f"https://{self.VIDEO_PATH}?d=mp4"
+
+    def test_public_hop_in_forward_chain_without_token_rejected(self, monkeypatch):
+        response = self._get(monkeypatch, "127.0.0.1", self.LAN_HOST, headers={"X-Forwarded-For": "8.8.8.8, 192.168.1.1"})
+        assert response.status_code == 403
+
+    def test_public_client_ip_without_token_rejected(self, monkeypatch):
+        assert self._get(monkeypatch, "8.8.8.8", self.LAN_HOST).status_code == 403
+
+    def test_wrong_token_from_public_rejected(self, monkeypatch):
+        assert self._get(monkeypatch, "8.8.8.8", self.PUBLIC_HOST, token="wrong-token").status_code == 403
+        assert _FakeRequestUtils.calls == []
+
+    def test_empty_first_segment_from_public_rejected(self, monkeypatch):
+        client = self._client(self._plugin(), monkeypatch, _FakeUpstream(), client_ip="8.8.8.8")
+        response = client.get("/api/v1/plugin/ANiStrmHub/relay//" + self.VIDEO_PATH, headers={"Host": self.PUBLIC_HOST})
+        assert response.status_code == 403
+
+    def test_form_has_readonly_token_and_reset_button_without_public_switch(self):
+        form_text = str(self._plugin().get_form()[0])
+        assert "'model': 'relay_token'" in form_text and "'readonly': True" in form_text
+        assert "relay_token = '';" in form_text
+        assert "relay_public" not in form_text
+
+
+class TestDirectProbeIgnoresEnvironmentProxy:
+    def test_direct_request_utils_ignores_env_proxy(self, monkeypatch):
+        # 回归：只是不传 proxies 时 requests 仍会使用 HTTP(S)_PROXY 环境变量，
+        # MoviePilot 容器常用它配置代理，导致「官方直链」测试实际走了代理
+        import app.plugins.anistrmhub as module
+
+        captured = {}
+
+        class _Capture:
+            def __init__(self, ua=None, proxies=None, session=None, **kwargs):
+                captured.update(proxies=proxies, session=session)
+
+        monkeypatch.setattr(module, "RequestUtils", _Capture)
+        aggregator = AniRssAggregator(use_proxy=True)
+        aggregator.build_direct_request_utils()
+        assert captured["proxies"] is None
+        assert captured["session"] is not None and captured["session"].trust_env is False
+
+    def test_trust_env_false_really_bypasses_env_proxy(self, monkeypatch):
+        import requests
+
+        monkeypatch.setenv("HTTPS_PROXY", "http://127.0.0.1:9")
+        session = requests.Session()
+        session.trust_env = False
+        settings = session.merge_environment_settings("https://resources.ani.rip/x", {}, None, None, None)
+        assert not settings["proxies"]
+        default = requests.Session().merge_environment_settings("https://resources.ani.rip/x", {}, None, None, None)
+        assert default["proxies"].get("https") == "http://127.0.0.1:9"
+
+
+class TestRelayRedirectCache(_RelayHarness):
+    """跳转缓存：记住 resources.ani.rip 跳转后的最终地址，之后直接访问，省掉一次经代理建连"""
+
+    FINAL = "https://cloud.ani-download.workers.dev/2026-7/x.mp4?d=mp4"
+
+    def _upstream(self, status_code=206, redirected=True):
+        upstream = _FakeUpstream(status_code=status_code, headers={"Content-Type": "video/mp4", "Content-Range": "bytes 0-1015/1016"})
+        upstream.history = [object()] if redirected else []
+        upstream.url = self.FINAL
+        return upstream
+
+    def test_second_request_goes_straight_to_final_url(self, monkeypatch):
+        client = self._client(self._plugin(), monkeypatch, self._upstream())
+        client.get(self._url(token=None), headers={"Range": "bytes=0-1015"})
+        client.get(self._url(token=None), headers={"Range": "bytes=0-1015"})
+        assert [c["url"] for c in _FakeRequestUtils.calls] == [f"https://{self.VIDEO_PATH}", self.FINAL]
+
+    def test_416_from_final_url_does_not_invalidate_cache(self, monkeypatch):
+        # 回归：416 曾被当成缓存失效，绕回原始地址重新跳转，多等一次建连(实测 7.9 秒)
+        client = self._client(self._plugin(), monkeypatch, self._upstream())
+        client.get(self._url(token=None), headers={"Range": "bytes=0-1015"})
+        _FakeRequestUtils.upstream = self._upstream(status_code=416)
+        response = client.get(self._url(token=None), headers={"Range": "bytes=999999999-"})
+        assert response.status_code == 416
+        assert [c["url"] for c in _FakeRequestUtils.calls][1:] == [self.FINAL]
+
+    def test_broken_final_url_falls_back_to_original(self, monkeypatch):
+        client = self._client(self._plugin(), monkeypatch, self._upstream())
+        client.get(self._url(token=None), headers={"Range": "bytes=0-1015"})
+        _FakeRequestUtils.upstream = self._upstream(status_code=403)
+        client.get(self._url(token=None), headers={"Range": "bytes=0-1015"})
+        assert [c["url"] for c in _FakeRequestUtils.calls][1:] == [self.FINAL, f"https://{self.VIDEO_PATH}"]
+
+
+class TestRelayProbeTimeout:
+    def test_relay_route_probed_with_longer_timeout(self):
+        # 中转冷启动经代理建两条连接，实测可达 18 秒，默认 20 秒容易误判不可达
+        import app.plugins.anistrmhub as module
+
+        seen = []
+
+        def factory(timeout=None):
+            seen.append(timeout)
+            utils = MagicMock()
+            utils.get_res.return_value = _video_response()
+            return utils
+
+        service = StrmRelinkService(request_factory=factory)
+        service.probe_latency_ms("http://192.168.1.10:3000/api/v1/plugin/ANiStrmHub/relay/resources.ani.rip/2026-7/x")
+        service.probe_latency_ms("https://pro.pili.cc.cd/resources.ani.rip/2026-7/x")
+        assert seen == [module.RELAY_PROBE_TIMEOUT_SECONDS, None]
