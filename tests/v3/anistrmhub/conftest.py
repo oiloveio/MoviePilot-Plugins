@@ -5,7 +5,7 @@
 plugins.v3/anistrmhub 挂载为 app.plugins.anistrmhub，使测试可以独立运行：
 
     python -m venv .venv
-    .venv/bin/pip install pytest apscheduler pytz fastapi httpx requests
+    .venv/bin/pip install pytest apscheduler pytz fastapi httpx httpx2 requests
     .venv/bin/python -m pytest tests/v3/anistrmhub
 """
 import importlib.util

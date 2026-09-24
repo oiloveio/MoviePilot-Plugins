@@ -301,7 +301,7 @@ RSS 能拉到 ≠ 视频能播：RSS 端点与其给出的下载直链经常不�
 
   ```bash
   python -m venv .venv
-  .venv/bin/pip install pytest apscheduler pytz fastapi httpx requests
+  .venv/bin/pip install pytest apscheduler pytz fastapi httpx httpx2 requests
   .venv/bin/python -m pytest tests/v3/anistrmhub
   ```
 
