@@ -4,6 +4,7 @@ import ipaddress
 import json
 import re
 import secrets
+import threading
 import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
@@ -15,7 +16,7 @@ import pytz
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.cron import CronTrigger
 
-from fastapi import Request
+from fastapi import Body, Request
 from fastapi.responses import Response, StreamingResponse
 from requests import Session
 from requests.adapters import HTTPAdapter
@@ -66,6 +67,13 @@ RELAY_PROBE_TIMEOUT_SECONDS = 60
 RELAY_REDIRECT_CACHE_LIMIT = 1000
 # 播放器拖动进度靠 Range 请求，必须原样转发；响应头只透传与视频传输相关的几项
 RELAY_REQUEST_HEADERS = ("If-Range",)
+# 中转密钥：URL 安全字符。配置页「重置密钥」在浏览器里直接生成，保存时由后端校验
+RELAY_TOKEN_RE = re.compile(r"^[A-Za-z0-9_-]{12,64}$")
+RELAY_TOKEN_JS = (
+    "function() { const c = 'ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz23456789'; "
+    "const b = new Uint8Array(16); crypto.getRandomValues(b); "
+    "relay_token = Array.from(b, x => c[x % c.length]).join(''); }"
+)
 CONTENT_RANGE_RE = re.compile(r"bytes\s+(\d+)-(\d+)/(\d+)")
 RELAY_RESPONSE_HEADERS = (
     "Content-Type",
@@ -126,7 +134,7 @@ class ANiStrmHub(_PluginBase):
     plugin_name = "ANiStrmHub"
     plugin_desc = "开箱即用的ANi新番strm生成：内置已加速订阅源，也可选官方源自配加速或本地中转；mp刮削入库，媒体服务器直连播放"
     plugin_icon = "https://raw.githubusercontent.com/oiloveio/MoviePilot-Plugins/main/icons/anistrmhub.png"
-    plugin_version = "0.12.0"
+    plugin_version = "0.13.0"
     plugin_author = "oiloveio"
     author_url = "https://github.com/oiloveio"
     plugin_config_prefix = "anistrmhub_"
@@ -150,15 +158,14 @@ class ANiStrmHub(_PluginBase):
     _relay_proxy = ""
     _relay_token = ""
 
-    _refresh_subscription_once = False
-    _regroup_once = False
-    _backfill_once = False
-    _detect_once = False
     _scheduler: Optional[BackgroundScheduler] = None
 
     def __init__(self):
         super().__init__()
         self._relay_session: Optional[Session] = None
+        # 维护任务(重建直链/重建目录结构/补全历史剧集/连通性检测)同一时间只运行一个：
+        # 它们扫描并改写同一批 strm，并发会互相看到对方写到一半的中间状态
+        self._maintenance_lock = threading.Lock()
         self._relay_redirects: Dict[str, Tuple[str, float]] = {}
         self._client = AniRssAggregator()
         self._strm_service = StrmFileService()
@@ -199,7 +206,7 @@ class ANiStrmHub(_PluginBase):
         self._relay_proxy = (config.get("relay_proxy") or "").strip()
         # 中转密钥：写进 strm 链接，没有正确密钥的请求一律拒绝。清空后保存即重新生成
         self._relay_token = (config.get("relay_token") or "").strip()
-        token_generated = not self._relay_token
+        token_generated = not RELAY_TOKEN_RE.match(self._relay_token)
         if token_generated:
             self._relay_token = secrets.token_urlsafe(12)
 
@@ -207,7 +214,7 @@ class ANiStrmHub(_PluginBase):
         lists_changed = token_generated or "subscription_list" not in config or "accelerator_list" not in config
         # 中转地址由插件维护：启用后作为一条加速源加入列表；中转地址或密钥变化后，
         # 列表里旧的中转地址被替换，正在使用旧地址时自动切到新地址(否则新生成的
-        # strm 会指向已失效的密钥)。已有 strm 需运行「重建直链」更新
+        # strm 会指向已失效的密钥)。已有 strm 需在详情页重建直链更新
         relay_prefix = self.relay_prefix()
         if relay_prefix:
             kept = [url for url in self._accelerator_list if RELAY_API_PATH not in url or url == relay_prefix]
@@ -226,10 +233,6 @@ class ANiStrmHub(_PluginBase):
             self._accelerator_list.append(self._accelerator_prefix)
             lists_changed = True
 
-        self._refresh_subscription_once = config.get("refresh_subscription_once", False)
-        self._regroup_once = config.get("regroup_once", False)
-        self._backfill_once = config.get("backfill_once", False)
-        self._detect_once = config.get("detect_once", False)
 
         self._client.set_use_proxy(self._use_proxy)
         logger.info(
@@ -238,14 +241,7 @@ class ANiStrmHub(_PluginBase):
             f"订阅源={self._subscription_source}, 加速源={self._accelerator_prefix or '(不加速)'}"
         )
 
-        if not (
-            self._enabled
-            or self._onlyonce
-            or self._refresh_subscription_once
-            or self._regroup_once
-            or self._backfill_once
-            or self._detect_once
-        ):
+        if not (self._enabled or self._onlyonce):
             logger.info("ANiStrmHub未启用且未触发立即运行，跳过任务注册")
             if lists_changed:
                 # 未启用时也要把并入的新地址写回配置，否则只存在于内存，下次保存就丢了
@@ -275,53 +271,58 @@ class ANiStrmHub(_PluginBase):
             )
             self._onlyonce = False
 
-        pending: List[Tuple[str, str, Any]] = []
-        if self._refresh_subscription_once:
-            pending.append(("refresh_subscription", "重建直链", self.__refresh_subscription_task))
-            self._refresh_subscription_once = False
-        if self._regroup_once:
-            pending.append(("regroup", "重建目录结构", self.__regroup_local_strm_task))
-            self._regroup_once = False
-        if self._backfill_once:
-            pending.append(("backfill", "补全历史剧集", self.__backfill_task))
-            self._backfill_once = False
-        if self._detect_once:
-            pending.append(("detect", "连通性检测", self.__detect_task))
-            self._detect_once = False
-
-        if pending:
-            logger.info(
-                "ANiStrmHub服务启动，依次执行维护任务：" + "、".join(name for _, name, _ in pending)
-            )
-            self._scheduler.add_job(
-                func=self.__run_pending_tasks,
-                args=[pending],
-                trigger="date",
-                run_date=datetime.now(tz=pytz.timezone(settings.TZ)) + timedelta(seconds=3),
-                name="ANiStrmHub维护任务",
-            )
-
         self.__update_config()
 
         if self._scheduler.get_jobs():
             self._scheduler.print_jobs()
             self._scheduler.start()
 
-    def __run_pending_tasks(self, pending: List[Tuple[str, str, Any]]) -> None:
-        """把勾选的多个维护开关串成一条队列依次执行，不并发。
+    # 详情页按钮可执行的操作：接口名 -> (任务状态键, 显示名, 执行函数名)
+    ACTIONS = {
+        "sync": ("task", "订阅同步", "_ANiStrmHub__task"),
+        "rebuild": ("refresh_subscription", "重建直链", "_ANiStrmHub__refresh_subscription_task"),
+        "regroup": ("regroup", "重建目录结构", "_ANiStrmHub__regroup_local_strm_task"),
+        "backfill": ("backfill", "补全历史剧集", "_ANiStrmHub__backfill_task"),
+        "detect": ("detect", "连通性检测", "_ANiStrmHub__detect_task"),
+    }
 
-        这些任务会扫描并改写同一批 strm 文件：并发跑会互相看到对方写到一半的
-        中间状态，本来就受限流约束的探测请求也会成倍增加。实测日志里出现过
-        一次同时触发四个任务、彼此交叠运行的情况。"""
-        for task_key, task_name, func in pending:
-            if self.__is_task_running(task_key):
-                logger.warning(f"ANiStrmHub{task_name}：上一次任务还在运行中，本次跳过")
-                continue
+    def run_action(self, name: str, payload: Optional[Dict[str, Any]] = Body(default=None)) -> Dict[str, Any]:
+        """详情页按钮调用的操作接口(需 MoviePilot 登录)。任务在后台线程执行，接口立即
+        返回，详情页刷新后在「任务运行状态」查看进度与结果。
+
+        重建直链带参数 accelerator：先把它设为当前加速源再重建，保证已有 strm 与之后
+        新生成的 strm 走同一条线路。空字符串表示不加速(使用订阅源原始链接)。"""
+        if name not in self.ACTIONS:
+            return {"success": False, "message": f"未知操作：{name}"}
+        task_key, label, method = self.ACTIONS[name]
+        if name == "rebuild":
+            accelerator = str((payload or {}).get("accelerator") or "").strip().rstrip("/")
+            allowed = set(self._accelerator_list) | {self.relay_prefix() or ""} | {""}
+            if accelerator not in allowed:
+                return {"success": False, "message": "目标线路不在加速源列表中，请刷新页面后重试"}
+            self._accelerator_prefix = accelerator
+            self.__update_config()
+            logger.info(f"ANiStrmHub重建直链：目标线路设为 {accelerator or '不加速（订阅源原始链接）'}")
+        started, message = self.start_maintenance(task_key, label, getattr(self, method))
+        return {"success": started, "message": message}
+
+    def start_maintenance(self, task_key: str, label: str, func) -> Tuple[bool, str]:
+        """在后台线程执行一个维护任务；已有任务在运行时拒绝，不排队也不并发"""
+        if not self._maintenance_lock.acquire(blocking=False):
+            return False, "已有维护任务在运行，请等它完成后再试"
+        self.__save_task_status(task_key, "running", "已启动")
+
+        def worker():
             try:
                 func()
             except Exception as err:
-                logger.error(f"ANiStrmHub{task_name}：任务异常终止 - {err}")
+                logger.error(f"ANiStrmHub{label}：任务异常终止 - {err}")
                 self.__save_task_status(task_key, "done", f"任务异常终止：{err}")
+            finally:
+                self._maintenance_lock.release()
+
+        threading.Thread(target=worker, name=f"ANiStrmHub-{task_key}", daemon=True).start()
+        return True, f"{label}已开始执行"
 
     @staticmethod
     def parse_url_lines(value: Any, strip_slash: bool = False) -> List[str]:
@@ -342,6 +343,15 @@ class ANiStrmHub(_PluginBase):
                 continue
             urls.append(line.rstrip("/") if strip_slash else line)
         return list(dict.fromkeys(urls))
+
+    @staticmethod
+    def short_url(url: str) -> str:
+        """界面上展示用的地址：本地中转只显示 协议+域名(接口路径与密钥对用户没有意义，
+        而且会把一行撑到换行)，其余原样"""
+        if RELAY_API_PATH in url:
+            parsed = urlparse(url)
+            return f"{parsed.scheme}://{parsed.netloc}"
+        return url
 
     @staticmethod
     def __display_name(url: str, builtin: Tuple[Tuple[str, str], ...]) -> str:
@@ -480,7 +490,7 @@ class ANiStrmHub(_PluginBase):
         if unreachable_reason:
             logger.warning(
                 f"ANiStrmHub订阅同步：加速源{accelerator}探测不可达({unreachable_reason})，本次不生成，"
-                f"下次定时运行会重试；可运行「连通性检测」对比线路后更换加速源"
+                f"下次定时运行会重试；可在详情页运行「连通性检测」对比线路后更换加速源"
             )
             self.__save_task_status("task", "done", f"加速源不可达，本次未生成：{unreachable_reason}")
             return
@@ -668,6 +678,14 @@ class ANiStrmHub(_PluginBase):
             ["标题精确匹配更新", "路径迁移更新"],
             resolve,
         )
+
+        # 重建完刷新本地线路分布，详情页「维护操作」马上能看到结果
+        expected_route = StrmRelinkService.describe_route(
+            StrmRelinkService.compose_link(entries[0]["link"], accelerator), accelerator
+        )
+        distribution = StrmRelinkService.scan_local_distribution(self._storageplace, accelerator, expected_route)
+        checked_at = datetime.now(tz=pytz.timezone(settings.TZ)).strftime("%Y-%m-%d %H:%M:%S")
+        self.save_data("local_distribution", {"checked_at": checked_at, **distribution})
 
     def __regroup_local_strm_task(self):
         """按当前「strm 存放方式」重建本地已有 strm 的目录结构：选"按剧集
@@ -947,7 +965,9 @@ class ANiStrmHub(_PluginBase):
             ):
                 if any(prefix == existing for _, existing in plan):
                     continue
-                if prefix in listed or prefix == accelerator:
+                if RELAY_API_PATH in prefix:
+                    label = "本地中转"
+                elif prefix in listed or prefix == accelerator:
                     label = self.__display_name(prefix, BUILTIN_ACCELERATORS)
                 else:
                     label = f"镜像节点 {urlparse(prefix).netloc}"
@@ -960,7 +980,7 @@ class ANiStrmHub(_PluginBase):
                     {
                         "label": label,
                         "prefix": prefix,
-                        "display": prefix or OFFICIAL_BASE_URL,
+                        "display": self.short_url(prefix) if prefix else OFFICIAL_BASE_URL,
                         "current": prefix == current_prefix,
                         **measured,
                     }
@@ -975,6 +995,7 @@ class ANiStrmHub(_PluginBase):
                 )
 
         verdict_level, verdict = self.__judge_routes(routes, bool(accelerator), source_is_official)
+        direct_egress = self.__direct_egress()
         checked_at = datetime.now(tz=pytz.timezone(settings.TZ)).strftime("%Y-%m-%d %H:%M:%S")
         self.save_data(
             "detect_result",
@@ -985,6 +1006,7 @@ class ANiStrmHub(_PluginBase):
                 "routes": routes,
                 "verdict": verdict,
                 "verdict_level": verdict_level,
+                "direct_egress": direct_egress,
             },
         )
 
@@ -1007,6 +1029,32 @@ class ANiStrmHub(_PluginBase):
         )
         logger.info(f"ANiStrmHub连通性检测完成：{summary}")
         self.__save_task_status("detect", "done", summary)
+
+    def __direct_egress(self) -> Optional[Dict[str, str]]:
+        """查询 MoviePilot 直连(不经任何代理)时的出口 IP 与所属国家。出口不在国内时，
+        说明所在网络本身已被代理(如透明代理、路由器翻墙)，「官方直链」测得可达并不代表
+        未翻墙的设备也能访问——用户实测时对此产生过疑问"""
+        # 多个查询服务依次尝试：单个服务可能限流(实测 ipinfo.io 返回过 429)
+        services = (
+            ("https://api.ip.sb/geoip", "ip", "country_code", "organization"),
+            ("https://ipinfo.io/json", "ip", "country", "org"),
+            ("http://ip-api.com/json", "query", "countryCode", "isp"),
+        )
+        for url, ip_key, country_key, org_key in services:
+            try:
+                response = self._client.build_direct_request_utils(timeout=10).get_res(url)
+                if response is None or response.status_code != 200:
+                    continue
+                data = response.json()
+                if data.get(ip_key):
+                    return {
+                        "ip": str(data.get(ip_key) or ""),
+                        "country": str(data.get(country_key) or "").upper(),
+                        "org": str(data.get(org_key) or ""),
+                    }
+            except Exception as err:
+                logger.debug(f"ANiStrmHub连通性检测：查询直连出口失败 {url} - {err}")
+        return None
 
     @staticmethod
     def __judge_routes(routes: List[Dict[str, Any]], has_accelerator: bool, source_is_official: bool) -> Tuple[str, str]:
@@ -1071,9 +1119,19 @@ class ANiStrmHub(_PluginBase):
         无法交互登录，凭证只能写在链接里。写 MoviePilot 账号密码或 API 令牌等于把
         MoviePilot 的完整权限写进每个 strm 文件，所以改用插件专用的中转密钥：只能
         用来转发 ANi 官方视频，泄露后重置即作废。见 relay_video。"""
+        apis: List[Dict[str, Any]] = [
+            {
+                "path": "/action/{name}",
+                "endpoint": self.run_action,
+                "methods": ["POST"],
+                # 详情页按钮经 MoviePilot 前端调用，携带登录令牌；未登录无法调用
+                "auth": "bear",
+                "summary": "执行维护操作",
+            }
+        ]
         if not self._relay_enabled:
-            return []
-        return [
+            return apis
+        return apis + [
             {
                 "path": "/relay/{path:path}",
                 "endpoint": self.relay_video,
@@ -1233,7 +1291,7 @@ class ANiStrmHub(_PluginBase):
                 logger.warning(f"ANiStrmHub本地中转：拒绝外网的无密钥请求（{basis}）")
                 return Response(
                     status_code=403,
-                    content="拒绝访问：外网访问需要带密钥的中转链接。请把「中转访问地址」设为公网地址后运行「重建直链」",
+                    content="拒绝访问：外网访问需要带密钥的中转链接。请把「中转访问地址」设为公网地址，再在插件详情页重建直链",
                 )
 
         target = self.relay_target(raw_path, request.url.query)
@@ -1332,7 +1390,8 @@ class ANiStrmHub(_PluginBase):
         """地址的注释标签：(文字, 颜色)。内置地址显示「内置」+名称+说明，其余显示「自定义」"""
         names = dict(builtin)
         if RELAY_API_PATH in url:
-            return [("本地中转", "info"), ("经局域网代理转发", "default")]
+            mode = "局域网免密钥" if ANiStrmHub.is_lan_host(urlparse(url).hostname) else "带密钥"
+            return [("本地中转", "info"), (mode, "default")]
         if url not in names:
             return [("自定义", "secondary")]
         notes = [("内置", "primary"), (names[url], "default")]
@@ -1356,7 +1415,7 @@ class ANiStrmHub(_PluginBase):
         notes = {url: " · ".join(text for text, _ in cls.__source_notes(url, builtin)) for url, _ in builtin}
         items_expr = (
             "{{ (%s || []).map(u => ({ title: u, value: u, subtitle: (%s)[u] || "
-            "(u.includes(%s) ? '本地中转 · 经局域网代理转发' : '自定义') })) }}"
+            "(u.includes(%s) ? '本地中转' : '自定义') })) }}"
             % (list_key, json.dumps(notes, ensure_ascii=False), json.dumps(RELAY_API_PATH))
         )
         props: Dict[str, Any] = {
@@ -1426,19 +1485,23 @@ class ANiStrmHub(_PluginBase):
                     "props": {"show": "{{ (%s || []).includes(%s) }}" % (list_key, literal)},
                     "content": [
                         {
+                            # 单行排布：地址过长时截断显示省略号，标签与按钮不换行
                             "component": "div",
                             "props": {
-                                "class": "d-flex flex-wrap align-center py-1",
-                                "style": "gap: 4px; border-bottom: 1px solid rgba(var(--v-border-color), var(--v-border-opacity));",
+                                "class": "d-flex align-center py-1",
+                                "style": "gap: 6px; border-bottom: 1px solid rgba(var(--v-border-color), var(--v-border-opacity));",
                             },
                             "content": [
                         {
                             "component": "span",
-                            "props": {"class": "text-body-2 me-2", "style": "word-break: break-all;"},
-                            "text": url,
+                            "props": {
+                                "class": "text-body-2 text-truncate",
+                                "style": "min-width: 0; flex: 1 1 auto;",
+                                "title": url,
+                            },
+                            "text": cls.short_url(url),
                         },
-                        *chips,
-                        {"component": "VSpacer"},
+                        {"component": "div", "props": {"class": "d-flex flex-shrink-0 align-center"}, "content": chips},
                         {
                             "component": "VBtn",
                             "props": {
@@ -1481,109 +1544,86 @@ class ANiStrmHub(_PluginBase):
         )
         return rows
 
-    def __relay_section(self) -> List[dict]:
-        """加速源分区底部的「本地中转」设置"""
+    def __relay_section(self) -> dict:
+        """「本地中转」设置卡片：一行填地址与代理，一行管理密钥，底部一句状态"""
         relay_prefix = self.relay_prefix()
-        if not relay_prefix:
-            status = "启用并填写中转访问地址、保存后，中转地址会加入上方列表"
+        is_lan = self.relay_address_is_lan()
+        if not self._relay_enabled:
+            status_type, status = "info", "未启用。启用并填写 strm 访问地址、保存后，本地中转会作为一条线路加入加速源列表"
+        elif not relay_prefix:
+            status_type, status = "warning", "请填写 strm 访问地址（以 http:// 或 https:// 开头）后保存"
         else:
-            mode = (
-                "局域网地址：链接不带密钥，仅局域网设备可播放"
-                if self.relay_address_is_lan()
-                else "公网地址：链接自动附带密钥，在家和在外都能直接播放"
-            )
-            if (self._accelerator_prefix or "").rstrip("/") == relay_prefix:
-                status = f"{mode}。已是当前加速源；已有 strm 运行「重建直链」即可改为经中转播放"
-            else:
-                status = f"{mode}。已加入上方列表，设为当前加速源后生效"
-        return [
-            {"component": "VDivider", "props": {"class": "my-4"}},
-            {"component": "div", "props": {"class": "text-subtitle-2 mb-2"}, "text": "本地中转"},
-            self.__notice(
-                "适用于媒体服务器或播放设备本身不走代理、打不开需要翻墙的视频链接的情况："
-                "strm 改为指向 MoviePilot，由 MoviePilot 经你的局域网代理拉取视频再转发，支持拖动进度，"
-                "播放设备无需任何代理设置。中转访问地址填局域网地址时免密钥、仅限局域网访问；"
-                "填公网地址时链接自动附带密钥，没有正确密钥的外网请求一律拒绝。只转发 ANi 视频，"
-                "中转期间需保持本插件处于启用状态。"
-            ),
-            self.__row(
-                [
-                    (3, {"component": "VSwitch", "props": {"model": "relay_enabled", "label": "启用本地中转"}}),
-                    (
-                        5,
-                        {
-                            "component": "VTextField",
-                            "props": {
-                                "model": "relay_address",
-                                "label": "中转访问地址",
-                                "placeholder": "http://192.168.1.10:3000",
-                                "hint": "播放设备访问 MoviePilot 的地址。只在家里看填局域网地址；在外网也要播放，填 MoviePilot 的公网访问地址",
-                                "persistent-hint": True,
-                            },
-                        },
-                    ),
-                    (
-                        4,
-                        {
-                            "component": "VTextField",
-                            "props": {
-                                "model": "relay_proxy",
-                                "label": "中转代理",
-                                "placeholder": "留空使用 MoviePilot 的代理设置",
-                                "hint": "如 http://192.168.1.2:7890 或 socks5://192.168.1.2:7891",
-                                "persistent-hint": True,
-                            },
-                        },
-                    ),
-                ]
-            ),
-            self.__row(
-                [
-                    (
-                        5,
-                        {
-                            # 用只读输入框绑定密钥：FormRender 不对组件的 text 字段求值，
-                            # 标签组件的 text 属性又会被默认插槽盖掉，只有 model 绑定能实时显示
-                            "component": "VTextField",
-                            "props": {
-                                "model": "relay_token",
-                                "label": "中转密钥",
-                                "readonly": True,
-                                "placeholder": "保存后生成新密钥",
-                                "hint": "中转访问地址为公网地址时写入 strm 链接，没有正确密钥的外网请求一律拒绝",
-                                "persistent-hint": True,
-                            },
-                        },
-                    ),
-                    (
-                        7,
-                        {
-                            "component": "div",
-                            "props": {"class": "d-flex flex-wrap align-center pt-2"},
-                            "content": [
-                                {
-                                    "component": "VBtn",
-                                    "props": {
-                                        "size": "small",
-                                        "variant": "tonal",
-                                        "color": "warning",
-                                        "class": "me-2",
-                                        "onClick": "function() { relay_token = ''; }",
-                                    },
-                                    "text": "重置密钥",
+            mode = "局域网地址：链接不带密钥，仅家里的设备可播放" if is_lan else "公网地址：链接自动附带密钥，在家和在外都能播放"
+            using = (self._accelerator_prefix or "").rstrip("/") == relay_prefix
+            tail = "已是当前加速源" if using else "在插件详情页点击「本地中转」即可把全部 strm 改为经中转播放"
+            status_type, status = ("success" if using else "info"), f"{mode}；{tail}"
+        return self.__config_card(
+            "本地中转",
+            [
+                self.__notice(
+                    "为不走代理的媒体服务器和播放器提供视频转发：strm 指向 MoviePilot，由 MoviePilot 经你的代理拉取视频"
+                    "再转发，支持拖动进度，播放设备无需任何代理设置。只转发 ANi 视频，使用期间请保持插件启用。"
+                ),
+                self.__row(
+                    [
+                        (3, {"component": "VSwitch", "props": {"model": "relay_enabled", "label": "启用本地中转"}}),
+                        (
+                            5,
+                            {
+                                "component": "VTextField",
+                                "props": {
+                                    "model": "relay_address",
+                                    "label": "strm 访问地址",
+                                    "placeholder": "https://mp.example.com:8443",
+                                    "hint": "播放设备访问 MoviePilot 的地址。填公网地址在家和在外都能播放；只在家里看可填局域网地址",
+                                    "persistent-hint": True,
                                 },
-                                {
-                                    "component": "span",
-                                    "props": {"class": "text-caption text-medium-emphasis"},
-                                    "text": "链接泄露时重置并保存，再运行「重建直链」，旧链接随即失效",
+                            },
+                        ),
+                        (
+                            4,
+                            {
+                                "component": "VTextField",
+                                "props": {
+                                    "model": "relay_proxy",
+                                    "label": "中转代理",
+                                    "placeholder": "留空使用 MoviePilot 的代理设置",
+                                    "hint": "如 http://192.168.1.2:7890",
+                                    "persistent-hint": True,
                                 },
-                            ],
-                        },
-                    ),
-                ]
-            ),
-            {"component": "div", "props": {"class": "text-caption text-medium-emphasis mt-2"}, "text": status},
-        ]
+                            },
+                        ),
+                    ]
+                ),
+                self.__row(
+                    [
+                        (3, {"component": "div"}),
+                        (
+                            5,
+                            {
+                                # 只读输入框绑定密钥，右侧刷新图标即「重置密钥」：在浏览器里直接生成新
+                                # 密钥并显示出来，保存后生效。图标用 append-inner-icon 属性而不是插槽内容，
+                                # 不受 FormRender 默认插槽的影响
+                                "component": "VTextField",
+                                "props": {
+                                    "model": "relay_token",
+                                    "label": "中转密钥",
+                                    "readonly": True,
+                                    "append-inner-icon": "mdi-refresh",
+                                    "onClick:appendInner": RELAY_TOKEN_JS,
+                                    "hint": "公网地址时写入 strm 链接。点击右侧图标重置，保存后到详情页重建直链，旧链接失效",
+                                    "persistent-hint": True,
+                                },
+                            },
+                        ),
+                    ]
+                ),
+                {
+                    "component": "VAlert",
+                    "props": {"type": status_type, "variant": "tonal", "density": "compact", "class": "mt-3", "text": status},
+                },
+            ],
+        )
 
     def get_form(self) -> Tuple[List[dict], Dict[str, Any]]:
         return [
@@ -1635,7 +1675,7 @@ class ANiStrmHub(_PluginBase):
                                                     {"title": "平铺存放", "value": LAYOUT_FLAT},
                                                     {"title": "按剧集分目录", "value": LAYOUT_BY_TITLE},
                                                 ],
-                                                "hint": "改后运行下方「重建目录结构」",
+                                                "hint": "改后在详情页运行「重建目录结构」",
                                                 "persistent-hint": True,
                                             },
                                         },
@@ -1703,44 +1743,19 @@ class ANiStrmHub(_PluginBase):
                             *self.__source_manager(
                                 self._accelerator_list, "accelerator_list", "accelerator_prefix", BUILTIN_ACCELERATORS
                             ),
-                            *self.__relay_section(),
                         ],
                     ),
+                    self.__relay_section(),
                     {
-                        "component": "VCard",
-                        "props": {"variant": "tonal", "color": "warning", "class": "mb-4"},
-                        "content": [
-                            {
-                                "component": "VCardTitle",
-                                "props": {"class": "text-subtitle-1 font-weight-bold"},
-                                "text": "维护操作",
-                            },
-                            {
-                                "component": "VCardText",
-                                "content": [
-                                    self.__row(
-                                        [
-                                            (3, {"component": "VSwitch", "props": {"model": model, "label": label}})
-                                            for model, label in (
-                                                ("refresh_subscription_once", "重建直链"),
-                                                ("regroup_once", "重建目录结构"),
-                                                ("backfill_once", "补全历史剧集"),
-                                                ("detect_once", "连通性检测"),
-                                            )
-                                        ]
-                                    ),
-                                    {
-                                        "component": "div",
-                                        "props": {"class": "text-caption", "style": "white-space: pre-line;"},
-                                        "text": "手动触发，多选时按顺序依次执行，运行状态见详情页\n"
-                                        "重建直链：按当前订阅源与加速源重写全部 strm 链接，实测可达才覆盖\n"
-                                        "重建目录结构：按「strm 存放方式」移动文件，不改内容\n"
-                                        "补全历史剧集：回溯 RSS 窗口之外的早期集数，串行限流探测\n"
-                                        "连通性检测：检查订阅源，并实测各播放线路的首包耗时与下载速度",
-                                    },
-                                ],
-                            },
-                        ],
+                        "component": "VAlert",
+                        "props": {
+                            "type": "warning",
+                            "variant": "tonal",
+                            "density": "compact",
+                            "class": "mb-4",
+                            "text": "维护操作（重建直链、重建目录结构、补全历史剧集、连通性检测）在插件详情页点击按钮执行，"
+                            "执行前可看到本地 strm 的线路分布",
+                        },
                     },
                     {
                         "component": "VAlert",
@@ -1787,10 +1802,6 @@ class ANiStrmHub(_PluginBase):
             "relay_address": "",
             "relay_proxy": "",
             "relay_token": "",
-            "refresh_subscription_once": False,
-            "regroup_once": False,
-            "backfill_once": False,
-            "detect_once": False,
             "cron": "20 22,23,0,1 * * *",
         }
 
@@ -1812,10 +1823,6 @@ class ANiStrmHub(_PluginBase):
                 "relay_address": self._relay_address,
                 "relay_proxy": self._relay_proxy,
                 "relay_token": self._relay_token,
-                "refresh_subscription_once": self._refresh_subscription_once,
-                "regroup_once": self._regroup_once,
-                "backfill_once": self._backfill_once,
-                "detect_once": self._detect_once,
             }
         )
 
@@ -1907,6 +1914,27 @@ class ANiStrmHub(_PluginBase):
             )
 
         body: List[dict] = rows or [{"component": "span", "text": "没有拿到样本直链，未测试播放线路"}]
+        egress = detect_result.get("direct_egress") or {}
+        if egress.get("ip"):
+            abroad = egress.get("country") and egress.get("country") != "CN"
+            body.append(
+                {
+                    "component": "VAlert",
+                    "props": {
+                        "type": "warning" if abroad else "info",
+                        "variant": "tonal",
+                        "density": "compact",
+                        "class": "mt-3",
+                        "text": f"MoviePilot 直连出口：{egress['ip']}（{egress.get('country') or '未知'} {egress.get('org') or ''}）"
+                        + (
+                            "。出口不在国内，说明所在网络本身已被代理（如透明代理、路由器翻墙），"
+                            "「官方直链」可达不代表未翻墙的设备也能访问"
+                            if abroad
+                            else ""
+                        ),
+                    },
+                }
+            )
         if detect_result.get("verdict"):
             body.append(
                 {
@@ -1963,7 +1991,7 @@ class ANiStrmHub(_PluginBase):
                         "variant": "tonal",
                         "density": "compact",
                         "class": "mt-3",
-                        "text": f"{mismatched} 个strm的线路与当前加速源配置不一致，运行「重建直链」可统一",
+                        "text": f"{mismatched} 个strm的线路与当前加速源配置不一致，在上方「维护操作」点击目标线路即可统一",
                     },
                 }
             )
@@ -1978,8 +2006,119 @@ class ANiStrmHub(_PluginBase):
             ],
         }
 
+    @staticmethod
+    def __action_button(text: str, action: str, params: Optional[Dict[str, Any]] = None, **props) -> dict:
+        """详情页按钮：MoviePilot 的 PageRender 用 events 描述点击调用的接口(自动携带
+        登录令牌)，执行完自动刷新详情页。按钮文字写在 text 字段"""
+        return {
+            "component": "VBtn",
+            # text-none：Vuetify 按钮默认把英文转成大写(pili → PILI)
+            "props": {"class": "me-2 mb-2 text-none", **props},
+            "text": text,
+            "events": {
+                "click": {"api": f"plugin/ANiStrmHub/action/{action}", "method": "post", "params": params or {}}
+            },
+        }
+
+    def __action_card(self, local_distribution: Dict[str, Any]) -> dict:
+        """详情页顶部的维护操作区：先看本地 strm 的线路分布，再点目标线路执行重建"""
+        busy = self._maintenance_lock.locked()
+        current = (self._accelerator_prefix or "").rstrip("/")
+        options: List[Tuple[str, str]] = [("", "订阅源原始链接（不加速）")]
+        relay_prefix = self.relay_prefix()
+        for prefix in dict.fromkeys(self._accelerator_list + ([relay_prefix] if relay_prefix else [])):
+            options.append((prefix, self.__display_name(prefix, BUILTIN_ACCELERATORS)))
+
+        route_buttons = [
+            self.__action_button(
+                f"{label}（当前）" if prefix == current else label,
+                "rebuild",
+                {"accelerator": prefix},
+                color="primary",
+                variant="flat" if prefix == current else "tonal",
+                disabled=busy,
+            )
+            for prefix, label in options
+        ]
+
+        by_category = local_distribution.get("by_category") or {}
+        if by_category:
+            distribution: List[dict] = [
+                {
+                    "component": "VChip",
+                    "props": {"size": "small", "variant": "tonal", "label": True, "class": "me-2 mb-2"},
+                    "text": f"{category} · {count} 个",
+                }
+                for category, count in sorted(by_category.items(), key=lambda kv: kv[1], reverse=True)
+            ]
+        else:
+            distribution = [
+                {
+                    "component": "span",
+                    "props": {"class": "text-body-2 text-medium-emphasis"},
+                    "text": "尚无统计，运行一次连通性检测或重建直链后显示",
+                }
+            ]
+
+        other_buttons = [
+            self.__action_button("立即订阅同步", "sync", variant="tonal", disabled=busy),
+            self.__action_button("重建目录结构", "regroup", variant="tonal", disabled=busy),
+            self.__action_button("补全历史剧集", "backfill", variant="tonal", disabled=busy),
+            self.__action_button("连通性检测", "detect", variant="tonal", disabled=busy),
+        ]
+        body: List[dict] = []
+        if busy:
+            body.append(
+                {
+                    "component": "VAlert",
+                    "props": {
+                        "type": "info",
+                        "variant": "tonal",
+                        "density": "compact",
+                        "class": "mb-3",
+                        "text": "有维护任务正在后台运行，完成前按钮不可用；稍后刷新本页查看进度",
+                    },
+                }
+            )
+        body += [
+            {"component": "div", "props": {"class": "text-subtitle-2 mb-1"}, "text": "重建直链"},
+            {
+                "component": "div",
+                "props": {"class": "text-body-2 text-medium-emphasis mb-2"},
+                "text": "点击目标线路，即把全部 strm 改为经该线路播放，并设为当前加速源，之后新生成的 strm 也走这条线路。"
+                "逐个实测可达才覆盖，不可达的保留原样。",
+            },
+            {"component": "div", "props": {"class": "text-caption mb-1"}, "text": "本地 strm 当前线路分布"},
+            {"component": "div", "props": {"class": "d-flex flex-wrap mb-2"}, "content": distribution},
+            {"component": "div", "props": {"class": "text-caption mb-1"}, "text": "重建为"},
+            {"component": "div", "props": {"class": "d-flex flex-wrap"}, "content": route_buttons},
+            {"component": "VDivider", "props": {"class": "my-3"}},
+            {"component": "div", "props": {"class": "text-subtitle-2 mb-2"}, "text": "其他操作"},
+            {"component": "div", "props": {"class": "d-flex flex-wrap"}, "content": other_buttons},
+            {
+                "component": "div",
+                "props": {"class": "text-caption text-medium-emphasis mt-1", "style": "white-space: pre-line;"},
+                "text": "重建目录结构：按配置页的「strm 存放方式」移动文件，不改内容\n"
+                "补全历史剧集：回溯 RSS 窗口之外的早期集数，串行限流探测\n"
+                "连通性检测：检查订阅源，并实测各播放线路的首包耗时与下载速度\n"
+                "任务在后台执行，同一时间只运行一个；完成后刷新本页查看结果",
+            },
+        ]
+        return {
+            "component": "VCard",
+            "props": {"class": "mb-4"},
+            "content": [
+                {"component": "VCardTitle", "text": "维护操作"},
+                {"component": "VCardText", "content": body},
+            ],
+        }
+
     def get_page(self) -> List[dict]:
-        content: List[dict] = []
+        local_distribution = self.get_data("local_distribution") or {}
+        if not local_distribution and self._storageplace:
+            # 还没有统计过：当场扫一次本地 strm(只读文件，不发网络请求)，让维护操作区直接看到分布
+            local_distribution = StrmRelinkService.scan_local_distribution(self._storageplace, self._accelerator_prefix)
+        content: List[dict] = [self.__action_card(local_distribution)]
 
         task_status = self.get_data("task_status") or {}
         if task_status:
@@ -2050,7 +2189,7 @@ class ANiStrmHub(_PluginBase):
                     "props": {
                         "type": "info",
                         "variant": "tonal",
-                        "text": "还没有检测数据。在配置页勾选「连通性检测」运行一次，这里会显示订阅源状态、"
+                        "text": "还没有检测数据。点击上方「连通性检测」运行一次，这里会显示订阅源状态、"
                         "各播放线路的首包耗时与下载速度，以及本地strm的线路分布。",
                     },
                 }
@@ -2517,7 +2656,9 @@ class StrmRelinkService:
                         result["error"] = "响应内容不是视频数据(HTTP状态码正常但可能是错误页)"
                         return result
                 received += len(chunk)
-                if received >= SPEED_TEST_BYTES or now - start >= SPEED_TEST_MAX_SECONDS:
+                # 时长上限从收到首包开始算：冷启动首包慢(实测中转可达 13 秒)时，从发起请求
+                # 算会在首包一到就停止，只读到一小块，速度被严重低估(实测误报 4.8KB/s)
+                if received >= SPEED_TEST_BYTES or now - first_at >= SPEED_TEST_MAX_SECONDS:
                     break
             end = time.monotonic()
 
@@ -2553,7 +2694,7 @@ class StrmRelinkService:
     ) -> Dict[str, Any]:
         """扫描本地strm，按实际线路归类(官方直链/加速源X/多层套壳/其他来源)。
         给出expected_route(按当前「订阅源+加速源」新生成的strm应属的类别)时，
-        统计有多少个跟它不一致——不一致的可以用「重建直链」一次性统一。"""
+        统计有多少个跟它不一致——不一致的可以在详情页重建直链一次性统一。"""
         directory = Path(storage_path) if storage_path else None
         if not directory or not directory.exists():
             return {"total": 0, "by_category": {}, "mismatched": 0}

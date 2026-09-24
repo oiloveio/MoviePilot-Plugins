@@ -1,0 +1,41 @@
+<!doctype html><html><head><meta charset="utf-8"><title>详情页预览</title>
+<link href="https://cdn.jsdelivr.net/npm/vuetify@3.7.3/dist/vuetify.min.css" rel="stylesheet">
+<link href="https://cdn.jsdelivr.net/npm/@mdi/font@7.4.47/css/materialdesignicons.min.css" rel="stylesheet">
+</head><body><div id="app"></div>
+<script src="https://cdn.jsdelivr.net/npm/vue@3.5.13/dist/vue.global.prod.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/vuetify@3.7.3/dist/vuetify.min.js"></script>
+<script>
+// 按 MoviePilot-Frontend v2 分支 src/components/render/PageRender.vue 移植：
+// props 直接绑定、text 放在默认插槽、events 描述点击调用的接口，执行完触发 action 刷新页面
+const { h, resolveComponent, createApp, defineComponent, ref } = Vue
+const busy = ref(false)
+const PageRender = defineComponent({
+  name: 'PageRender', props: ['config'], emits: ['action'],
+  setup(props, { emit }) {
+    const events = {}
+    for (const [key, attr] of Object.entries(props.config?.events || {})) {
+      events['on' + key[0].toUpperCase() + key.slice(1)] = async () => {
+        busy.value = true
+        try {
+          const url = '/api/v1/' + attr.api
+          const res = attr.method.toUpperCase() === 'GET'
+            ? await fetch(url + '?' + new URLSearchParams(attr.params || {}))
+            : await fetch(url, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(attr.params || {}) })
+          window.lastAction = { api: attr.api, params: attr.params, response: await res.json() }
+          emit('action')
+        } finally { busy.value = false }
+      }
+    }
+    return () => h(resolveComponent(props.config.component), { ...(props.config.props || {}), ...events }, {
+      default: () => [props.config.text || '', ...(props.config.content || []).map(c => h(PageRender, { config: c, onAction: () => emit('action') }))]
+    })
+  }
+})
+const items = ref([])
+async function load() { items.value = await fetch('/api/v1/plugin/page/ANiStrmHub', { cache: 'no-store' }).then(r => r.json()) }
+window.reloadPage = load
+createApp({ setup() { load(); return () => h(resolveComponent('VApp'), null, { default: () => h(resolveComponent('VMain'), null, { default: () => h(resolveComponent('VContainer'), null, { default: () => [
+  busy.value ? h(resolveComponent('VAlert'), { type: 'info', text: '正在处理...（模拟 MoviePilot 进度框）' }) : null,
+  ...items.value.map(c => h(PageRender, { config: c, onAction: load }))
+] }) }) }) } }).use(Vuetify.createVuetify()).mount('#app')
+</script></body></html>

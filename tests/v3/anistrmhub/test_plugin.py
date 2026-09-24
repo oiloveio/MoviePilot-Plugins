@@ -1349,51 +1349,122 @@ class TestMaintenanceLoopProtections:
         assert "路径迁移更新=1" in status["summary"]
 
 
-class TestPendingTaskQueue:
-    def test_selected_tasks_run_sequentially(self):
-        # 多个维护开关同时勾选时必须串行执行：并发会互相看到对方写到一半的
-        # 状态，探测请求也会翻倍
+class TestMaintenanceActions:
+    """详情页按钮：需 MoviePilot 登录的操作接口，后台执行，同一时间只运行一个维护任务"""
+
+    def _plugin(self, monkeypatch, **config):
+        import threading as threading_module
+
+        class _InlineThread:  # 测试里同步执行，便于断言结果
+            def __init__(self, target=None, **kwargs):
+                self._target = target
+
+            def start(self):
+                self._target()
+
+        import app.plugins.anistrmhub as module
+
+        monkeypatch.setattr(module.threading, "Thread", _InlineThread)
         plugin = ANiStrmHub()
-        order = []
-        pending = [
-            ("refresh_subscription", "重建直链", lambda: order.append("refresh")),
-            ("apply_accelerator", "应用加速源", lambda: order.append("accel")),
-            ("regroup", "重建目录结构", lambda: order.append("regroup")),
-        ]
+        plugin.init_plugin(config)
+        return plugin
 
-        getattr(plugin, "_ANiStrmHub__run_pending_tasks")(pending)
-
-        assert order == ["refresh", "accel", "regroup"]
-
-    def test_running_task_is_skipped(self):
+    def test_action_api_requires_moviepilot_login(self):
         plugin = ANiStrmHub()
-        getattr(plugin, "_ANiStrmHub__save_task_status")("regroup", "running", "进行中")
-        order = []
-        pending = [
-            ("regroup", "重建目录结构", lambda: order.append("regroup")),
-            ("backfill", "补全历史剧集", lambda: order.append("backfill")),
-        ]
+        plugin.init_plugin({})
+        action = next(api for api in plugin.get_api() if api["path"] == "/action/{name}")
+        assert action["auth"] == "bear" and "allow_anonymous" not in action
 
-        getattr(plugin, "_ANiStrmHub__run_pending_tasks")(pending)
+    def test_rebuild_sets_target_as_current_accelerator_then_runs(self, monkeypatch):
+        plugin = self._plugin(monkeypatch)
+        ran = []
+        plugin._ANiStrmHub__refresh_subscription_task = lambda: ran.append(plugin._accelerator_prefix)
+        monkeypatch.setitem(plugin.ACTIONS, "rebuild", ("refresh_subscription", "重建直链", "_ANiStrmHub__refresh_subscription_task"))
 
-        assert order == ["backfill"]
+        result = plugin.run_action("rebuild", {"accelerator": "https://pro.op5.de5.net"})
 
-    def test_one_task_failing_does_not_block_the_rest(self):
+        assert result["success"] is True
+        assert ran == ["https://pro.op5.de5.net"]
+        assert plugin.get_config()["accelerator_prefix"] == "https://pro.op5.de5.net"
+
+    def test_rebuild_to_no_accelerator(self, monkeypatch):
+        plugin = self._plugin(monkeypatch, accelerator_prefix="https://pro.pili.cc.cd")
+        plugin._ANiStrmHub__refresh_subscription_task = lambda: None
+        assert plugin.run_action("rebuild", {"accelerator": ""})["success"] is True
+        assert plugin._accelerator_prefix == ""
+
+    def test_rebuild_rejects_target_not_in_list(self, monkeypatch):
+        plugin = self._plugin(monkeypatch)
+        result = plugin.run_action("rebuild", {"accelerator": "https://evil.example"})
+        assert result["success"] is False
+        assert plugin._accelerator_prefix == ""
+
+    def test_unknown_action_rejected(self, monkeypatch):
+        assert self._plugin(monkeypatch).run_action("format_disk")["success"] is False
+
+    def test_second_task_rejected_while_one_is_running(self):
         plugin = ANiStrmHub()
-        order = []
+        plugin.init_plugin({})
+        assert plugin._maintenance_lock.acquire(blocking=False)
+        try:
+            started, message = plugin.start_maintenance("detect", "连通性检测", lambda: None)
+            assert started is False and "已有维护任务在运行" in message
+        finally:
+            plugin._maintenance_lock.release()
+
+    def test_failing_task_records_error_and_releases_lock(self, monkeypatch):
+        plugin = self._plugin(monkeypatch)
 
         def boom():
-            raise RuntimeError("炸了")
+            raise RuntimeError("磁盘满了")
 
-        pending = [
-            ("refresh_subscription", "重建直链", boom),
-            ("backfill", "补全历史剧集", lambda: order.append("backfill")),
-        ]
+        started, _ = plugin.start_maintenance("backfill", "补全历史剧集", boom)
+        assert started is True
+        assert "任务异常终止" in plugin.get_data("task_status")["backfill"]["summary"]
+        assert plugin._maintenance_lock.acquire(blocking=False)
 
-        getattr(plugin, "_ANiStrmHub__run_pending_tasks")(pending)
+    def test_page_has_route_buttons_and_other_actions(self):
+        plugin = ANiStrmHub()
+        plugin.init_plugin({"accelerator_prefix": "https://pro.pili.cc.cd"})
+        page = plugin.get_page()
+        buttons = []
 
-        assert order == ["backfill"]
-        assert "任务异常终止" in plugin.get_data("task_status")["refresh_subscription"]["summary"]
+        def walk(node):
+            if isinstance(node, dict):
+                if node.get("component") == "VBtn" and "events" in node:
+                    buttons.append(node)
+                for value in node.values():
+                    walk(value)
+            elif isinstance(node, list):
+                for item in node:
+                    walk(item)
+
+        walk(page)
+        rebuild = [b for b in buttons if b["events"]["click"]["api"] == "plugin/ANiStrmHub/action/rebuild"]
+        targets = [b["events"]["click"]["params"]["accelerator"] for b in rebuild]
+        assert targets == ["", "https://pro.pili.cc.cd", "https://pro.op5.de5.net"]
+        current = next(b for b in rebuild if b["events"]["click"]["params"]["accelerator"] == "https://pro.pili.cc.cd")
+        assert current["text"].endswith("（当前）") and current["props"]["variant"] == "flat"
+        others = {b["events"]["click"]["api"].rsplit("/", 1)[1] for b in buttons} - {"rebuild"}
+        assert others == {"sync", "regroup", "backfill", "detect"}
+        assert all(b["events"]["click"]["method"] == "post" for b in buttons)
+
+    def test_buttons_disabled_while_task_running(self):
+        plugin = ANiStrmHub()
+        plugin.init_plugin({})
+        plugin._maintenance_lock.acquire()
+        try:
+            page_text = str(plugin.get_page())
+            assert "'disabled': True" in page_text and "有维护任务正在后台运行" in page_text
+        finally:
+            plugin._maintenance_lock.release()
+
+    def test_config_form_has_no_maintenance_switches(self):
+        plugin = ANiStrmHub()
+        plugin.init_plugin({})
+        form, model = plugin.get_form()
+        for key in ("refresh_subscription_once", "regroup_once", "backfill_once", "detect_once"):
+            assert key not in str(form) and key not in model
 
 
 class TestBackfillTask:
@@ -1762,6 +1833,7 @@ class _RelayHarness:
         for api in plugin.get_api():
             api = dict(api)
             api.pop("allow_anonymous", None)
+            api.pop("auth", None)
             api["path"] = f"/api/v1/plugin/ANiStrmHub{api['path']}"
             app.add_api_route(**api)
         return TestClient(app, client=(client_ip, 50000))
@@ -1769,15 +1841,14 @@ class _RelayHarness:
 
 
 class TestLocalRelay(_RelayHarness):
-    def test_disabled_registers_no_api(self):
+    def test_disabled_registers_only_action_api(self):
         plugin = ANiStrmHub()
         plugin.init_plugin({})
-        assert plugin.get_api() == []
+        assert [api["path"] for api in plugin.get_api()] == ["/action/{name}"]
 
     def test_enabled_registers_anonymous_relay_route(self):
-        api = self._plugin().get_api()
-        assert api[0]["path"] == "/relay/{path:path}"
-        assert api[0]["allow_anonymous"] is True and set(api[0]["methods"]) == {"GET", "HEAD"}
+        relay = next(api for api in self._plugin().get_api() if api["path"] == "/relay/{path:path}")
+        assert relay["allow_anonymous"] is True and set(relay["methods"]) == {"GET", "HEAD"}
 
     def test_lan_address_prefix_has_no_token(self):
         plugin = self._plugin(relay_token="abc123")
@@ -1785,8 +1856,17 @@ class TestLocalRelay(_RelayHarness):
         assert self._plugin(relay_address="").relay_prefix() is None
 
     def test_public_address_prefix_carries_token(self):
-        plugin = self._plugin(relay_token="abc123", relay_address="https://mp.example.com:8443")
-        assert plugin.relay_prefix() == "https://mp.example.com:8443/api/v1/plugin/ANiStrmHub/relay/abc123"
+        plugin = self._plugin(relay_token="abcDEF123456", relay_address="https://mp.example.com:8443")
+        assert plugin.relay_prefix() == "https://mp.example.com:8443/api/v1/plugin/ANiStrmHub/relay/abcDEF123456"
+
+    @pytest.mark.parametrize("token", ["", "short", "has space in it!!", "../../etc/passwd00"])
+    def test_invalid_token_is_regenerated(self, token):
+        plugin = self._plugin(relay_token=token)
+        assert plugin._relay_token != token and len(plugin._relay_token) >= 12
+
+    def test_browser_generated_token_is_kept(self):
+        # 配置页「重置密钥」在浏览器里生成 16 位新密钥，保存时应原样采用
+        assert self._plugin(relay_token="Hk7mQ2xZpR9wLc4v")._relay_token == "Hk7mQ2xZpR9wLc4v"
 
     @pytest.mark.parametrize(
         "host,expected",
@@ -1934,7 +2014,7 @@ class TestLocalRelay(_RelayHarness):
     def test_relay_row_tagged_in_form(self):
         plugin = self._plugin()
         form_text = str(plugin.get_form()[0])
-        assert "'text': '本地中转'" in form_text and "经局域网代理转发" in form_text
+        assert "'text': '本地中转'" in form_text and "'text': '局域网免密钥'" in form_text
 
 
 class TestV2Compatibility:
@@ -1980,7 +2060,7 @@ class TestV2Compatibility:
 
         plugin = v2.ANiStrmHub()
         plugin.init_plugin({"relay_enabled": True, "relay_address": "http://192.168.1.10:3000"})
-        assert plugin.get_api()[0]["path"] == "/relay/{path:path}"
+        assert "/relay/{path:path}" in [api["path"] for api in plugin.get_api()]
         plugin.get_form()
         plugin.get_page()
 
@@ -2035,7 +2115,8 @@ class TestRelayAccessControl(_RelayHarness):
     def test_form_has_readonly_token_and_reset_button_without_public_switch(self):
         form_text = str(self._plugin().get_form()[0])
         assert "'model': 'relay_token'" in form_text and "'readonly': True" in form_text
-        assert "relay_token = '';" in form_text
+        # 回归：重置密钥此前只是清空，保存后才生成，页面上看不到新密钥
+        assert "'onClick:appendInner'" in form_text and "crypto.getRandomValues" in form_text
         assert "relay_public" not in form_text
 
 
@@ -2120,3 +2201,37 @@ class TestRelayProbeTimeout:
         service.probe_latency_ms("http://192.168.1.10:3000/api/v1/plugin/ANiStrmHub/relay/resources.ani.rip/2026-7/x")
         service.probe_latency_ms("https://pro.pili.cc.cd/resources.ani.rip/2026-7/x")
         assert seen == [module.RELAY_PROBE_TIMEOUT_SECONDS, None]
+
+
+class TestDisplayShortening:
+    def test_relay_url_shown_as_scheme_and_host(self):
+        url = "https://mp.example.com:8443/api/v1/plugin/ANiStrmHub/relay/Hk7mQ2xZpR9wLc4v"
+        assert ANiStrmHub.short_url(url) == "https://mp.example.com:8443"
+        assert ANiStrmHub.short_url("https://pro.pili.cc.cd") == "https://pro.pili.cc.cd"
+
+    def test_manager_row_is_single_line_with_full_url_tooltip(self):
+        plugin = ANiStrmHub()
+        plugin.init_plugin({"relay_enabled": True, "relay_address": "https://mp.example.com:8443", "relay_token": "Hk7mQ2xZpR9wLc4v"})
+        form_text = str(plugin.get_form()[0])
+        assert "'title': 'https://mp.example.com:8443/api/v1/plugin/ANiStrmHub/relay/Hk7mQ2xZpR9wLc4v'" in form_text
+        assert "'text': 'https://mp.example.com:8443'" in form_text
+        assert "text-truncate" in form_text
+
+
+class TestSpeedMeasurementTiming:
+    def test_time_cap_counts_from_first_byte(self, monkeypatch):
+        # 回归：冷启动首包慢时，时长上限从发起请求算会在首包到达后立即停止，速度被严重低估
+        import app.plugins.anistrmhub as module
+
+        clock = iter([0.0, 13.0, 13.5, 14.0, 14.5, 15.0, 15.0])
+        monkeypatch.setattr(module.time, "monotonic", lambda: next(clock))
+        chunks = [MP4_MAGIC_CONTENT + b"x" * (64 * 1024 - len(MP4_MAGIC_CONTENT))] + [b"x" * 64 * 1024] * 4
+        request_utils = MagicMock()
+        request_utils.get_res.return_value = _stream_response(chunks)
+        service = StrmRelinkService(request_factory=lambda **kwargs: request_utils)
+
+        result = service.measure_playback("https://slow-start.example/ep.mp4")
+
+        assert result["first_byte_ms"] == 13000.0
+        # 首包后 2 秒读完 4 块共 256KB，约 128KB/s；按旧逻辑只会读到首块就停
+        assert result["speed_kbps"] == pytest.approx(128.0, rel=0.05)
