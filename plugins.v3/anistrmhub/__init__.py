@@ -134,6 +134,11 @@ REBUILD_PROBE_SAMPLES = 3
 # 不是「线路不通」，不能计入连续失败熔断，检测时也不能拿它当样本(否则误报所有线路不可达)
 MISSING_RESOURCE_REASONS = ("HTTP 404", "HTTP 410")
 DETECT_SAMPLE_CANDIDATES = 5
+# 已生成剧集记录的上限：每部番每周一集，5000 条足够覆盖多年；超出时丢弃最早的记录
+GENERATED_RECORD_LIMIT = 5000
+# 详情页「已删除的剧集」最多列出的剧数，其余只显示数量，避免页面过长
+DELETED_SERIES_SHOWN = 10
+UNKNOWN_SERIES = "未识别剧名"
 # 本地中转拒绝/失败类告警的最短间隔：媒体服务器扫库时会对大量旧链接发请求，
 # 逐条告警会刷屏(0.8.0 时期出现过单次任务近 5000 行日志)
 RELAY_WARN_INTERVAL_SECONDS = 60
@@ -143,7 +148,7 @@ class ANiStrmHub(_PluginBase):
     plugin_name = "ANiStrmHub"
     plugin_desc = "开箱即用的ANi新番strm生成：内置已加速订阅源，也可选官方源自配加速或本地中转；mp刮削入库，媒体服务器直连播放"
     plugin_icon = "https://raw.githubusercontent.com/oiloveio/MoviePilot-Plugins/main/icons/anistrmhub.png"
-    plugin_version = "0.14.1"
+    plugin_version = "0.15.0"
     plugin_author = "oiloveio"
     author_url = "https://github.com/oiloveio"
     plugin_config_prefix = "anistrmhub_"
@@ -302,6 +307,7 @@ class ANiStrmHub(_PluginBase):
         "regroup": ("regroup", "重建目录结构", "_ANiStrmHub__regroup_local_strm_task"),
         "backfill": ("backfill", "补全历史剧集", "_ANiStrmHub__backfill_task"),
         "detect": ("detect", "连通性检测", "_ANiStrmHub__detect_task"),
+        "restore": ("restore", "恢复已删除剧集", "_ANiStrmHub__restore_task"),
     }
 
     def run_action(self, name: str, payload: Optional[Dict[str, Any]] = Body(default=None)) -> Dict[str, Any]:
@@ -324,7 +330,13 @@ class ANiStrmHub(_PluginBase):
             self._accelerator_prefix = accelerator
             self.__update_config()
             logger.info(f"ANiStrmHub重建直链：目标线路设为 {self.log_url(accelerator) or '不加速（订阅源原始链接）'}")
-        started, message = self.start_maintenance(task_key, label, getattr(self, method))
+        func = getattr(self, method)
+        if name == "restore":
+            series = str((payload or {}).get("series") or "")
+            if series not in self.__deleted_episodes():
+                return self.__envelope(False, "这部剧已没有需要恢复的集数，请刷新页面")
+            func = lambda: getattr(self, method)(series)  # noqa: E731
+        started, message = self.start_maintenance(task_key, label, func)
         return self.__envelope(started, message)
 
     @staticmethod
@@ -549,14 +561,24 @@ class ANiStrmHub(_PluginBase):
         total_exists = 0
         total_failed = 0
         total_skipped = 0
+        total_deleted = 0
+        generated = self.__load_generated()
+        local_names = self.__local_strm_names()
+        now = self.__now_text()
         for entry in entries:
             title = entry["title"]
+            name = StrmFileService.safe_file_name(title)
             if StrmFileService.is_subtitle_file(title):
                 total_skipped += 1
                 continue
             if StrmFileService.is_blacklisted(title, NON_EPISODE_BLACKLIST):
                 logger.info(f"ANiStrmHub订阅同步：标题命中非正片关键词，跳过：{title}")
                 total_skipped += 1
+                continue
+
+            if name in generated and local_names is not None and name not in local_names:
+                # 生成过、现在不在目录里：用户删掉了或被「媒体整理」移走，不再重新生成
+                total_deleted += 1
                 continue
 
             relative_dir = self.__resolve_relative_dir(title)
@@ -577,10 +599,13 @@ class ANiStrmHub(_PluginBase):
                 total_exists += 1
             else:
                 total_failed += 1
+            if status in ("created", "exists"):
+                generated[name] = {"link": entry["link"], "at": (generated.get(name) or {}).get("at") or now}
+        self.__save_generated(generated)
 
         summary = (
             f"订阅源{used_source}共{len(entries)}条，新增={total_created}，"
-            f"跳过(已存在)={total_exists}，跳过(附属文件)={total_skipped}，失败={total_failed}"
+            f"跳过(已存在)={total_exists}，跳过(已删除)={total_deleted}，跳过(附属文件)={total_skipped}，失败={total_failed}"
         )
         logger.info(f"ANiStrmHub订阅同步完成：{summary}")
         self.__save_task_status("task", "done", summary)
@@ -876,6 +901,7 @@ class ANiStrmHub(_PluginBase):
 
         total_probed = 0
         total_created = 0
+        generated = self.__load_generated()
 
         for min_ep, ref_file in series_min_ep.values():
             if total_probed >= max_probes_total:
@@ -900,9 +926,9 @@ class ANiStrmHub(_PluginBase):
                 if not candidate_title:
                     break
                 candidate_path = ref_file.with_name(f"{candidate_title}.strm")
-                if candidate_path.exists():
-                    # 这一集本地已经有了(之前补过/正常拉过)，不用重新探测，
-                    # 继续往前查更早的集数
+                if candidate_path.exists() or candidate_title in generated:
+                    # 这一集本地已经有了(之前补过/正常拉过)，或生成过又被用户删掉，
+                    # 不用重新探测，继续往前查更早的集数
                     continue
 
                 season_candidates: List[str] = []
@@ -935,6 +961,7 @@ class ANiStrmHub(_PluginBase):
                     if latency_ms is not None:
                         try:
                             candidate_path.write_text(final_link, encoding="utf-8")
+                            generated[candidate_title] = {"link": candidate_link, "at": self.__now_text()}
                             total_created += 1
                             found = True
                             current_season = season_option
@@ -957,9 +984,89 @@ class ANiStrmHub(_PluginBase):
                     )
                     break
 
+        if total_created:
+            self.__save_generated(generated)
         summary = f"探测{total_probed}次，成功补齐{total_created}集"
         logger.info(f"ANiStrmHub补全历史剧集完成：{summary}")
         self.__save_task_status("backfill", "done", summary)
+
+    @staticmethod
+    def __now_text() -> str:
+        return datetime.now(tz=pytz.timezone(settings.TZ)).strftime("%Y-%m-%d %H:%M:%S")
+
+    def __load_generated(self) -> Dict[str, Dict[str, str]]:
+        """插件生成过的剧集：文件名 -> {订阅源给出的原始直链, 首次生成时间}。
+        用来区分「从没生成过」和「生成过又被删掉」：后者订阅同步不再重新生成。
+        记录与存储目录绑定，换了存储目录按全新目录处理"""
+        record = self.get_data("generated_episodes") or {}
+        if record.get("storage") != self._storageplace:
+            return {}
+        return dict(record.get("items") or {})
+
+    def __save_generated(self, items: Dict[str, Dict[str, str]]) -> None:
+        if len(items) > GENERATED_RECORD_LIMIT:
+            newest = sorted(items.items(), key=lambda kv: kv[1].get("at", ""), reverse=True)
+            items = dict(newest[:GENERATED_RECORD_LIMIT])
+        self.save_data("generated_episodes", {"storage": self._storageplace, "items": items})
+
+    def __local_strm_names(self) -> Optional[Set[str]]:
+        """存储目录下所有 strm 的文件名(不含后缀)。目录不存在时返回 None：
+        可能是硬盘或网络盘没挂载，不能据此把全部剧集当成「已删除」"""
+        if not self._storageplace:
+            return None
+        directory = Path(self._storageplace)
+        if not directory.is_dir():
+            return None
+        return {path.stem for path in directory.rglob("*.strm")}
+
+    def __deleted_episodes(self) -> Dict[str, List[str]]:
+        """生成过、但已不在存储目录里的剧集，按剧名分组；组内按集名排序，
+        组按最近一次生成时间倒序(最近删掉的通常是最近在追的)"""
+        generated = self.__load_generated()
+        local_names = self.__local_strm_names()
+        if not generated or local_names is None:
+            return {}
+        groups: Dict[str, List[str]] = {}
+        latest: Dict[str, str] = {}
+        for name, info in generated.items():
+            if name in local_names:
+                continue
+            series = StrmFileService.extract_series_title(name) or UNKNOWN_SERIES
+            groups.setdefault(series, []).append(name)
+            latest[series] = max(latest.get(series, ""), (info or {}).get("at", ""))
+        return {
+            series: sorted(groups[series])
+            for series in sorted(groups, key=lambda key: latest[key], reverse=True)
+        }
+
+    def __restore_task(self, series: str) -> None:
+        """把一部剧里生成过又被删掉的集数按当前线路重新生成。误删时用；
+        主动删掉的不点就不会回来"""
+        self.__save_task_status("restore", "running", "进行中")
+        names = self.__deleted_episodes().get(series) or []
+        if not names:
+            self.__save_task_status("restore", "done", f"{series}：没有需要恢复的集数")
+            return
+        generated = self.__load_generated()
+        unreachable_reason = self.__check_accelerator_for_this_run(generated[names[0]]["link"])
+        if unreachable_reason:
+            self.__save_task_status("restore", "done", f"{series}：当前加速源不可达，未恢复：{unreachable_reason}")
+            return
+        created = failed = 0
+        for name in names:
+            status = self._strm_service.touch_strm_file(
+                storage_path=self._storageplace,
+                file_name=name,
+                file_url=StrmRelinkService.compose_link(generated[name]["link"], self._accelerator_prefix),
+                relative_dir=self.__resolve_relative_dir(name),
+            )
+            if status in ("created", "exists"):
+                created += 1
+            else:
+                failed += 1
+        summary = f"{series}：恢复{created}集" + (f"，失败{failed}集" if failed else "")
+        logger.info(f"ANiStrmHub恢复已删除剧集：{summary}")
+        self.__save_task_status("restore", "done", summary)
 
     def __detect_task(self):
         """分两层检测，两层回答的是不同问题：
@@ -1945,6 +2052,7 @@ class ANiStrmHub(_PluginBase):
         "regroup": "重建目录结构",
         "backfill": "补全历史剧集",
         "detect": "连通性检测",
+        "restore": "恢复已删除剧集",
     }
 
     @staticmethod
@@ -2224,12 +2332,60 @@ class ANiStrmHub(_PluginBase):
             ],
         }
 
+    def __deleted_card(self, groups: Dict[str, List[str]]) -> dict:
+        """详情页「已删除的剧集」：生成过、现在不在存储目录里的剧集。订阅同步不会再
+        生成它们，误删的在这里按剧恢复"""
+        busy = self._maintenance_lock.locked()
+        rows: List[dict] = []
+        for series, names in list(groups.items())[:DELETED_SERIES_SHOWN]:
+            rows.append(
+                {
+                    "component": "div",
+                    "props": {"class": "d-flex align-center"},
+                    "content": [
+                        {
+                            "component": "span",
+                            "props": {"class": "text-body-2 text-truncate flex-grow-1 me-2 mb-2"},
+                            "text": f"{series} · {len(names)} 集",
+                        },
+                        self.__action_button("恢复", "restore", {"series": series}, size="small", variant="tonal", disabled=busy),
+                    ],
+                }
+            )
+        hidden = len(groups) - DELETED_SERIES_SHOWN
+        if hidden > 0:
+            rows.append(
+                {
+                    "component": "div",
+                    "props": {"class": "text-caption text-medium-emphasis"},
+                    "text": f"另有 {hidden} 部剧未列出（按最近生成时间排序）",
+                }
+            )
+        total = sum(len(names) for names in groups.values())
+        return {
+            "component": "VCard",
+            "props": {"class": "mb-4"},
+            "content": [
+                {"component": "VCardTitle", "text": f"已删除的剧集（{len(groups)} 部 {total} 集）"},
+                {
+                    "component": "VCardSubtitle",
+                    "props": {"style": "white-space: normal;"},
+                    "text": "插件生成过、但现在不在存储目录里的剧集（手动删除，或被「媒体整理」移走）。"
+                    "订阅同步不会再自动生成它们；误删的点「恢复」，按当前线路重新生成这部剧被删掉的集数",
+                },
+                {"component": "VCardText", "content": rows},
+            ],
+        }
+
     def get_page(self) -> List[dict]:
         local_distribution = self.get_data("local_distribution") or {}
         if not local_distribution and self._storageplace:
             # 还没有统计过：当场扫一次本地 strm(只读文件，不发网络请求)，让维护操作区直接看到分布
             local_distribution = StrmRelinkService.scan_local_distribution(self._storageplace, self._accelerator_prefix)
         content: List[dict] = [self.__action_card(local_distribution)]
+        deleted_groups = self.__deleted_episodes()
+        if deleted_groups:
+            content.append(self.__deleted_card(deleted_groups))
 
         task_status = self.get_data("task_status") or {}
         if task_status:
@@ -2463,6 +2619,11 @@ class StrmFileService:
         目录，不做过度清洗。"""
         return name.replace("/", "_").replace("\\", "_").strip()
 
+    @staticmethod
+    def safe_file_name(title: str) -> str:
+        """标题转 strm 文件名(不含后缀)，只挡路径分隔符"""
+        return title.replace("/", "_").replace("\\", "_")
+
     def touch_strm_file(
         self,
         storage_path: str,
@@ -2474,7 +2635,7 @@ class StrmFileService:
             logger.error("创建strm源文件失败：未配置存储目录")
             return "failed"
 
-        safe_name = file_name.replace("/", "_").replace("\\", "_")
+        safe_name = self.safe_file_name(file_name)
         # RSS里的link本身就是可直接请求的直链(通常带?d=mp4参数)，不要对其做后缀改写，
         # 改写会导致目标站点路由不到实际资源(404)——已实测踩过这个坑
         src_url = file_url

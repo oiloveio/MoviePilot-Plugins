@@ -4,6 +4,7 @@
 在宿主虚拟环境下运行：../MoviePilot/.venv/bin/python -m pytest tests/v3/anistrmhub
 宿主之外运行时由同目录的 conftest.py 注入 app.* 替身模块，用法见其说明。
 """
+import json
 import time
 from pathlib import Path
 from unittest.mock import MagicMock
@@ -2506,3 +2507,96 @@ class TestMissingResourceHandling:
         assert "资源已下架(保留原文件)=15" in summary and "路径迁移更新=10" in summary
         assert all(f.read_text().startswith("https://resources.ani.rip/") for f in tmp_path.glob("a*.strm"))
         assert all(f.read_text().startswith("https://pro.pili.cc.cd/") for f in tmp_path.glob("b*.strm"))
+
+
+class TestGeneratedEpisodeRecord:
+    """生成过又被删掉的剧集，订阅同步不再重新生成；误删可在详情页按剧恢复"""
+
+    def _plugin(self, tmp_path, entries, accelerator=""):
+        plugin = ANiStrmHub()
+        plugin.init_plugin({"subscription_source": "https://api.ani.rip/ani-download.xml", "storageplace": str(tmp_path)})
+        plugin._accelerator_prefix = accelerator
+        plugin._client.fetch_one_source = MagicMock(return_value=entries)
+        plugin._relink_service.probe_latency_ms = MagicMock(return_value=(50.0, None))
+        return plugin
+
+    @staticmethod
+    def _entries():
+        return [
+            {"title": f"[ANi] 测试番 - {i:02d} [1080P][Baha][WEB-DL][AAC AVC][CHT].mp4",
+             "link": f"https://resources.ani.rip/2026-7/ep{i}?d=mp4"}
+            for i in (1, 2)
+        ]
+
+    def _sync(self, plugin):
+        getattr(plugin, "_ANiStrmHub__task")()
+        return plugin.get_data("task_status")["task"]["summary"]
+
+    def test_deleted_episode_not_regenerated(self, tmp_path):
+        plugin = self._plugin(tmp_path, self._entries())
+        assert "新增=2" in self._sync(plugin)
+        victim = next(tmp_path.rglob("*01*.strm"))
+        victim.unlink()
+
+        summary = self._sync(plugin)
+        assert "新增=0" in summary and "跳过(已删除)=1" in summary
+        assert not victim.exists()
+
+    def test_restore_brings_back_with_current_route(self, tmp_path):
+        plugin = self._plugin(tmp_path, self._entries())
+        self._sync(plugin)
+        for path in tmp_path.rglob("*.strm"):
+            path.unlink()
+        groups = getattr(plugin, "_ANiStrmHub__deleted_episodes")()
+        assert list(groups) == ["测试番"] and len(groups["测试番"]) == 2
+
+        plugin._accelerator_prefix = "https://pro.pili.cc.cd"
+        getattr(plugin, "_ANiStrmHub__restore_task")("测试番")
+
+        restored = sorted(tmp_path.rglob("*.strm"))
+        assert len(restored) == 2
+        assert restored[0].read_text().startswith("https://pro.pili.cc.cd/resources.ani.rip/2026-7/ep1")
+        assert getattr(plugin, "_ANiStrmHub__deleted_episodes")() == {}
+
+    def test_restore_action_rejects_unknown_series(self, tmp_path):
+        plugin = self._plugin(tmp_path, self._entries())
+        self._sync(plugin)
+        result = plugin.run_action("restore", {"series": "不存在的剧"})
+        assert result["success"] is False and set(result) == {"success", "message", "data"}
+
+    def test_new_episode_still_generated(self, tmp_path):
+        plugin = self._plugin(tmp_path, self._entries()[:1])
+        self._sync(plugin)
+        plugin._client.fetch_one_source.return_value = self._entries()
+        assert "新增=1" in self._sync(plugin)
+
+    def test_storage_change_starts_fresh(self, tmp_path):
+        first, second = tmp_path / "a", tmp_path / "b"
+        first.mkdir()
+        second.mkdir()
+        plugin = self._plugin(first, self._entries())
+        self._sync(plugin)
+        plugin._storageplace = str(second)
+        assert "新增=2" in self._sync(plugin)
+
+    def test_unmounted_storage_not_treated_as_deleted(self, tmp_path):
+        # 存储目录暂时不在(硬盘或网络盘没挂载)时，不能把全部剧集当成已删除
+        storage = tmp_path / "media"
+        storage.mkdir()
+        plugin = self._plugin(storage, self._entries())
+        self._sync(plugin)
+        for path in storage.rglob("*"):
+            if path.is_file():
+                path.unlink()
+        for path in sorted(storage.rglob("*"), reverse=True):
+            path.rmdir()
+        storage.rmdir()
+        assert getattr(plugin, "_ANiStrmHub__deleted_episodes")() == {}
+
+    def test_page_lists_deleted_series(self, tmp_path):
+        plugin = self._plugin(tmp_path, self._entries())
+        self._sync(plugin)
+        next(tmp_path.rglob("*01*.strm")).unlink()
+        page = json.dumps(plugin.get_page(), ensure_ascii=False)
+        assert "已删除的剧集（1 部 1 集）" in page and "测试番 · 1 集" in page
+        assert "plugin/ANiStrmHub/action/restore" in page
