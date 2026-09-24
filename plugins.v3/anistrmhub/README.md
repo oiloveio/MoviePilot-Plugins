@@ -9,6 +9,7 @@ fork 自 [honue/MoviePilot-Plugins](https://github.com/honue/MoviePilot-Plugins)
 - **订阅同步**：按执行周期抓取订阅源，为新集生成 strm
 - **订阅源与加速源**：各自维护一份地址列表，在下拉框输入新地址即可添加，列表中每项都可设为当前或删除，并以标签标注「内置 / 自定义」及说明。首次安装预填已加速的镜像订阅源（默认，开箱即用）、ANi 官方订阅源和两个加速节点；内置地址失效时直接删除、换成新地址即可，不依赖插件更新。用哪个由用户选，插件不在后台自动切换
 - **加速源的作用范围**：只作用于 strm 中的视频播放链接，用于提升媒体服务器的播放速度，不作用于订阅源（RSS）的获取
+- **本地中转**：媒体服务器（如飞牛影视）本身不走代理、打不开需要翻墙的视频链接时，strm 改为指向 MoviePilot 的局域网地址，由 MoviePilot 经局域网代理拉取视频再转发，支持拖动进度，媒体服务器无需任何代理设置
 - **存放方式**：平铺存放，或按剧集分目录（每部剧一个文件夹）
 - **本地 strm 维护**：重建直链、重建目录结构
 - **补全历史剧集**：回溯找回 RSS 滚动窗口之外的老集数
@@ -31,6 +32,9 @@ fork 自 [honue/MoviePilot-Plugins](https://github.com/honue/MoviePilot-Plugins)
 | 当前订阅源 | 下拉选择已保存的订阅源，每项第二行显示「内置 / 自定义」及说明；也可直接输入新的 RSS 地址，保存后自动加入列表。留空时使用列表第一条 |
 | 拉取季度筛选 | 只处理 RSS 当前窗口内指定季度的条目，默认不筛选 |
 | 当前加速源 | 下拉选择已保存的加速源，或直接输入新的反代前缀，保存后自动加入列表。留空 = 直接使用订阅源给出的视频链接 |
+| 启用本地中转 | 开启后在 MoviePilot 内注册视频转发接口，并把中转地址加入加速源列表（标签「本地中转」），设为当前加速源后生效 |
+| MoviePilot 局域网地址 | 媒体服务器能访问到的 MoviePilot 地址，即平时打开 MoviePilot 网页的地址，如 `http://192.168.1.10:3000` |
+| 中转代理 | 中转拉取视频时使用的代理。留空使用 MoviePilot 的代理设置；也可填 `http://IP:端口` 或 `socks5://IP:端口` |
 | 已保存的地址 | 订阅源、加速源下方各一份列表。每行显示地址、标签（内置 / 自定义、名称、是否已加速、当前使用），可「设为当前」或删除，删除后点保存生效；列表删空后不会被自动补回 |
 
 内置地址（首次安装预填）：
@@ -95,6 +99,22 @@ ANi 直链的结构是 `{线路前缀}/{季度}/{文件名}?d=mp4`，其中 `季
 镜像链接上直接叠加速源会叠出 `pro.op5.de5.net/pro.pili.cc.cd/resources.ani.rip/...` 这样的两层壳，第 2 步的先剥后套就是为此。
 
 加速源在每次拉取开始时用当次样本直链实测一次：测不通则本次不生成、在运行状态中写明原因，下次定时运行再试，不会改用其他线路生成。这一步只判断通不通，线路快慢由连通性检测负责。
+
+### 本地中转：给不走代理的媒体服务器用
+
+strm 由媒体服务器直接访问。飞牛影视这类媒体服务器本身不走代理，而 ANi 官方直链（`resources.ani.rip` → `cloud.ani-download.workers.dev`）在大陆网络下通常需要代理才能访问，社区加速节点也可能不稳定。本地中转把"走代理"这一步挪到 MoviePilot：
+
+```text
+飞牛影视 ──局域网──▶ MoviePilot /api/v1/plugin/ANiStrmHub/relay/resources.ani.rip/... ──代理──▶ ANi 官方
+```
+
+- **接入方式**：中转地址 `{MoviePilot 局域网地址}/api/v1/plugin/ANiStrmHub/relay` 作为一条加速源，与其他加速源用同一套 `compose_link()` 拼接，strm 内容为 `http://192.168.1.10:3000/api/v1/plugin/ANiStrmHub/relay/resources.ani.rip/2026-7/xxx?d=mp4`。挂在 MoviePilot 已有的网页端口上，不需要额外开放或映射端口
+- **转发**：`relay_video()` 经中转代理向上游发起流式请求，按 256KB 分块转发，边收边发，不落盘。上游的跳转在 MoviePilot 这一侧经代理完成，媒体服务器无感知
+- **拖动进度与文件大小**：上游对象存储对 Range 请求只返回 `Content-Range`，不带 `Content-Length` 与 `Accept-Ranges`，媒体服务器因此拿不到文件大小。中转一律以 Range 向上游请求：客户端带 Range 时原样转发并按 `Content-Range` 补齐本段长度；不带 Range 时向上游取 `bytes=0-`，按 200 返回整个文件并给出文件总大小；HEAD 只向上游取 1 字节，读出文件总大小
+- **安全**：接口需要免登录（`allow_anonymous`），因为媒体服务器无法携带 MoviePilot 的 API 密钥。为避免成为开放代理，只接受局域网来源的请求（经 MoviePilot 自带 nginx 转发时按 `X-Real-IP` 判断），且只转发 `resources.ani.rip` 下"季度/文件名"结构的地址，其余一律返回 403
+- **文件名编码**：从请求的原始路径（`raw_path`）截取上游地址，不做解码再编码，保证文件名与 ANi 官方地址逐字节一致
+
+已用真实网络验证：经中转读取的起始片段为标准 mp4 头（`ftyp`）；从 200MB 处读取的 2MB 与直连结果逐字节一致；`ffprobe` 经中转正确识别出 1080P H.264 + AAC、时长 24 分钟、文件大小 435MB。
 
 ### 连通性检测：订阅源与播放线路分开测
 
@@ -194,15 +214,26 @@ strm 生成在插件配置的存储地址（如 `/downloads/strm`），通过目
 
 Clash 侧记得为 `resources.ani.rip`、`aniopen.an-i.workers.dev` 配置代理规则。
 
+### 媒体服务器不走代理时：本地中转
+
+以飞牛影视为例（MoviePilot 与代理服务都部署在同一台 NAS 上）：
+
+1. 确认 MoviePilot 的代理服务器设置（配置项 `PROXY_HOST`）已指向局域网代理，例如 `http://192.168.1.2:7890`；也可以不改 MoviePilot 的设置，在插件的「中转代理」里单独填写
+2. 插件配置页「加速源 → 本地中转」：开启「启用本地中转」，「MoviePilot 局域网地址」填平时打开 MoviePilot 网页的地址，例如 `http://192.168.1.10:3000`，保存
+3. 重新打开配置页，在加速源列表中把标签为「本地中转」的地址「设为当前」，保存
+4. 勾选「连通性检测」确认本地中转线路可达，再勾选「重建直链」把已有 strm 改为经本地中转播放
+
 ### 自建反代当加速源
 
-社区加速源（pili/op5 这类免费部署的 Cloudflare Worker）天然不稳定。可以用 GOST、Nginx 等工具自建一个 "Proxy Everything" 风格的反向代理，把反代地址直接填进「加速源」，用法与社区加速源完全一致——网络层转发交给专业工具，插件不需要额外支持。
+社区加速源（pili/op5 这类免费部署的 Cloudflare Worker）天然不稳定。也可以用 GOST、Nginx 等工具自建一个 "Proxy Everything" 风格的反向代理，把反代地址输入到「加速源」，用法与社区加速源完全一致。
 
 ## 已知限制
 
 - **不能补历史季度**：「拉取季度筛选」只能在 RSS 当前滚动窗口（近期约 50~60 条）里筛选。原版依赖的目录扫描接口（`openani.an-i.workers.dev`）已确认 429 限流失效，现有可用镜像（pili/op5）也未实现该协议——POST 目录接口返回的是普通网页而非 JSON，"全量补季度"没有可用的接口基础
 - **详情页是缓存快照**：`get_page()` 与 `get_form()` 一样是静态 Vuetify 组件树，没有"点按钮调 API 刷新"的机制（需要独立打包 Vue 自定义组件并声明 `get_render_mode` 为 `vue`）。探测与展示是分开的两步：先勾探测开关，再打开详情页看结果
 - **加速源切换的识别边界**：「重建直链」通过 `extract_resource_path()` 定位与域名无关的资源路径再重建地址，因此改订阅源、改加速源或清空加速源都能正确处理，不依赖"记住"原先套的是哪个前缀
+- **本地中转只在局域网内可用**：strm 里是局域网地址，在外网直接访问媒体服务器的客户端打不开。如果外网观看是由媒体服务器在 NAS 上拉流再转给客户端，则不受影响
+- **本地中转依赖 MoviePilot 运行**：中转接口随插件注册，插件停用或 MoviePilot 重启期间，经中转的 strm 无法播放；视频流量会经过 MoviePilot
 - **测速是单点单次**：测速在 MoviePilot 主机上进行，每条线路只测一次，受当时网络波动影响；播放设备与 MoviePilot 不在同一网络时，结果只能作参考
 
 ## 技术存档
@@ -244,8 +275,15 @@ RSS 能拉到 ≠ 视频能播：RSS 端点与其给出的下载直链经常不�
 ## 开发
 
 - V3 实现位于 `plugins.v3/anistrmhub/`，导入统一走 `app.sdk.*` 稳定出口，索引见仓库根目录 `package.v3.json`
-- V2 兼容实现位于 `plugins.v2/anistrmhub/`，索引 `package.v2.json`。V2 宿主没有 `app.sdk.*`，只能用 `app.core.config`/`app.log`/`app.utils.http`，因此无法与 V3 共用源码——两份文件除 import 外逐字节一致
-- 单测位于 `tests/v3/anistrmhub/test_plugin.py`，不依赖公网状态，外部 HTTP 全部 mock
+- V2 兼容实现位于 `plugins.v2/anistrmhub/`，索引 `package.v2.json`。V2 宿主没有 `app.sdk.*`，只能用 `app.core.config`/`app.log`/`app.utils.http`，因此无法与 V3 共用源码——两份文件除这 3 行 import 外完全一致
+- V2 副本由 `tools/sync_v2.py` 从 V3 生成，只修改 V3 后运行 `python tools/sync_v2.py`；测试会检查两份是否同步，并用 V2 的旧 import 路径真实加载一次 V2 文件
+- 单测位于 `tests/v3/anistrmhub/test_plugin.py`，不依赖公网状态，外部 HTTP 全部 mock。在 MoviePilot 宿主之外运行时，同目录的 `conftest.py` 会注入 `app.*` 替身模块：
+
+  ```bash
+  python -m venv .venv
+  .venv/bin/pip install pytest apscheduler pytz fastapi httpx requests
+  .venv/bin/python -m pytest tests/v3/anistrmhub
+  ```
 
 ## 致谢
 
@@ -259,6 +297,21 @@ RSS 能拉到 ≠ 视频能播：RSS 端点与其给出的下载直链经常不�
 </div>
 
 ## 更新日志
+
+### v0.11.0
+
+**新增**
+
+- 本地中转：媒体服务器（如飞牛影视）本身不走代理、打不开需要翻墙的视频链接时，strm 改为指向 MoviePilot 的局域网地址，由 MoviePilot 经局域网代理拉取视频再转发。支持拖动进度，挂在 MoviePilot 已有端口上，不需要额外映射端口，媒体服务器无需任何代理设置
+- 「加速源 → 本地中转」设置：启用开关、MoviePilot 局域网地址、中转代理（留空使用 MoviePilot 的代理设置，支持 http / socks5）。启用后中转地址自动加入加速源列表，标签「本地中转」
+- 中转接口只接受局域网来源，且只转发 ANi 官方视频地址，避免成为开放代理
+- `tools/sync_v2.py`：由 V3 自动生成 V2 副本；测试检查两份是否同步，并用 V2 的旧 import 路径真实加载 V2 文件
+- `tests/v3/anistrmhub/conftest.py`：在 MoviePilot 宿主之外也能直接运行测试
+
+**变更**
+
+- 线路识别支持本地中转地址，本地 strm 分布中单独归类为「本地中转」，不再误判为多层套壳
+- 配置页底部说明精简为配合「目录监控」与「媒体整理」刮削入库，以及项目地址链接
 
 ### v0.10.0
 

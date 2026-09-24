@@ -1,0 +1,54 @@
+<!doctype html><html><head><meta charset="utf-8"><title>配置页预览</title>
+<link href="https://cdn.jsdelivr.net/npm/vuetify@3.7.3/dist/vuetify.min.css" rel="stylesheet">
+<link href="https://cdn.jsdelivr.net/npm/@mdi/font@7.4.47/css/materialdesignicons.min.css" rel="stylesheet">
+</head><body><div id="app"></div>
+<script src="https://cdn.jsdelivr.net/npm/vue@3.5.13/dist/vue.global.prod.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/vuetify@3.7.3/dist/vuetify.min.js"></script>
+<script>
+// parseProps / renderComponent 按 MoviePilot-Frontend v2 分支 src/components/render/FormRender.vue 逐行移植
+const { h, resolveComponent, reactive, createApp, defineComponent } = Vue
+const parseProps = (rawProps, model) => {
+  const parsedProps = {}
+  const isExpression = v => v.startsWith('{{') && v.endsWith('}}')
+  const extractExpression = v => v.slice(2, -2).trim()
+  for (const [key, value] of Object.entries(rawProps)) {
+    if (key === 'modelvalue') { parsedProps['value'] = model[value]; parsedProps['onUpdate:value'] = nv => { model[value] = nv } }
+    else if (['model', 'v-model'].includes(key)) { parsedProps['modelValue'] = model[value]; parsedProps['onUpdate:modelValue'] = nv => { model[value] = nv } }
+    else if (['show', 'v-show'].includes(key)) {
+      const expression = isExpression(value) ? extractExpression(value) : value
+      const isVisible = new Function('model', `with(model) { return ${expression} }`)(model)
+      if (!parsedProps.style) parsedProps.style = {}
+      parsedProps.style.display = isVisible ? '' : 'none'
+    } else if (key.startsWith('model:') || key.startsWith('v-model:')) {
+      const propName = key.split(':')[1]; parsedProps[propName] = model[value]; parsedProps[`onUpdate:${propName}`] = nv => { model[value] = nv }
+    } else if (key.startsWith('on')) {
+      if (typeof value === 'string') {
+        const handler = new Function('model', 'event', `try { with(model) { return (${value})(event); } } catch(e) { console.error('事件处理函数执行错误:', e); }`)
+        parsedProps[key] = (...args) => handler(model, args[0])
+      }
+    } else {
+      if (typeof value === 'string' && isExpression(value)) parsedProps[key] = new Function('model', `with(model) { return ${extractExpression(value)} }`)(model)
+      else if (typeof value === 'string' && value in model) parsedProps[key] = model[value]
+      else parsedProps[key] = value
+    }
+  }
+  return parsedProps
+}
+const renderComponent = (config, model, slotScope = {}) => {
+  const { component, props: componentProps = {}, content = [], html, text } = config
+  const Component = resolveComponent(component)
+  const parsedProps = parseProps(componentProps, model)
+  const renderContent = () => {
+    if (html) return h(Component, { innerHTML: html })
+    if (text) return typeof text === 'string' ? text : model[text]
+    if (Array.isArray(content)) return content.map(c => renderComponent(c, model, slotScope))
+    return null
+  }
+  return h(Component, parsedProps, { default: renderContent })
+}
+fetch('form.json', { cache: 'no-store' }).then(r => r.json()).then(({ form, model }) => {
+  const m = reactive(model); window.M = m
+  const FormRender = defineComponent({ props: ['config', 'model'], setup(p) { return () => renderComponent(p.config, p.model) } })
+  createApp({ render: () => h(resolveComponent('VApp'), null, { default: () => h(resolveComponent('VMain'), null, { default: () => h(resolveComponent('VContainer'), null, { default: () => form.map(c => h(FormRender, { config: c, model: m })) }) }) }) }).use(Vuetify.createVuetify()).mount('#app')
+})
+</script></body></html>

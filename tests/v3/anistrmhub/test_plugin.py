@@ -2,6 +2,7 @@
 
 按V3插件开发指南要求：普通单测不依赖公网状态，外部HTTP一律mock。
 在宿主虚拟环境下运行：../MoviePilot/.venv/bin/python -m pytest tests/v3/anistrmhub
+宿主之外运行时由同目录的 conftest.py 注入 app.* 替身模块，用法见其说明。
 """
 import time
 from pathlib import Path
@@ -1692,3 +1693,254 @@ class TestDetectTask:
         assert "播放线路测速" in page_text
         assert "2.0 MB/s" in page_text and "300 KB/s" in page_text
         assert "当前使用" in page_text and "HTTP 403" in page_text
+
+
+class _FakeUpstream:
+    def __init__(self, status_code=206, headers=None, chunks=(b"\x00\x00\x00\x18ftypmp42", b"x" * 1000)):
+        self.status_code = status_code
+        # 与真实上游一致：Range 请求只返回 Content-Range，不带 Content-Length/Accept-Ranges
+        self.headers = headers if headers is not None else {
+            "Content-Type": "video/mp4",
+            "Content-Range": "bytes 0-1015/999999",
+            "Set-Cookie": "should-not-leak",
+        }
+        self._chunks = chunks
+        self.closed = False
+
+    def iter_content(self, chunk_size=None):
+        yield from self._chunks
+
+    def close(self):
+        self.closed = True
+
+
+class _FakeRequestUtils:
+    """记录中转请求的上游参数：地址、代理、转发的请求头"""
+
+    calls = []
+    upstream = None
+
+    def __init__(self, ua=None, proxies=None, timeout=None, **kwargs):
+        self.record = {"proxies": proxies, "timeout": timeout, "headers": {}}
+
+    def update_headers(self, headers):
+        self.record["headers"].update(headers)
+
+    def get_res(self, url, **kwargs):
+        self.record.update({"url": url, **kwargs})
+        _FakeRequestUtils.calls.append(self.record)
+        return _FakeRequestUtils.upstream
+
+
+class TestLocalRelay:
+    ADDRESS = "http://192.168.1.10:3000"
+    VIDEO_PATH = "resources.ani.rip/2026-7/%5BANi%5D%20%E7%A4%BA%E4%BE%8B%20-%2001%20%5B1080P%5D.mp4"
+
+    def _plugin(self, **config):
+        plugin = ANiStrmHub()
+        plugin.init_plugin({"relay_enabled": True, "relay_address": self.ADDRESS, **config})
+        return plugin
+
+    def _client(self, plugin, monkeypatch, upstream=None, client_ip="192.168.1.50"):
+        import app.plugins.anistrmhub as module
+        from fastapi import FastAPI
+        from fastapi.testclient import TestClient
+
+        _FakeRequestUtils.calls = []
+        _FakeRequestUtils.upstream = upstream
+        monkeypatch.setattr(module, "RequestUtils", _FakeRequestUtils)
+        app = FastAPI()
+        # 与 MoviePilot 注册插件接口的方式一致：/api/v1/plugin/{插件ID}{path}
+        for api in plugin.get_api():
+            api = dict(api)
+            api.pop("allow_anonymous", None)
+            api["path"] = f"/api/v1/plugin/ANiStrmHub{api['path']}"
+            app.add_api_route(**api)
+        return TestClient(app, client=(client_ip, 50000))
+
+    def test_disabled_registers_no_api(self):
+        plugin = ANiStrmHub()
+        plugin.init_plugin({})
+        assert plugin.get_api() == []
+
+    def test_enabled_registers_anonymous_relay_route(self):
+        api = self._plugin().get_api()
+        assert api[0]["path"] == "/relay/{path:path}"
+        assert api[0]["allow_anonymous"] is True and set(api[0]["methods"]) == {"GET", "HEAD"}
+
+    def test_relay_prefix_joins_address_and_api_path(self):
+        assert self._plugin().relay_prefix() == "http://192.168.1.10:3000/api/v1/plugin/ANiStrmHub/relay"
+        assert self._plugin(relay_address="").relay_prefix() is None
+
+    def test_relay_address_added_to_accelerator_list_and_persisted(self):
+        plugin = self._plugin()
+        assert plugin.relay_prefix() in plugin._accelerator_list
+        assert plugin.relay_prefix() in plugin.get_config()["accelerator_list"]
+
+    def test_compose_link_through_relay(self):
+        prefix = self._plugin().relay_prefix()
+        link = StrmRelinkService.compose_link("https://pro.pili.cc.cd/resources.ani.rip/2026-7/ep.mp4?d=mp4", prefix)
+        assert link == f"{prefix}/resources.ani.rip/2026-7/ep.mp4?d=mp4"
+        assert StrmRelinkService.describe_route(link, prefix) == "本地中转 192.168.1.10:3000（当前配置）"
+        assert StrmRelinkService.describe_route(link, "") == "本地中转 192.168.1.10:3000"
+
+    @pytest.mark.parametrize(
+        "raw_path,query,expected",
+        [
+            ("resources.ani.rip/2026-7/ep.mp4", "d=mp4", "https://resources.ani.rip/2026-7/ep.mp4?d=mp4"),
+            ("resources.ani.rip/2026-7/ep.mp4", "", "https://resources.ani.rip/2026-7/ep.mp4"),
+            ("evil.example/2026-7/ep.mp4", "", None),
+            ("resources.ani.rip/admin", "", None),
+            ("resources.ani.rip/2026-7/../../etc/passwd", "", None),
+        ],
+    )
+    def test_relay_target_only_allows_ani_videos(self, raw_path, query, expected):
+        assert ANiStrmHub.relay_target(raw_path, query) == expected
+
+    @pytest.mark.parametrize(
+        "host,expected",
+        [("192.168.1.50", True), ("10.0.0.2", True), ("127.0.0.1", True), ("::ffff:192.168.1.2", True),
+         ("8.8.8.8", False), ("testclient", False), ("", False)],
+    )
+    def test_is_lan_client(self, host, expected):
+        assert ANiStrmHub.is_lan_client(host) is expected
+
+    def test_streams_video_and_forwards_range(self, monkeypatch):
+        upstream = _FakeUpstream()
+        client = self._client(self._plugin(), monkeypatch, upstream)
+
+        response = client.get(
+            f"/api/v1/plugin/ANiStrmHub/relay/{self.VIDEO_PATH}?d=mp4", headers={"Range": "bytes=0-1015"}
+        )
+
+        assert response.status_code == 206
+        assert response.content == b"\x00\x00\x00\x18ftypmp42" + b"x" * 1000
+        assert response.headers["content-range"] == "bytes 0-1015/999999"
+        assert response.headers["accept-ranges"] == "bytes"
+        assert response.headers["content-length"] == "1016"
+        assert "set-cookie" not in response.headers
+        call = _FakeRequestUtils.calls[0]
+        # 文件名保持原始编码，不做解码再编码
+        assert call["url"] == f"https://{self.VIDEO_PATH}?d=mp4"
+        assert call["headers"] == {"Range": "bytes=0-1015"}
+        assert call["stream"] is True
+        assert upstream.closed
+
+    def test_uses_moviepilot_proxy_by_default(self, monkeypatch):
+        import app.plugins.anistrmhub as module
+
+        monkeypatch.setattr(module.settings, "PROXY", {"http": "http://192.168.1.2:7890", "https": "http://192.168.1.2:7890"})
+        client = self._client(self._plugin(), monkeypatch, _FakeUpstream())
+        client.get(f"/api/v1/plugin/ANiStrmHub/relay/{self.VIDEO_PATH}")
+        assert _FakeRequestUtils.calls[0]["proxies"]["https"] == "http://192.168.1.2:7890"
+
+    def test_custom_relay_proxy_overrides(self, monkeypatch):
+        client = self._client(self._plugin(relay_proxy="socks5://192.168.1.2:7891"), monkeypatch, _FakeUpstream())
+        client.get(f"/api/v1/plugin/ANiStrmHub/relay/{self.VIDEO_PATH}")
+        assert _FakeRequestUtils.calls[0]["proxies"] == {
+            "http": "socks5://192.168.1.2:7891",
+            "https": "socks5://192.168.1.2:7891",
+        }
+
+    def test_full_request_returns_200_with_total_size(self, monkeypatch):
+        upstream = _FakeUpstream(headers={"Content-Type": "video/mp4", "Content-Range": "bytes 0-1015/1016"})
+        client = self._client(self._plugin(), monkeypatch, upstream)
+
+        response = client.get(f"/api/v1/plugin/ANiStrmHub/relay/{self.VIDEO_PATH}")
+
+        assert response.status_code == 200
+        assert response.headers["content-length"] == "1016"
+        assert "content-range" not in response.headers
+        assert _FakeRequestUtils.calls[0]["headers"]["Range"] == "bytes=0-"
+
+    def test_head_reports_file_size_without_body(self, monkeypatch):
+        # 回归：上游 Range 响应不带 Content-Length，此前 HEAD 返回长度 0，媒体服务器拿不到文件大小
+        upstream = _FakeUpstream(headers={"Content-Type": "video/mp4", "Content-Range": "bytes 0-0/435525972"})
+        client = self._client(self._plugin(), monkeypatch, upstream)
+
+        response = client.head(f"/api/v1/plugin/ANiStrmHub/relay/{self.VIDEO_PATH}")
+
+        assert response.status_code == 200 and response.content == b""
+        assert response.headers["content-length"] == "435525972"
+        assert response.headers["accept-ranges"] == "bytes"
+        assert _FakeRequestUtils.calls[0]["headers"]["Range"] == "bytes=0-0"
+        assert upstream.closed
+
+    def test_rejects_public_client(self, monkeypatch):
+        client = self._client(self._plugin(), monkeypatch, _FakeUpstream(), client_ip="8.8.8.8")
+        assert client.get(f"/api/v1/plugin/ANiStrmHub/relay/{self.VIDEO_PATH}").status_code == 403
+        assert _FakeRequestUtils.calls == []
+
+    def test_rejects_public_client_behind_moviepilot_nginx(self, monkeypatch):
+        # 经 MoviePilot 自带 nginx 转发时来源是 127.0.0.1，真实地址在 X-Real-IP
+        client = self._client(self._plugin(), monkeypatch, _FakeUpstream(), client_ip="127.0.0.1")
+        response = client.get(f"/api/v1/plugin/ANiStrmHub/relay/{self.VIDEO_PATH}", headers={"X-Real-IP": "8.8.8.8"})
+        assert response.status_code == 403
+
+    def test_rejects_non_ani_target(self, monkeypatch):
+        client = self._client(self._plugin(), monkeypatch, _FakeUpstream())
+        assert client.get("/api/v1/plugin/ANiStrmHub/relay/evil.example/2026-7/x.mp4").status_code == 403
+        assert _FakeRequestUtils.calls == []
+
+    def test_upstream_unreachable_returns_502(self, monkeypatch):
+        client = self._client(self._plugin(), monkeypatch, None)
+        assert client.get(f"/api/v1/plugin/ANiStrmHub/relay/{self.VIDEO_PATH}").status_code == 502
+
+    def test_upstream_error_status_passed_through(self, monkeypatch):
+        upstream = _FakeUpstream(status_code=404, headers={"Content-Type": "text/html"})
+        client = self._client(self._plugin(), monkeypatch, upstream)
+        assert client.get(f"/api/v1/plugin/ANiStrmHub/relay/{self.VIDEO_PATH}").status_code == 404
+        assert upstream.closed
+
+    def test_relay_row_tagged_in_form(self):
+        plugin = self._plugin()
+        form_text = str(plugin.get_form()[0])
+        assert "'text': '本地中转'" in form_text and "经局域网代理转发" in form_text
+
+
+class TestV2Compatibility:
+    ROOT = Path(__file__).resolve().parents[3]
+
+    def test_v2_copy_is_in_sync_with_v3(self):
+        import importlib.util
+
+        spec = importlib.util.spec_from_file_location("sync_v2", self.ROOT / "tools" / "sync_v2.py")
+        sync_v2 = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(sync_v2)
+        current = (self.ROOT / "plugins.v2" / "anistrmhub" / "__init__.py").read_text(encoding="utf-8")
+        assert current == sync_v2.render_v2("anistrmhub"), "V2 副本未同步，请运行 python tools/sync_v2.py"
+
+    def test_v2_copy_imports_with_legacy_paths(self, monkeypatch):
+        # 回归：只做语法检查发现不了漏掉的 import（4.0 时期 V2 漏 fastapi 即如此），
+        # 这里用 V2 的旧 import 路径真实加载一次
+        import importlib.util
+        import sys
+        import types
+
+        import app.plugins.anistrmhub as v3
+
+        for name, attr, value in (
+            ("app.core.config", "settings", v3.settings),
+            ("app.log", "logger", v3.logger),
+            ("app.utils.http", "RequestUtils", v3.RequestUtils),
+        ):
+            if name not in sys.modules:
+                module = types.ModuleType(name)
+                setattr(module, attr, value)
+                monkeypatch.setitem(sys.modules, name, module)
+        for package in ("app.core", "app.utils"):
+            if package not in sys.modules:
+                pkg = types.ModuleType(package)
+                pkg.__path__ = []
+                monkeypatch.setitem(sys.modules, package, pkg)
+
+        path = self.ROOT / "plugins.v2" / "anistrmhub" / "__init__.py"
+        spec = importlib.util.spec_from_file_location("anistrmhub_v2_check", path)
+        v2 = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(v2)
+
+        plugin = v2.ANiStrmHub()
+        plugin.init_plugin({"relay_enabled": True, "relay_address": "http://192.168.1.10:3000"})
+        assert plugin.get_api()[0]["path"] == "/relay/{path:path}"
+        plugin.get_form()
+        plugin.get_page()

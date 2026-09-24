@@ -1,23 +1,25 @@
-# 本文件是 plugins.v3/anistrmhub/__init__.py 的V2兼容副本。
-# V2宿主没有app.sdk.*稳定出口，只能用app.core.config/app.log/app.utils.http这几个旧路径，
-# 所以业务逻辑没法跨版本共用同一份源码，只能保留两份——这里除了下面4行import外，
-# 其余代码必须和V3版本保持一致。改动业务逻辑时两个文件都要同步改。
+# 本文件由 tools/sync_v2.py 从 plugins.v3/anistrmhub/__init__.py 生成，请勿直接修改。
+# V2 宿主没有 app.sdk.* 稳定出口，两份实现只有 settings/logger/RequestUtils 三行 import 不同。
+import ipaddress
 import json
 import re
 import time
-import xml.etree.ElementTree as ET
-from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
 from urllib.parse import quote, unquote, urlparse, urlunparse
+import xml.etree.ElementTree as ET
+from datetime import datetime, timedelta
 
 import pytz
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.cron import CronTrigger
 
+from fastapi import Request
+from fastapi.responses import Response, StreamingResponse
+
+from app.plugins import _PluginBase
 from app.core.config import settings
 from app.log import logger
-from app.plugins import _PluginBase
 from app.utils.http import RequestUtils
 
 # 内置订阅源：只作为首次安装时「订阅源列表」的初始内容。列表完全由用户维护，
@@ -43,6 +45,24 @@ BUILTIN_TAGS: Dict[str, Tuple[str, ...]] = {
     "https://api.pili.cc.cd/ani-download.xml": ("视频链接已加速",),
     "https://aniapi.op5.de5.net/ani-download.xml": ("视频链接已加速",),
 }
+# 本地中转：插件在 MoviePilot 内提供的视频转发接口。媒体服务器(如飞牛影视)本身
+# 不走代理、访问不了需要翻墙的视频链接时，strm 改为指向这个局域网地址，由
+# MoviePilot 经用户的代理拉取视频再原样转发。路径固定为 MoviePilot 插件接口的
+# 注册规则：/api/v1/plugin/{插件ID}{get_api 的 path}
+RELAY_API_PATH = "/api/v1/plugin/ANiStrmHub/relay"
+RELAY_CHUNK_BYTES = 256 * 1024
+RELAY_TIMEOUT_SECONDS = 30
+# 播放器拖动进度靠 Range 请求，必须原样转发；响应头只透传与视频传输相关的几项
+RELAY_REQUEST_HEADERS = ("If-Range",)
+CONTENT_RANGE_RE = re.compile(r"bytes\s+(\d+)-(\d+)/(\d+)")
+RELAY_RESPONSE_HEADERS = (
+    "Content-Type",
+    "Content-Length",
+    "Content-Range",
+    "Accept-Ranges",
+    "Last-Modified",
+    "ETag",
+)
 # ANi官方直链域名，用于重建官方直链——不管当前strm内容被套了
 # 几层壳，extract_resource_path()都能从URL末尾定位出跟域名无关的"季度/
 # 文件名?query"这一段，配上这个官方域名就能拼出一个确定的官方直链，不需要
@@ -92,9 +112,9 @@ MAX_CONSECUTIVE_PROBE_FAILURES = 10
 
 class ANiStrmHub(_PluginBase):
     plugin_name = "ANiStrmHub"
-    plugin_desc = "开箱即用的ANi新番strm生成：内置已加速订阅源，也可选官方源自配加速；mp刮削入库，媒体服务器直连播放"
+    plugin_desc = "开箱即用的ANi新番strm生成：内置已加速订阅源，也可选官方源自配加速或本地中转；mp刮削入库，媒体服务器直连播放"
     plugin_icon = "https://raw.githubusercontent.com/oiloveio/MoviePilot-Plugins/main/icons/anistrmhub.png"
-    plugin_version = "0.10.0"
+    plugin_version = "0.11.0"
     plugin_author = "oiloveio"
     author_url = "https://github.com/oiloveio"
     plugin_config_prefix = "anistrmhub_"
@@ -113,6 +133,9 @@ class ANiStrmHub(_PluginBase):
     _accelerator_prefix = ""
     _subscription_list: List[str] = [url for url, _ in BUILTIN_SUBSCRIPTIONS]
     _accelerator_list: List[str] = [prefix for prefix, _ in BUILTIN_ACCELERATORS]
+    _relay_enabled = False
+    _relay_address = ""
+    _relay_proxy = ""
 
     _refresh_subscription_once = False
     _regroup_once = False
@@ -156,8 +179,17 @@ class ANiStrmHub(_PluginBase):
             self._accelerator_list = self.parse_url_lines(config.get("accelerator_list"), strip_slash=True)
         else:
             self._accelerator_list = [prefix for prefix, _ in BUILTIN_ACCELERATORS]
+        self._relay_enabled = bool(config.get("relay_enabled", False))
+        self._relay_address = (config.get("relay_address") or "").strip().rstrip("/")
+        self._relay_proxy = (config.get("relay_proxy") or "").strip()
+
         # 在下拉框里直接输入的新地址，保存时并入列表，之后一直保留，直到用户删除
         lists_changed = "subscription_list" not in config or "accelerator_list" not in config
+        # 启用本地中转后，中转地址作为一条加速源加入列表，由用户设为当前使用
+        relay_prefix = self.relay_prefix()
+        if relay_prefix and relay_prefix not in self._accelerator_list:
+            self._accelerator_list.append(relay_prefix)
+            lists_changed = True
         if self._subscription_source and self._subscription_source not in self._subscription_list:
             self._subscription_list.append(self._subscription_source)
             lists_changed = True
@@ -284,7 +316,9 @@ class ANiStrmHub(_PluginBase):
 
     @staticmethod
     def __display_name(url: str, builtin: Tuple[Tuple[str, str], ...]) -> str:
-        """内置地址显示内置名称，自定义地址显示域名"""
+        """内置地址显示内置名称，本地中转显示「本地中转」，自定义地址显示域名"""
+        if RELAY_API_PATH in url:
+            return f"本地中转 {urlparse(url).netloc}"
         return dict(builtin).get(url) or (urlparse(url).netloc or url)
 
     def __active_subscription(self) -> str:
@@ -998,11 +1032,132 @@ class ANiStrmHub(_PluginBase):
         return []
 
     def get_api(self) -> List[Dict[str, Any]]:
-        """当前插件不注册后端API。如果社区加速源都不稳定，可以自己用GOST/
-        Nginx等工具搭一个"Proxy Everything"风格的反向代理，把这个反代地址
-        当成"加速源"填进配置里即可——不需要插件在自己进程里重造一遍转发，
-        这也是0.6.0移除4.0.0"Relay转发"实验性功能的原因，详见README。"""
-        return []
+        """启用本地中转时注册视频转发接口。
+
+        接口免登录(allow_anonymous)：strm 链接由媒体服务器直接访问，无法携带
+        MoviePilot 的 API 密钥。为避免成为开放代理，只接受局域网来源的请求，
+        且只转发 ANi 官方视频地址(resources.ani.rip 的季度/文件路径)，见 relay_video。"""
+        if not self._relay_enabled:
+            return []
+        return [
+            {
+                "path": "/relay/{path:path}",
+                "endpoint": self.relay_video,
+                "methods": ["GET", "HEAD"],
+                "allow_anonymous": True,
+                "summary": "本地中转：经代理转发 ANi 视频",
+            }
+        ]
+
+    def relay_prefix(self) -> Optional[str]:
+        """本地中转作为加速源时的前缀，如 http://192.168.1.10:3000/api/v1/plugin/ANiStrmHub/relay；
+        未启用或未填写 MoviePilot 局域网地址时返回 None"""
+        address = (self._relay_address or "").strip().rstrip("/")
+        if not self._relay_enabled or not address.lower().startswith(("http://", "https://")):
+            return None
+        return f"{address}{RELAY_API_PATH}"
+
+    def __relay_proxies(self) -> Optional[Dict[str, str]]:
+        """中转上游代理：填写了就用填写的，留空使用 MoviePilot 的代理设置"""
+        custom = (self._relay_proxy or "").strip()
+        if custom:
+            return {"http": custom, "https": custom}
+        return settings.PROXY or None
+
+    @staticmethod
+    def relay_target(raw_path: str, query: str) -> Optional[str]:
+        """由中转请求的路径还原上游视频地址。只接受 resources.ani.rip 下
+        "季度/文件名" 结构的路径，其余一律拒绝，保证接口不会被当成通用代理。
+        raw_path 是未解码的原始路径段，直接拼回去，避免解码再编码改变文件名。"""
+        remainder = (raw_path or "").lstrip("/")
+        if not remainder.startswith(f"{OFFICIAL_HOST}/"):
+            return None
+        if ".." in remainder or not StrmRelinkService.extract_resource_path("/" + remainder):
+            return None
+        target = f"https://{remainder}"
+        return f"{target}?{query}" if query else target
+
+    @staticmethod
+    def is_lan_client(host: Optional[str]) -> bool:
+        try:
+            address = ipaddress.ip_address((host or "").strip())
+        except ValueError:
+            return False
+        if getattr(address, "ipv4_mapped", None):
+            address = address.ipv4_mapped
+        return address.is_private or address.is_loopback or address.is_link_local
+
+    def relay_video(self, request: Request, path: str):
+        """本地中转接口：媒体服务器请求局域网地址，MoviePilot 经代理向上游拉取
+        视频并流式转发。Range 原样转发以支持拖动进度；上游的跳转(resources.ani.rip
+        会跳到 workers.dev)在 MoviePilot 这一侧经代理完成，媒体服务器无感知。"""
+        # 经 MoviePilot 自带的 nginx 转发时 client.host 是 127.0.0.1，真实来源在 X-Real-IP
+        client_host = request.client.host if request.client else ""
+        if self.is_lan_client(client_host) and request.headers.get("X-Real-IP"):
+            client_host = request.headers.get("X-Real-IP")
+        if not self.is_lan_client(client_host):
+            logger.warning(f"ANiStrmHub本地中转：拒绝非局域网来源的请求 {client_host}")
+            return Response(status_code=403, content="仅允许局域网访问")
+
+        raw_path = request.scope.get("raw_path")
+        raw_path = raw_path.decode("latin-1") if isinstance(raw_path, bytes) else ""
+        marker = f"{RELAY_API_PATH}/"
+        if marker in raw_path:
+            raw_path = raw_path.split(marker, 1)[1]
+        else:
+            raw_path = quote(path, safe="/")
+        target = self.relay_target(raw_path, request.url.query)
+        if not target:
+            return Response(status_code=403, content="仅转发 ANi 官方视频地址")
+
+        request_utils = RequestUtils(
+            ua=settings.USER_AGENT if settings.USER_AGENT else None,
+            proxies=self.__relay_proxies(),
+            timeout=RELAY_TIMEOUT_SECONDS,
+        )
+        # 上游(Cloudflare 后的对象存储)对 Range 请求只返回 Content-Range，不带
+        # Content-Length/Accept-Ranges，媒体服务器因此拿不到文件大小。所以上游一律按
+        # Range 请求：客户端没带 Range 时取整个文件(bytes=0-)，HEAD 只取 1 字节，
+        # 再由 Content-Range 算出长度与文件总大小回给客户端。
+        client_range = request.headers.get("Range")
+        is_head = request.method == "HEAD"
+        forward = {name: request.headers[name] for name in RELAY_REQUEST_HEADERS if request.headers.get(name)}
+        forward["Range"] = client_range or ("bytes=0-0" if is_head else "bytes=0-")
+        request_utils.update_headers(forward)
+        upstream = request_utils.get_res(target, stream=True)
+        if upstream is None:
+            logger.warning(f"ANiStrmHub本地中转：上游无响应（检查中转代理是否可用）{target}")
+            return Response(status_code=502, content="上游无响应，检查中转代理是否可用")
+
+        headers = {name: upstream.headers[name] for name in RELAY_RESPONSE_HEADERS if upstream.headers.get(name)}
+        status_code = upstream.status_code
+        content_range = CONTENT_RANGE_RE.match(upstream.headers.get("Content-Range") or "")
+        if status_code == 206 and content_range:
+            start, end, total = (int(value) for value in content_range.groups())
+            headers["Accept-Ranges"] = "bytes"
+            if client_range:
+                headers["Content-Length"] = str(end - start + 1)
+            else:
+                # 客户端要的是整个文件：按 200 回整个文件，长度为文件总大小
+                status_code = 200
+                headers.pop("Content-Range", None)
+                headers["Content-Length"] = str(total)
+        if upstream.headers.get("Content-Encoding"):
+            # iter_content 会解压，长度与 Content-Length 对不上，交给框架按分块传输
+            headers.pop("Content-Length", None)
+        if is_head or status_code >= 400:
+            upstream.close()
+            return Response(status_code=status_code, headers=headers)
+
+        def body():
+            try:
+                for chunk in upstream.iter_content(chunk_size=RELAY_CHUNK_BYTES):
+                    if chunk:
+                        yield chunk
+            finally:
+                upstream.close()
+
+        return StreamingResponse(body(), status_code=status_code, headers=headers)
 
     @staticmethod
     def __row(cells: List[Tuple[int, dict]]) -> dict:
@@ -1046,6 +1201,8 @@ class ANiStrmHub(_PluginBase):
     def __source_notes(url: str, builtin: Tuple[Tuple[str, str], ...]) -> List[Tuple[str, str]]:
         """地址的注释标签：(文字, 颜色)。内置地址显示「内置」+名称+说明，其余显示「自定义」"""
         names = dict(builtin)
+        if RELAY_API_PATH in url:
+            return [("本地中转", "info"), ("经局域网代理转发", "default")]
         if url not in names:
             return [("自定义", "secondary")]
         notes = [("内置", "primary"), (names[url], "default")]
@@ -1068,8 +1225,9 @@ class ANiStrmHub(_PluginBase):
         地址字符串——已在 Vuetify 3.7.3 下实测选择与手动输入两种情况。"""
         notes = {url: " · ".join(text for text, _ in cls.__source_notes(url, builtin)) for url, _ in builtin}
         items_expr = (
-            "{{ (%s || []).map(u => ({ title: u, value: u, subtitle: (%s)[u] || '自定义' })) }}"
-            % (list_key, json.dumps(notes, ensure_ascii=False))
+            "{{ (%s || []).map(u => ({ title: u, value: u, subtitle: (%s)[u] || "
+            "(u.includes(%s) ? '本地中转 · 经局域网代理转发' : '自定义') })) }}"
+            % (list_key, json.dumps(notes, ensure_ascii=False), json.dumps(RELAY_API_PATH))
         )
         props: Dict[str, Any] = {
             "model": model_key,
@@ -1193,6 +1351,58 @@ class ANiStrmHub(_PluginBase):
         )
         return rows
 
+    def __relay_section(self) -> List[dict]:
+        """加速源分区底部的「本地中转」设置"""
+        relay_prefix = self.relay_prefix()
+        if not relay_prefix:
+            status = "启用并填写 MoviePilot 局域网地址、保存后，中转地址会加入上方列表"
+        elif (self._accelerator_prefix or "").rstrip("/") == relay_prefix:
+            status = f"中转地址：{relay_prefix}（当前加速源，已生效；已有 strm 运行「重建直链」即可改为经中转播放）"
+        else:
+            status = f"中转地址：{relay_prefix}（已加入上方列表，设为当前加速源后生效）"
+        return [
+            {"component": "VDivider", "props": {"class": "my-4"}},
+            {"component": "div", "props": {"class": "text-subtitle-2 mb-2"}, "text": "本地中转"},
+            self.__notice(
+                "适用于媒体服务器（如飞牛影视）本身不走代理、打不开需要翻墙的视频链接的情况："
+                "strm 改为指向 MoviePilot 的局域网地址，由 MoviePilot 经你的局域网代理拉取视频，再转发给媒体服务器，"
+                "支持拖动进度。媒体服务器无需任何代理设置。"
+                "中转期间需保持本插件处于启用状态；仅在局域网内可用，且只转发 ANi 视频。"
+            ),
+            self.__row(
+                [
+                    (3, {"component": "VSwitch", "props": {"model": "relay_enabled", "label": "启用本地中转"}}),
+                    (
+                        5,
+                        {
+                            "component": "VTextField",
+                            "props": {
+                                "model": "relay_address",
+                                "label": "MoviePilot 局域网地址",
+                                "placeholder": "http://192.168.1.10:3000",
+                                "hint": "媒体服务器能访问到的 MoviePilot 地址，即平时打开 MoviePilot 网页的地址",
+                                "persistent-hint": True,
+                            },
+                        },
+                    ),
+                    (
+                        4,
+                        {
+                            "component": "VTextField",
+                            "props": {
+                                "model": "relay_proxy",
+                                "label": "中转代理",
+                                "placeholder": "留空使用 MoviePilot 的代理设置",
+                                "hint": "如 http://192.168.1.2:7890 或 socks5://192.168.1.2:7891",
+                                "persistent-hint": True,
+                            },
+                        },
+                    ),
+                ]
+            ),
+            {"component": "div", "props": {"class": "text-caption text-medium-emphasis mt-2"}, "text": status},
+        ]
+
     def get_form(self) -> Tuple[List[dict], Dict[str, Any]]:
         return [
             {
@@ -1293,7 +1503,7 @@ class ANiStrmHub(_PluginBase):
                         "加速源",
                         [
                             self.__notice(
-                                "加速源只作用于 strm 中的视频播放链接，用于提升 Emby/Jellyfin 等媒体服务器的播放速度，"
+                                "加速源只作用于 strm 中的视频播放链接，用于提升 Emby/Jellyfin/飞牛影视 等媒体服务器的播放速度，"
                                 "不影响订阅源的获取。留空则直接使用订阅源给出的视频链接；"
                                 "当前订阅源已是「视频链接已加速」的镜像时，通常无需再配置。"
                             ),
@@ -1311,6 +1521,7 @@ class ANiStrmHub(_PluginBase):
                             *self.__source_manager(
                                 self._accelerator_list, "accelerator_list", "accelerator_prefix", BUILTIN_ACCELERATORS
                             ),
+                            *self.__relay_section(),
                         ],
                     ),
                     {
@@ -1356,10 +1567,7 @@ class ANiStrmHub(_PluginBase):
                             "variant": "tonal",
                             "density": "compact",
                             "style": "white-space: pre-line;",
-                            "text": "生成的 strm 建议配合 MoviePilot 的「目录监控」与「媒体整理」，刮削后整理到媒体库目录\n"
-                            "存放方式选「按剧集分目录」时每部剧一个文件夹，Emby/Jellyfin 识别更准确\n"
-                            "Emby 以容器运行时需设置小写 http_proxy 环境变量，否则无法提取媒体信息\n"
-                            "社区加速源不稳定时，可用 GOST/Nginx 自建反代，在加速源中输入添加",
+                            "text": "生成的 strm 建议配合 MoviePilot 的「目录监控」与「媒体整理」，刮削后整理到媒体库目录",
                         },
                         "content": [
                             {
@@ -1393,6 +1601,9 @@ class ANiStrmHub(_PluginBase):
             "accelerator_prefix": "",
             "subscription_list": [url for url, _ in BUILTIN_SUBSCRIPTIONS],
             "accelerator_list": [prefix for prefix, _ in BUILTIN_ACCELERATORS],
+            "relay_enabled": False,
+            "relay_address": "",
+            "relay_proxy": "",
             "refresh_subscription_once": False,
             "regroup_once": False,
             "backfill_once": False,
@@ -1414,6 +1625,9 @@ class ANiStrmHub(_PluginBase):
                 "accelerator_prefix": self._accelerator_prefix,
                 "subscription_list": self._subscription_list,
                 "accelerator_list": self._accelerator_list,
+                "relay_enabled": self._relay_enabled,
+                "relay_address": self._relay_address,
+                "relay_proxy": self._relay_proxy,
                 "refresh_subscription_once": self._refresh_subscription_once,
                 "regroup_once": self._regroup_once,
                 "backfill_once": self._backfill_once,
@@ -1920,6 +2134,13 @@ class StrmRelinkService:
     def describe_route(cls, link: str, accelerator: Optional[str] = None) -> str:
         """compose_link的逆向归类：这条strm实际走的是哪条线路。"""
         accelerator = (accelerator or "").strip().rstrip("/")
+        # 本地中转的前缀本身带路径(/api/v1/plugin/...)，要先于按主机逐跳拆分识别，
+        # 否则会被误判为多层套壳
+        relay_index = link.find(RELAY_API_PATH + "/")
+        if relay_index > 0:
+            prefix = link[: relay_index + len(RELAY_API_PATH)]
+            label = f"本地中转 {urlparse(prefix).netloc}"
+            return f"{label}（当前配置）" if prefix == accelerator else label
         if accelerator and link.startswith(accelerator + "/"):
             remainder = link[len(accelerator) + 1:]
             if cls.route_hops("https://" + remainder) == [OFFICIAL_HOST]:
