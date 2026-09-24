@@ -130,6 +130,10 @@ MAX_CONSECUTIVE_PROBE_FAILURES = 10
 # 2713 个文件按实测约 2 秒/个要一百多分钟，期间所有按钮不可用；抽样确认线路可达后，
 # 其余文件直接按同一线路改写
 REBUILD_PROBE_SAMPLES = 3
+# 资源本身不存在(剧集被 ANi 下架)时各条线路都返回 404/410：这说明的是「这一集没有了」，
+# 不是「线路不通」，不能计入连续失败熔断，检测时也不能拿它当样本(否则误报所有线路不可达)
+MISSING_RESOURCE_REASONS = ("HTTP 404", "HTTP 410")
+DETECT_SAMPLE_CANDIDATES = 5
 # 本地中转拒绝/失败类告警的最短间隔：媒体服务器扫库时会对大量旧链接发请求，
 # 逐条告警会刷屏(0.8.0 时期出现过单次任务近 5000 行日志)
 RELAY_WARN_INTERVAL_SECONDS = 60
@@ -139,7 +143,7 @@ class ANiStrmHub(_PluginBase):
     plugin_name = "ANiStrmHub"
     plugin_desc = "开箱即用的ANi新番strm生成：内置已加速订阅源，也可选官方源自配加速或本地中转；mp刮削入库，媒体服务器直连播放"
     plugin_icon = "https://raw.githubusercontent.com/oiloveio/MoviePilot-Plugins/main/icons/anistrmhub.png"
-    plugin_version = "0.14.0"
+    plugin_version = "0.14.1"
     plugin_author = "oiloveio"
     author_url = "https://github.com/oiloveio"
     plugin_config_prefix = "anistrmhub_"
@@ -611,7 +615,7 @@ class ANiStrmHub(_PluginBase):
             return {}
 
         stats: Dict[str, int] = {label: 0 for label in kind_labels}
-        for label in ("无需更新", "探测不可达(保留原文件)", "无法识别(保留原文件)", "已移除(跳过)"):
+        for label in ("无需更新", "探测不可达(保留原文件)", "资源已下架(保留原文件)", "无法识别(保留原文件)", "已移除(跳过)"):
             stats.setdefault(label, 0)
 
         consecutive_failures = 0
@@ -663,6 +667,11 @@ class ANiStrmHub(_PluginBase):
                 logger.debug(f"ANiStrmHub{task_name}：已更新({latency_ms}ms) {strm_file.name}")
                 continue
 
+            if fail_reason in MISSING_RESOURCE_REASONS:
+                # 这一集已被下架：保留原文件，不影响对线路本身的判断
+                stats["资源已下架(保留原文件)"] += 1
+                logger.debug(f"ANiStrmHub{task_name}：资源已下架({fail_reason})，保留原文件 {strm_file.name}")
+                continue
             stats["探测不可达(保留原文件)"] += 1
             consecutive_failures += 1
             message = f"ANiStrmHub{task_name}：探测不可达({fail_reason})，保留原文件 {strm_file.name}"
@@ -969,6 +978,7 @@ class ANiStrmHub(_PluginBase):
 
         subscriptions: List[Dict[str, Any]] = []
         configured_sample: Optional[Dict[str, str]] = None
+        sample_note = ""
         fallback_sample: Optional[Dict[str, str]] = None
         extra_nodes: List[str] = []
         for url in dict.fromkeys(([configured] if configured else []) + self.parse_url_lines(self._subscription_list)):
@@ -994,7 +1004,7 @@ class ANiStrmHub(_PluginBase):
             row["entries"] = len(entries)
             if entries:
                 if url == configured:
-                    configured_sample = entries[0]
+                    configured_sample, sample_note = self.__pick_detect_sample(entries)
                     self.__remember_seasons(entries)
                 elif fallback_sample is None:
                     fallback_sample = entries[0]
@@ -1067,6 +1077,7 @@ class ANiStrmHub(_PluginBase):
                 "checked_at": checked_at,
                 "subscriptions": subscriptions,
                 "sample_title": (sample or {}).get("title"),
+                "sample_note": sample_note,
                 "routes": routes,
                 "verdict": verdict,
                 "verdict_level": verdict_level,
@@ -1093,6 +1104,17 @@ class ANiStrmHub(_PluginBase):
         )
         logger.info(f"ANiStrmHub连通性检测完成：{summary}")
         self.__save_task_status("detect", "done", summary)
+
+    def __pick_detect_sample(self, entries: List[Dict[str, str]]) -> Tuple[Dict[str, str], str]:
+        """挑一个确认存在的剧集当测速样本：RSS 第一条恰好被 ANi 下架时，所有线路都会
+        返回 404，检测会误报「所有播放线路均不可达」。依次试前几条，遇到 404 换下一条；
+        遇到的是连不上之类的线路问题则不换，让检测如实反映出来"""
+        for index, entry in enumerate(entries[:DETECT_SAMPLE_CANDIDATES]):
+            latency_ms, reason = self._relink_service.probe_latency_ms(entry["link"])
+            if latency_ms is not None or reason not in MISSING_RESOURCE_REASONS:
+                note = f"RSS 前 {index} 条已下架，改用第 {index + 1} 条作为样本" if index else ""
+                return entry, note
+        return entries[0], f"RSS 前 {min(len(entries), DETECT_SAMPLE_CANDIDATES)} 条均返回 404，样本可能已下架"
 
     def __direct_egress(self) -> Optional[Dict[str, str]]:
         """查询 MoviePilot 直连(不经任何代理)时的出口 IP 与所属国家。出口不在国内时，
@@ -2040,6 +2062,8 @@ class ANiStrmHub(_PluginBase):
                 }
             )
         sample_title = detect_result.get("sample_title") or "无"
+        if detect_result.get("sample_note"):
+            sample_title = f"{sample_title}（{detect_result['sample_note']}）"
         return {
             "component": "VCard",
             "props": {"class": "mb-4"},

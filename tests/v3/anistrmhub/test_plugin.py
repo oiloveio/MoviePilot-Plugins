@@ -2451,3 +2451,58 @@ class TestProjectReviewFixes:
         plugin = ANiStrmHub()
         plugin.init_plugin({})
         assert plugin.run_action("refresh") == {"success": True, "message": "已刷新", "data": None}
+
+
+class TestMissingResourceHandling:
+    """剧集被 ANi 下架时各线路都返回 404：说明「这一集没有了」，不是「线路不通」(实测)"""
+
+    def _detect_plugin(self, monkeypatch, probe_results):
+        monkeypatch.setattr(time, "sleep", lambda *_: None)
+        plugin = ANiStrmHub()
+        plugin.init_plugin({"subscription_source": "https://api.ani.rip/ani-download.xml"})
+        entries = [{"title": f"第{i}条", "link": f"https://resources.ani.rip/2026-7/ep{i}?d=mp4"} for i in range(5)]
+        plugin._client.fetch_one_source = MagicMock(return_value=entries)
+        plugin._relink_service.probe_latency_ms = MagicMock(side_effect=probe_results)
+        plugin._relink_service.measure_playback = MagicMock(
+            return_value={"first_byte_ms": 500.0, "speed_kbps": 2000.0, "error": None}
+        )
+        plugin._ANiStrmHub__direct_egress = lambda: None
+        return plugin
+
+    def test_detect_skips_removed_sample(self, monkeypatch):
+        plugin = self._detect_plugin(monkeypatch, [(None, "HTTP 404"), (None, "HTTP 404"), (50.0, None)] + [(50.0, None)] * 10)
+        getattr(plugin, "_ANiStrmHub__detect_task")()
+        result = plugin.get_data("detect_result")
+        assert result["sample_title"] == "第2条"
+        assert "前 2 条已下架" in result["sample_note"]
+        measured = plugin._relink_service.measure_playback.call_args_list[0].args[0]
+        assert "ep2" in measured
+
+    def test_detect_keeps_sample_when_route_itself_fails(self, monkeypatch):
+        # 连不上是线路问题，不能靠换样本掩盖
+        plugin = self._detect_plugin(monkeypatch, [(None, "无响应(连接失败或超时)")] + [(50.0, None)] * 10)
+        getattr(plugin, "_ANiStrmHub__detect_task")()
+        assert plugin.get_data("detect_result")["sample_title"] == "第0条"
+
+    def test_rebuild_not_aborted_by_removed_season(self, tmp_path, monkeypatch):
+        # 回归：整季被下架的十几集排在一起，全部 404，此前会触发「连续失败 10 次」误判线路不通而中止
+        monkeypatch.setattr(time, "sleep", lambda *_: None)
+        plugin = ANiStrmHub()
+        plugin._client.fetch_one_source = MagicMock(return_value=[{"title": "x", "link": OFFICIAL_RSS_LINK}])
+        plugin._storageplace = str(tmp_path)
+        plugin._accelerator_prefix = "https://pro.pili.cc.cd"
+        for i in range(15):
+            (tmp_path / f"a已下架的剧 - {i:02d}.strm").write_text(f"https://resources.ani.rip/2025-1/gone{i}?d=mp4", encoding="utf-8")
+        for i in range(10):
+            (tmp_path / f"b正常的剧 - {i:02d}.strm").write_text(f"https://resources.ani.rip/2026-7/ok{i}?d=mp4", encoding="utf-8")
+        plugin._relink_service.probe_latency_ms = MagicMock(
+            side_effect=lambda url: (None, "HTTP 404") if "gone" in url else (50.0, None)
+        )
+
+        getattr(plugin, "_ANiStrmHub__refresh_subscription_task")()
+
+        summary = plugin.get_data("task_status")["refresh_subscription"]["summary"]
+        assert "已中止" not in summary
+        assert "资源已下架(保留原文件)=15" in summary and "路径迁移更新=10" in summary
+        assert all(f.read_text().startswith("https://resources.ani.rip/") for f in tmp_path.glob("a*.strm"))
+        assert all(f.read_text().startswith("https://pro.pili.cc.cd/") for f in tmp_path.glob("b*.strm"))
