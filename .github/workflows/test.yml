@@ -1,0 +1,27 @@
+name: 测试
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        # 与 MoviePilot 宿主一致：V2 镜像为 Python 3.12，V3 要求 Python >= 3.14
+        python-version: ["3.12", "3.14"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: 安装依赖
+        run: pip install pytest apscheduler pytz fastapi httpx requests
+      - name: 检查 V2 副本与 V3 同步
+        run: python tools/sync_v2.py --check
+      - name: 校验插件索引 JSON
+        run: python -c "import json; [json.load(open(f, encoding='utf-8')) for f in ('package.v2.json', 'package.v3.json')]"
+      - name: 运行测试
+        run: python -m pytest -q tests/v3/anistrmhub

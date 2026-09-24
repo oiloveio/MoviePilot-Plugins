@@ -1318,7 +1318,8 @@ class TestMaintenanceLoopProtections:
 
         status = plugin.get_data("task_status")["refresh_subscription"]
         assert "已中止" not in status["summary"]
-        assert "路径迁移更新=10" in status["summary"]
+        # 成功/失败交替：第 0、2、4 个成功后线路已抽样确认可达，其余 15 个直接改写
+        assert "路径迁移更新=18" in status["summary"] and "探测不可达(保留原文件)=2" in status["summary"]
 
     def test_file_removed_midway_counts_as_removed_not_unrecognized(self, tmp_path, monkeypatch):
         # 长任务执行期间目录监控把文件转移走是正常现象，不该报成"无法识别"
@@ -1446,7 +1447,7 @@ class TestMaintenanceActions:
         current = next(b for b in rebuild if b["events"]["click"]["params"]["accelerator"] == "https://pro.pili.cc.cd")
         assert current["text"].endswith("（当前）") and current["props"]["variant"] == "flat"
         others = {b["events"]["click"]["api"].rsplit("/", 1)[1] for b in buttons} - {"rebuild"}
-        assert others == {"sync", "regroup", "backfill", "detect"}
+        assert others == {"sync", "regroup", "backfill", "detect", "refresh"}
         assert all(b["events"]["click"]["method"] == "post" for b in buttons)
 
     def test_buttons_disabled_while_task_running(self):
@@ -1716,7 +1717,7 @@ class TestDetectTask:
 
         result = plugin.get_data("detect_result")
         assert result["verdict_level"] == "warning"
-        assert "https://pro.op5.de5.net" in result["verdict"]
+        assert "「op5 节点」" in result["verdict"] and "重建为" in result["verdict"]
         assert plugin._accelerator_prefix == "https://pro.pili.cc.cd"
 
     def test_current_route_unreachable(self, tmp_path, monkeypatch):
@@ -1727,7 +1728,7 @@ class TestDetectTask:
 
         result = plugin.get_data("detect_result")
         assert result["verdict_level"] == "error"
-        assert "当前线路不可达" in result["verdict"] and "https://pro.pili.cc.cd" in result["verdict"]
+        assert "当前线路不可达" in result["verdict"] and "「pili 节点」" in result["verdict"]
 
     def test_all_subscriptions_fail_skips_route_test(self, tmp_path, monkeypatch):
         plugin = self._make_plugin(
@@ -2324,3 +2325,129 @@ class TestDefaultRelayAddress:
         form_text = str(plugin.get_form()[0])
         assert "'placeholder': 'http://192.168.1.10:3000'" in form_text
         assert "如 http://192.168.1.2:7890" in form_text
+
+
+class TestProjectReviewFixes:
+    """项目复盘时主动发现并修复的问题"""
+
+    def test_rebuild_probes_only_a_sample(self, tmp_path, monkeypatch):
+        # 逐个实测 2713 个文件按约 2 秒/个要一百多分钟，期间按钮全部不可用
+        monkeypatch.setattr(time, "sleep", lambda *_: None)
+        plugin = ANiStrmHub()
+        plugin._client.fetch_one_source = MagicMock(return_value=[{"title": "窗口内的其他剧", "link": OFFICIAL_RSS_LINK}])
+        plugin._storageplace = str(tmp_path)
+        plugin._accelerator_prefix = "https://pro.pili.cc.cd"
+        for i in range(50):
+            (tmp_path / f"第{i:02d}集.strm").write_text(f"https://resources.ani.rip/2026-7/ep{i}?d=mp4", encoding="utf-8")
+        plugin._relink_service.probe_latency_ms = MagicMock(return_value=(50.0, None))
+
+        getattr(plugin, "_ANiStrmHub__refresh_subscription_task")()
+
+        assert plugin._relink_service.probe_latency_ms.call_count == 3
+        assert all(f.read_text().startswith("https://pro.pili.cc.cd/") for f in tmp_path.glob("*.strm"))
+        assert "抽样实测 3 个可达" in plugin.get_data("task_status")["refresh_subscription"]["summary"]
+
+    def test_rebuild_still_aborts_when_route_is_down(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(time, "sleep", lambda *_: None)
+        plugin = ANiStrmHub()
+        plugin._client.fetch_one_source = MagicMock(return_value=[{"title": "x", "link": OFFICIAL_RSS_LINK}])
+        plugin._storageplace = str(tmp_path)
+        plugin._accelerator_prefix = "https://dead.example"
+        for i in range(30):
+            (tmp_path / f"第{i:02d}集.strm").write_text(f"https://resources.ani.rip/2026-7/ep{i}?d=mp4", encoding="utf-8")
+        plugin._relink_service.probe_latency_ms = MagicMock(return_value=(None, "HTTP 403"))
+
+        getattr(plugin, "_ANiStrmHub__refresh_subscription_task")()
+
+        assert all(f.read_text().startswith("https://resources.ani.rip/") for f in tmp_path.glob("*.strm"))
+        assert "已中止" in plugin.get_data("task_status")["refresh_subscription"]["summary"]
+
+    def test_config_page_does_not_fetch_rss(self):
+        # 此前每次打开配置页都现抓 RSS，订阅源不可用时要卡 43 秒(实测)
+        plugin = ANiStrmHub()
+        plugin.init_plugin({"season_filter": ["2025-10"]})
+        plugin._client.fetch_one_source = MagicMock(side_effect=AssertionError("打开配置页不应联网"))
+        plugin.save_data("rss_seasons", ["2026-7", "2026-4"])
+        form_text = str(plugin.get_form()[0])
+        assert "'value': '2026-7'" in form_text and "'value': '2025-10'" in form_text
+
+    def test_sync_remembers_seasons_for_config_page(self, tmp_path):
+        plugin = ANiStrmHub()
+        plugin._storageplace = str(tmp_path)
+        plugin._client.fetch_one_source = MagicMock(
+            return_value=[{"title": "a - 01 [", "link": "https://resources.ani.rip/2026-7/a?d=mp4"},
+                          {"title": "b - 01 [", "link": "https://resources.ani.rip/2026-4/b?d=mp4"}]
+        )
+        getattr(plugin, "_ANiStrmHub__task")()
+        assert plugin.get_data("rss_seasons") == ["2026-7", "2026-4"]
+
+    @pytest.mark.parametrize(
+        "url,expected",
+        [
+            ("https://mp.example.com/api/v1/plugin/ANiStrmHub/relay/Hk7mQ2xZpR9wLc4v",
+             "https://mp.example.com/api/v1/plugin/ANiStrmHub/relay/***"),
+            ("https://mp.example.com/api/v1/plugin/ANiStrmHub/relay/Hk7mQ2xZpR9wLc4v/resources.ani.rip/2026-7/x",
+             "https://mp.example.com/api/v1/plugin/ANiStrmHub/relay/***/resources.ani.rip/2026-7/x"),
+            ("http://192.168.1.10:3000/api/v1/plugin/ANiStrmHub/relay", "http://192.168.1.10:3000/api/v1/plugin/ANiStrmHub/relay"),
+            ("https://pro.pili.cc.cd", "https://pro.pili.cc.cd"),
+        ],
+    )
+    def test_log_url_masks_relay_token(self, url, expected):
+        assert ANiStrmHub.log_url(url) == expected
+
+    def test_logs_never_contain_relay_token(self, tmp_path, caplog):
+        import logging
+
+        token = "Hk7mQ2xZpR9wLc4v"
+        relay = f"https://mp.example.com/api/v1/plugin/ANiStrmHub/relay/{token}"
+        plugin = ANiStrmHub()
+        with caplog.at_level(logging.DEBUG):
+            plugin.init_plugin({"relay_enabled": True, "relay_address": "https://mp.example.com",
+                                "relay_token": token, "accelerator_prefix": relay, "storageplace": str(tmp_path)})
+            plugin._client.fetch_one_source = MagicMock(return_value=[{"title": "a", "link": OFFICIAL_RSS_LINK}])
+            plugin._relink_service.probe_latency_ms = MagicMock(return_value=(50.0, None))
+            getattr(plugin, "_ANiStrmHub__task")()
+        assert token not in caplog.text
+
+    def test_disabled_relay_removed_from_list_and_rebuild(self, monkeypatch):
+        relay = "https://mp.example.com/api/v1/plugin/ANiStrmHub/relay/Hk7mQ2xZpR9wLc4v"
+        plugin = ANiStrmHub()
+        plugin.init_plugin({"relay_enabled": False, "accelerator_list": ["https://pro.pili.cc.cd", relay],
+                            "accelerator_prefix": relay})
+        assert relay not in plugin._accelerator_list
+        page_text = str(plugin.get_page())
+        assert "本地中转已停用" in page_text
+        assert f"'accelerator': '{relay}'" not in page_text
+        assert plugin.run_action("rebuild", {"accelerator": relay})["success"] is False
+
+    def test_interrupted_running_status_is_reset_on_restart(self):
+        plugin = ANiStrmHub()
+        plugin.save_data("task_status", {"refresh_subscription": {"status": "running", "summary": "进行中", "updated_at": "x"}})
+        plugin.init_plugin({})
+        info = plugin.get_data("task_status")["refresh_subscription"]
+        assert info["status"] == "done" and "已中断" in info["summary"]
+
+    def test_running_status_kept_while_task_holds_lock(self):
+        plugin = ANiStrmHub()
+        plugin.save_data("task_status", {"detect": {"status": "running", "summary": "进行中", "updated_at": "x"}})
+        plugin._maintenance_lock.acquire()
+        try:
+            plugin.init_plugin({})  # 任务运行中保存配置：状态不能被误改为已中断
+            assert plugin.get_data("task_status")["detect"]["status"] == "running"
+        finally:
+            plugin._maintenance_lock.release()
+
+    def test_relay_deny_warnings_are_rate_limited(self, monkeypatch, caplog):
+        import logging
+
+        plugin = ANiStrmHub()
+        plugin.init_plugin({})
+        with caplog.at_level(logging.WARNING):
+            for _ in range(50):
+                plugin._ANiStrmHub__relay_warn("no_token", "ANiStrmHub本地中转：拒绝")
+        assert caplog.text.count("拒绝") == 1
+
+    def test_refresh_action_just_reloads_page(self):
+        plugin = ANiStrmHub()
+        plugin.init_plugin({})
+        assert plugin.run_action("refresh") == {"success": True, "message": "已刷新", "data": None}
