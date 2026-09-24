@@ -134,7 +134,7 @@ class ANiStrmHub(_PluginBase):
     plugin_name = "ANiStrmHub"
     plugin_desc = "开箱即用的ANi新番strm生成：内置已加速订阅源，也可选官方源自配加速或本地中转；mp刮削入库，媒体服务器直连播放"
     plugin_icon = "https://raw.githubusercontent.com/oiloveio/MoviePilot-Plugins/main/icons/anistrmhub.png"
-    plugin_version = "0.13.1"
+    plugin_version = "0.13.2"
     plugin_author = "oiloveio"
     author_url = "https://github.com/oiloveio"
     plugin_config_prefix = "anistrmhub_"
@@ -202,7 +202,7 @@ class ANiStrmHub(_PluginBase):
         else:
             self._accelerator_list = [prefix for prefix, _ in BUILTIN_ACCELERATORS]
         self._relay_enabled = bool(config.get("relay_enabled", False))
-        self._relay_address = (config.get("relay_address") or "").strip().rstrip("/")
+        self._relay_address = (config.get("relay_address") or "").strip().rstrip("/") or self.default_relay_address()
         self._relay_proxy = (config.get("relay_proxy") or "").strip()
         # 中转密钥：写进 strm 链接，没有正确密钥的请求一律拒绝。清空后保存即重新生成
         self._relay_token = (config.get("relay_token") or "").strip()
@@ -293,18 +293,24 @@ class ANiStrmHub(_PluginBase):
         重建直链带参数 accelerator：先把它设为当前加速源再重建，保证已有 strm 与之后
         新生成的 strm 走同一条线路。空字符串表示不加速(使用订阅源原始链接)。"""
         if name not in self.ACTIONS:
-            return {"success": False, "message": f"未知操作：{name}"}
+            return self.__envelope(False, f"未知操作：{name}")
         task_key, label, method = self.ACTIONS[name]
         if name == "rebuild":
             accelerator = str((payload or {}).get("accelerator") or "").strip().rstrip("/")
             allowed = set(self._accelerator_list) | {self.relay_prefix() or ""} | {""}
             if accelerator not in allowed:
-                return {"success": False, "message": "目标线路不在加速源列表中，请刷新页面后重试"}
+                return self.__envelope(False, "目标线路不在加速源列表中，请刷新页面后重试")
             self._accelerator_prefix = accelerator
             self.__update_config()
             logger.info(f"ANiStrmHub重建直链：目标线路设为 {accelerator or '不加速（订阅源原始链接）'}")
         started, message = self.start_maintenance(task_key, label, getattr(self, method))
-        return {"success": started, "message": message}
+        return self.__envelope(started, message)
+
+    @staticmethod
+    def __envelope(success: bool, message: str) -> Dict[str, Any]:
+        """MoviePilot 标准响应格式：恰好 success/message/data 三个字段。V3 前端会严格校验，
+        缺少 data 时报「服务器返回了无效响应」(用户实测)；V2 前端不校验"""
+        return {"success": success, "message": message, "data": None}
 
     def start_maintenance(self, task_key: str, label: str, func) -> Tuple[bool, str]:
         """在后台线程执行一个维护任务；已有任务在运行时拒绝，不排队也不并发"""
@@ -1142,13 +1148,13 @@ class ANiStrmHub(_PluginBase):
         ]
 
     def relay_prefix(self) -> Optional[str]:
-        """本地中转作为加速源时的前缀。一个 strm 只能写一个地址，所以由「strm 访问地址」
+        """本地中转作为加速源时的前缀。一个 strm 只能写一个地址，所以由「MoviePilot 访问地址」
         决定链接形态：
         - 局域网地址：http://192.168.1.10:3000/api/v1/plugin/ANiStrmHub/relay
           不带任何凭证，只有局域网设备能用；
         - 公网地址：https://mp.example.com/api/v1/plugin/ANiStrmHub/relay/{密钥}
           自动带密钥，内外网都能直接播放。
-        未启用或未填写 strm 访问地址时返回 None"""
+        未启用或未填写 MoviePilot 访问地址时返回 None"""
         address = (self._relay_address or "").strip().rstrip("/")
         if not self._relay_enabled or not address.lower().startswith(("http://", "https://")):
             return None
@@ -1157,6 +1163,18 @@ class ANiStrmHub(_PluginBase):
         if not self._relay_token:
             return None
         return f"{address}{RELAY_API_PATH}/{self._relay_token}"
+
+    @classmethod
+    def default_relay_address(cls) -> str:
+        """未填写时默认使用 MoviePilot 设置里的「访问域名」(APP_DOMAIN)，它本来就是
+        MoviePilot 的对外访问地址，新用户不需要自己再填一遍"""
+        domain = str(getattr(settings, "APP_DOMAIN", "") or "").strip().rstrip("/")
+        if not domain:
+            return ""
+        if domain.lower().startswith(("http://", "https://")):
+            return domain
+        host = urlparse(f"//{domain}").hostname or ""
+        return f"{'http' if cls.is_lan_host(host) else 'https'}://{domain}"
 
     def relay_address_is_lan(self) -> bool:
         return self.is_lan_host(urlparse(self._relay_address or "").hostname)
@@ -1191,7 +1209,7 @@ class ANiStrmHub(_PluginBase):
         这里的来源地址是反向代理自己的局域网地址——0.11.0 就因此把外网请求当成局域网
         放行。所以同时满足两条才算局域网：
         1. 访问地址(Host)是局域网地址。经 Lucky 等反向代理访问时，Host 是公网域名
-           (已实测：外网访问时 MoviePilot 看到的 Host 为 mp.example.com:8443)；
+           (已实测：经 Lucky 反向代理从外网访问时，MoviePilot 看到的 Host 是公网域名)；
         2. 整条转发链(直接连接方、X-Forwarded-For、X-Real-IP)都是局域网地址。"""
         raw_host = request.headers.get("host") or ""
         host = urlparse(f"//{raw_host}").hostname or raw_host
@@ -1299,7 +1317,7 @@ class ANiStrmHub(_PluginBase):
                 logger.warning(f"ANiStrmHub本地中转：拒绝外网的无密钥请求（{basis}）")
                 if self.relay_address_is_lan():
                     return self.__deny(
-                        "拒绝访问：该中转链接只能在局域网内使用。需要在外网播放，请把插件的「strm 访问地址」改为公网地址，"
+                        "拒绝访问：该中转链接只能在局域网内使用。需要在外网播放，请把插件的「MoviePilot 访问地址」改为公网地址，"
                         "再在插件详情页点击「本地中转」重建直链"
                     )
                 return self.__deny(
@@ -1561,9 +1579,9 @@ class ANiStrmHub(_PluginBase):
         relay_prefix = self.relay_prefix()
         is_lan = self.relay_address_is_lan()
         if not self._relay_enabled:
-            status_type, status = "info", "未启用。启用并填写 strm 访问地址、保存后，本地中转会作为一条线路加入加速源列表"
+            status_type, status = "info", "未启用。启用并保存后，本地中转会作为一条线路出现在详情页「重建为」中"
         elif not relay_prefix:
-            status_type, status = "warning", "请填写 strm 访问地址（以 http:// 或 https:// 开头）后保存"
+            status_type, status = "warning", "请填写 MoviePilot 访问地址（以 http:// 或 https:// 开头）后保存"
         else:
             mode = "局域网地址：链接不带密钥，仅家里的设备可播放" if is_lan else "公网地址：链接自动附带密钥，在家和在外都能播放"
             using = (self._accelerator_prefix or "").rstrip("/") == relay_prefix
@@ -1573,45 +1591,40 @@ class ANiStrmHub(_PluginBase):
             "本地中转",
             [
                 self.__notice(
-                    "为不走代理的媒体服务器和播放器提供视频转发：strm 指向 MoviePilot，由 MoviePilot 经你的代理拉取视频"
-                    "再转发，支持拖动进度，播放设备无需任何代理设置。只转发 ANi 视频，使用期间请保持插件启用。"
+                    "媒体服务器或播放器不能翻墙时使用：strm 改为指向 MoviePilot，由 MoviePilot 通过代理拉取 ANi 视频"
+                    "再转给播放器，支持拖动进度，播放设备不用做任何设置。启用并保存后，在插件详情页点击「本地中转」即可切换。"
                 ),
                 self.__row(
                     [
-                        (3, {"component": "VSwitch", "props": {"model": "relay_enabled", "label": "启用本地中转"}}),
-                        (
-                            5,
-                            {
-                                "component": "VTextField",
-                                "props": {
-                                    "model": "relay_address",
-                                    "label": "strm 访问地址",
-                                    "placeholder": "https://mp.example.com:8443",
-                                    "hint": "播放设备访问 MoviePilot 的地址。填公网地址在家和在外都能播放；只在家里看可填局域网地址",
-                                    "persistent-hint": True,
-                                },
-                            },
-                        ),
+                        (2, {"component": "VSwitch", "props": {"model": "relay_enabled", "label": "启用"}}),
                         (
                             4,
                             {
                                 "component": "VTextField",
                                 "props": {
-                                    "model": "relay_proxy",
-                                    "label": "中转代理",
-                                    "placeholder": "留空使用 MoviePilot 的代理设置",
-                                    "hint": "如 http://192.168.1.2:7890",
+                                    "model": "relay_address",
+                                    "label": "MoviePilot 访问地址",
+                                    "placeholder": "http://192.168.1.10:3000",
+                                    "hint": "外网播放需填公网地址，默认读取「访问域名」",
                                     "persistent-hint": True,
                                 },
                             },
                         ),
-                    ]
-                ),
-                self.__row(
-                    [
-                        (3, {"component": "div"}),
                         (
-                            5,
+                            3,
+                            {
+                                "component": "VTextField",
+                                "props": {
+                                    "model": "relay_proxy",
+                                    "label": "代理服务器",
+                                    "placeholder": "留空使用系统代理",
+                                    "hint": "拉取视频用，如 http://192.168.1.2:7890",
+                                    "persistent-hint": True,
+                                },
+                            },
+                        ),
+                        (
+                            3,
                             {
                                 # 只读输入框绑定密钥，右侧刷新图标即「重置密钥」：在浏览器里直接生成新
                                 # 密钥并显示出来，保存后生效。图标用 append-inner-icon 属性而不是插槽内容，
@@ -1623,7 +1636,7 @@ class ANiStrmHub(_PluginBase):
                                     "readonly": True,
                                     "append-inner-icon": "mdi-refresh",
                                     "onClick:appendInner": RELAY_TOKEN_JS,
-                                    "hint": "公网地址时写入 strm 链接。点击右侧图标重置，保存后到详情页重建直链，旧链接失效",
+                                    "hint": "点右侧图标重置",
                                     "persistent-hint": True,
                                 },
                             },

@@ -2255,7 +2255,7 @@ class TestRelayDenyMessages(_RelayHarness):
 
     def test_tokenless_link_with_lan_address_says_change_to_public(self, monkeypatch):
         response = self._get(monkeypatch, self._url(token=None))
-        assert response.status_code == 403 and "只能在局域网内使用" in response.text and "strm 访问地址" in response.text
+        assert response.status_code == 403 and "只能在局域网内使用" in response.text and "MoviePilot 访问地址" in response.text
 
     def test_outdated_token_says_key_invalid_even_from_lan(self, monkeypatch):
         response = self._get(monkeypatch, self._url(token="OldKey123456789ab"), host="192.168.1.10:3000")
@@ -2264,4 +2264,63 @@ class TestRelayDenyMessages(_RelayHarness):
     def test_no_stale_field_name_in_messages(self):
         import app.plugins.anistrmhub as module
 
-        assert "中转访问地址" not in Path(module.__file__).read_text(encoding="utf-8")
+        source = Path(module.__file__).read_text(encoding="utf-8")
+        assert "中转访问地址" not in source and "strm 访问地址" not in source
+
+
+class TestV3ResponseEnvelope:
+    """MoviePilot V3 前端严格校验响应：恰好 success/message/data 三个字段，
+    否则报「服务器返回了无效响应」(用户实测，任务其实已在后台运行)"""
+
+    @pytest.mark.parametrize("name,payload", [("detect", None), ("format_disk", None), ("rebuild", {"accelerator": "https://evil.example"})])
+    def test_action_response_is_standard_envelope(self, monkeypatch, name, payload):
+        import app.plugins.anistrmhub as module
+
+        class _NoThread:
+            def __init__(self, target=None, **kwargs):
+                pass
+
+            def start(self):
+                pass
+
+        monkeypatch.setattr(module.threading, "Thread", _NoThread)
+        plugin = ANiStrmHub()
+        plugin.init_plugin({})
+        result = plugin.run_action(name, payload)
+        assert set(result) == {"success", "message", "data"}
+        assert isinstance(result["success"], bool) and isinstance(result["message"], str)
+
+
+class TestDefaultRelayAddress:
+    @pytest.mark.parametrize(
+        "app_domain,expected",
+        [
+            ("https://mp.example.com:8443/", "https://mp.example.com:8443"),
+            ("mp.example.com", "https://mp.example.com"),
+            ("192.168.1.10:3000", "http://192.168.1.10:3000"),
+            ("", ""),
+        ],
+    )
+    def test_defaults_to_moviepilot_app_domain(self, monkeypatch, app_domain, expected):
+        import app.plugins.anistrmhub as module
+
+        monkeypatch.setattr(module.settings, "APP_DOMAIN", app_domain, raising=False)
+        plugin = ANiStrmHub()
+        plugin.init_plugin({"relay_enabled": True})
+        assert plugin._relay_address == expected
+
+    def test_user_value_wins_over_app_domain(self, monkeypatch):
+        import app.plugins.anistrmhub as module
+
+        monkeypatch.setattr(module.settings, "APP_DOMAIN", "https://mp.example.com", raising=False)
+        plugin = ANiStrmHub()
+        plugin.init_plugin({"relay_enabled": True, "relay_address": "http://192.168.1.10:3000"})
+        assert plugin._relay_address == "http://192.168.1.10:3000"
+
+    def test_form_uses_generic_example_addresses(self):
+        # 界面示例只用通用地址，不出现任何用户的真实地址
+        plugin = ANiStrmHub()
+        plugin.init_plugin({})
+        form_text = str(plugin.get_form()[0])
+        assert "'placeholder': 'http://192.168.1.10:3000'" in form_text
+        assert "如 http://192.168.1.2:7890" in form_text
