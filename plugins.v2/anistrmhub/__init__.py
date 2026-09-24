@@ -7,7 +7,7 @@ import time
 import xml.etree.ElementTree as ET
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
 from urllib.parse import quote, unquote, urlparse, urlunparse
 
 import pytz
@@ -19,21 +19,27 @@ from app.log import logger
 from app.plugins import _PluginBase
 from app.utils.http import RequestUtils
 
-# 唯一默认订阅源。0.6.0起订阅源只有一个配置值，下面这个内置候选池是抓取
-# 失败时后台自动依次尝试的容灾兜底，不作为UI概念暴露——0.4.0的"多源同时
-# 聚合谁先抓到用谁"和0.5.0的"列表+选择器"都把容灾暴露成了需要理解的概念，
-# 复杂度与实际需求不匹配。
-DEFAULT_SUBSCRIPTION_SOURCE = "https://api.pili.cc.cd/ani-download.xml"
-# ANi官方直链域名，用于"还原成裸链接"时重建地址——不管当前strm内容被套了
+# 内置订阅源，以可选项的形式展示给用户，用哪个由用户自己选，插件不在后台
+# 自动切换。订阅源分两类：社区镜像下发的视频直链已经自带镜像方的加速；
+# ANi 官方下发的是未加速的官方直链，需要自己配置加速源。默认给新用户
+# 已加速的镜像，开箱即用。
+BUILTIN_SUBSCRIPTIONS: Tuple[Tuple[str, str], ...] = (
+    ("https://api.pili.cc.cd/ani-download.xml", "pili 镜像（已加速）"),
+    ("https://aniapi.op5.de5.net/ani-download.xml", "op5 镜像（已加速）"),
+    ("https://api.ani.rip/ani-download.xml", "ANi 官方（未加速）"),
+)
+DEFAULT_SUBSCRIPTION_SOURCE = BUILTIN_SUBSCRIPTIONS[0][0]
+# 内置加速源，同样只作为可选项展示。这两个就是上面两个镜像自带加速所用的
+# 反代节点，也可以单独套在官方订阅源的直链上使用。
+BUILTIN_ACCELERATORS: Tuple[Tuple[str, str], ...] = (
+    ("https://pro.pili.cc.cd", "pili 节点"),
+    ("https://pro.op5.de5.net", "op5 节点"),
+)
+# ANi官方直链域名，用于重建官方直链——不管当前strm内容被套了
 # 几层壳，extract_resource_path()都能从URL末尾定位出跟域名无关的"季度/
-# 文件名?query"这一段，配上这个官方域名就能拼出一个确定的裸直链，不需要
+# 文件名?query"这一段，配上这个官方域名就能拼出一个确定的官方直链，不需要
 # "记住"当初到底是被哪个加速源套过壳(单值配置模型下也没地方存这个记忆)。
 OFFICIAL_BASE_URL = "https://resources.ani.rip"
-FALLBACK_SUBSCRIPTION_POOL: Tuple[str, ...] = (
-    "https://api.pili.cc.cd/ani-download.xml",
-    "https://aniapi.op5.de5.net/ani-download.xml",
-    "https://api.ani.rip/ani-download.xml",
-)
 
 # 非正片附属文件的标题关键词，固定常量不再作为配置项——预告/OP/ED这类标记
 # 在几乎所有ANi/fansub命名习惯里含义固定，没必要为此暴露一个配置项
@@ -61,6 +67,15 @@ LAYOUT_BY_TITLE = "by_title"
 HTML_LIKE_PREFIXES = (b"<!doctype", b"<html", b"<?xml", b"{")
 NON_VIDEO_CONTENT_TYPES = ("text/html", "text/plain", "application/json", "application/xml", "text/xml")
 PROBE_RANGE_BYTES = 64  # 够读到mp4的ftyp box或分辨明显的错误页，开销依然很小
+OFFICIAL_HOST = urlparse(OFFICIAL_BASE_URL).netloc
+# 播放线路测速：下载视频开头一段测持续吞吐，按"量"和"时"双重封顶——4MB
+# 足够让读数稳定，8秒封顶保证慢线路不会拖住检测任务。
+SPEED_TEST_BYTES = 4 * 1024 * 1024
+SPEED_TEST_MAX_SECONDS = 8
+SPEED_TEST_CHUNK_BYTES = 64 * 1024
+# ANi 1080P 单集约 570MB/24分钟，折合约 400KB/s(3.2Mbps)。线路速度低于这个值
+# 播放必然卡顿，达到两倍以上才有余量应对波动。
+PLAYBACK_BITRATE_KBPS = 400
 # 维护类任务连续探测失败到这个次数就中止。目标地址整体不可达时逐个文件磨
 # 下去毫无意义：实测有一次跑满72分钟、1461个文件全部"无响应(连接失败或
 # 超时)"、最终一个文件都没改。
@@ -69,9 +84,9 @@ MAX_CONSECUTIVE_PROBE_FAILURES = 10
 
 class ANiStrmHub(_PluginBase):
     plugin_name = "ANiStrmHub"
-    plugin_desc = "填一个订阅源+一个加速地址即可，自动抓取ANi新番资源生成strm文件，mp刮削入库，媒体服务器直连播放"
+    plugin_desc = "开箱即用的ANi新番strm生成：内置已加速订阅源，也可选官方源自配加速；mp刮削入库，媒体服务器直连播放"
     plugin_icon = "https://raw.githubusercontent.com/oiloveio/MoviePilot-Plugins/main/icons/anistrmhub.png"
-    plugin_version = "0.8.0"
+    plugin_version = "0.9.0"
     plugin_author = "oiloveio"
     author_url = "https://github.com/oiloveio"
     plugin_config_prefix = "anistrmhub_"
@@ -90,7 +105,6 @@ class ANiStrmHub(_PluginBase):
     _accelerator_prefix = ""
 
     _refresh_subscription_once = False
-    _apply_accelerator_once = False
     _regroup_once = False
     _backfill_once = False
     _detect_once = False
@@ -100,7 +114,7 @@ class ANiStrmHub(_PluginBase):
         super().__init__()
         self._client = AniRssAggregator()
         self._strm_service = StrmFileService()
-        self._relink_service = StrmRelinkService(request_factory=self._client.build_request_utils)
+        self._relink_service = StrmRelinkService(request_factory=self._client.build_direct_request_utils)
 
     def init_plugin(self, config: dict = None):
         self.stop_service()
@@ -119,7 +133,6 @@ class ANiStrmHub(_PluginBase):
         self._accelerator_prefix = (config.get("accelerator_prefix") or "").strip()
 
         self._refresh_subscription_once = config.get("refresh_subscription_once", False)
-        self._apply_accelerator_once = config.get("apply_accelerator_once", False)
         self._regroup_once = config.get("regroup_once", False)
         self._backfill_once = config.get("backfill_once", False)
         self._detect_once = config.get("detect_once", False)
@@ -135,7 +148,6 @@ class ANiStrmHub(_PluginBase):
             self._enabled
             or self._onlyonce
             or self._refresh_subscription_once
-            or self._apply_accelerator_once
             or self._regroup_once
             or self._backfill_once
             or self._detect_once
@@ -170,9 +182,6 @@ class ANiStrmHub(_PluginBase):
         if self._refresh_subscription_once:
             pending.append(("refresh_subscription", "重建直链", self.__refresh_subscription_task))
             self._refresh_subscription_once = False
-        if self._apply_accelerator_once:
-            pending.append(("apply_accelerator", "应用加速源", self.__apply_accelerator_task))
-            self._apply_accelerator_once = False
         if self._regroup_once:
             pending.append(("regroup", "重建目录结构", self.__regroup_local_strm_task))
             self._regroup_once = False
@@ -217,33 +226,24 @@ class ANiStrmHub(_PluginBase):
                 logger.error(f"ANiStrmHub{task_name}：任务异常终止 - {err}")
                 self.__save_task_status(task_key, "done", f"任务异常终止：{err}")
 
-    def __subscription_candidates(self, primary: str) -> List[str]:
-        """主订阅源优先，抓取失败时按顺序自动试内置容灾候选池——这一步完全
-        在后台完成，不需要理解"多源列表"这个概念，也不会像0.4.0那样把多个源
-        的内容混在一起用(那是坏链接的根因)，每次运行始终只用其中一个"""
-        ordered = [primary] + [c for c in FALLBACK_SUBSCRIPTION_POOL if c != primary]
-        return list(dict.fromkeys(ordered))
-
-    def __resolve_accelerator_for_this_run(self, sample_link: str) -> Optional[str]:
+    def __check_accelerator_for_this_run(self, sample_link: str) -> Optional[str]:
         """加速源现在只有一个配置值。用这一轮实际抓到的样本直链实测一次
         "这个加速源套上这条直链"能不能连通——只测一次，不是每条目都测，
-        拉新番的速度不受影响；这一次检查就是从设计上避免"加速源套在一个
-        连不通的组合上批量生成坏链接"的安全网，取代4.0.0"完全不测"和
-        5.0.0部分场景"逐条测"这两个极端。探测不通过就本次任务不加速，
-        写入裸直链，不阻塞整个任务。"""
+        拉新番的速度不受影响；这一次检查是避免"加速源连不通却批量生成
+        坏链接"的安全网。探测不通过就本次不生成、在运行状态里写明原因，
+        不会悄悄换成别的线路——用哪条线路始终由用户的配置决定。只测通不通
+        不测速，线路快慢由「连通性检测」负责。
+
+        返回None表示可以继续，返回字符串表示不可达的原因。"""
         prefix = (self._accelerator_prefix or "").strip()
         if not prefix:
             return None
-        candidate = StrmRelinkService.build_proxied_url(sample_link, prefix)
+        candidate = StrmRelinkService.compose_link(sample_link, prefix)
         latency_ms, fail_reason = self._relink_service.probe_latency_ms(candidate)
         if latency_ms is None:
-            logger.warning(
-                f"ANiStrmHub订阅同步：加速源{prefix}套上本次样本直链探测不可达({fail_reason})，"
-                f"本次任务不加速，写入裸直链"
-            )
-            return None
-        logger.info(f"ANiStrmHub订阅同步：加速源{prefix}探测可达({latency_ms}ms)，新生成的strm将套用")
-        return prefix
+            return fail_reason or "不可达"
+        logger.info(f"ANiStrmHub订阅同步：加速源{prefix}探测可达({latency_ms}ms)")
+        return None
 
     def __resolve_relative_dir(self, file_name: str) -> Optional[str]:
         """按当前"strm存放方式"决定这个文件该放在storageplace下的哪个子目录：
@@ -251,7 +251,7 @@ class ANiStrmHub(_PluginBase):
 
         决定目录的逻辑只有这一处——订阅同步(__task)和重建目录结构
         (__regroup_local_strm_task)都调它；补全历史剧集用ref_file.with_name()
-        天然跟参照文件同目录、重建直链/应用加速源都是原地改写内容不挪
+        天然跟参照文件同目录、重建直链是原地改写内容不挪
         位置，所以那三个任务不需要各自再解析一遍剧名(各写各的正是"同一部剧
         一半在文件夹里一半在根目录"这类分裂的来源)。"""
         if self._strm_layout != LAYOUT_BY_TITLE:
@@ -263,13 +263,11 @@ class ANiStrmHub(_PluginBase):
         return StrmFileService.safe_dir_name(series)
 
     def __finalize_strm_link(self, real_link: str) -> str:
-        """补全历史剧集用：套用当前配置的加速源(没配置就是原始直链)。这个任务
+        """补全历史剧集用：按当前加速源重组链接(没配置就是官方直链)。参照文件
+        可能是任意历史线路，统一经compose_link重组，不会叠出多层壳。这个任务
         本身对每个候选都会探测最终地址，天然有安全网，不需要像__task那样
         额外做一次性的"这个组合能不能用"预检查。"""
-        accelerator = (self._accelerator_prefix or "").strip()
-        if accelerator:
-            return StrmRelinkService.build_proxied_url(real_link, accelerator)
-        return real_link
+        return StrmRelinkService.compose_link(real_link, self._accelerator_prefix)
 
     def __build_season_options(self) -> List[Dict[str, str]]:
         """拉当前配置订阅源的样本条目，从里面提取当前RSS窗口内出现过的季度，
@@ -321,28 +319,13 @@ class ANiStrmHub(_PluginBase):
 
     def __task(self):
         self.__save_task_status("task", "running", "进行中")
-        primary = (self._subscription_source or "").strip() or DEFAULT_SUBSCRIPTION_SOURCE
-
-        entries = None
-        used_source = None
-        tried = []
-        for candidate in self.__subscription_candidates(primary):
-            tried.append(candidate)
-            try:
-                entries = self._client.fetch_one_source(candidate)
-                used_source = candidate
-                break
-            except Exception as err:
-                logger.warning(f"ANiStrmHub订阅同步：订阅源抓取失败，自动尝试下一个候选：{candidate} - {err}")
-                continue
-
-        if entries is None:
-            logger.warning(f"ANiStrmHub订阅同步：全部{len(tried)}个候选订阅源均抓取失败，本次任务结束")
-            self.__save_task_status("task", "done", f"全部候选订阅源均不可用({len(tried)}个)")
+        used_source = (self._subscription_source or "").strip() or DEFAULT_SUBSCRIPTION_SOURCE
+        try:
+            entries = self._client.fetch_one_source(used_source)
+        except Exception as err:
+            logger.warning(f"ANiStrmHub订阅同步：订阅源{used_source}抓取失败，本次任务结束 - {err}")
+            self.__save_task_status("task", "done", f"订阅源抓取失败：{err}")
             return
-
-        if used_source != primary:
-            logger.warning(f"ANiStrmHub订阅同步：主订阅源{primary}不可用，本次自动切到{used_source}")
 
         if not entries:
             logger.warning("ANiStrmHub订阅同步：订阅源RSS无内容，本次任务结束")
@@ -355,7 +338,15 @@ class ANiStrmHub(_PluginBase):
             self.__save_task_status("task", "done", "季度筛选后无条目")
             return
 
-        resolved_accelerator = self.__resolve_accelerator_for_this_run(entries[0]["link"])
+        accelerator = (self._accelerator_prefix or "").strip()
+        unreachable_reason = self.__check_accelerator_for_this_run(entries[0]["link"])
+        if unreachable_reason:
+            logger.warning(
+                f"ANiStrmHub订阅同步：加速源{accelerator}探测不可达({unreachable_reason})，本次不生成，"
+                f"下次定时运行会重试；可运行「连通性检测」对比线路后更换加速源"
+            )
+            self.__save_task_status("task", "done", f"加速源不可达，本次未生成：{unreachable_reason}")
+            return
 
         total_created = 0
         total_exists = 0
@@ -373,9 +364,9 @@ class ANiStrmHub(_PluginBase):
 
             relative_dir = self.__resolve_relative_dir(title)
 
-            file_url = entry["link"]
-            if resolved_accelerator:
-                file_url = StrmRelinkService.build_proxied_url(file_url, resolved_accelerator)
+            # 加速源留空：原样使用订阅源下发的链接(镜像源自带加速，官方源是官方直链)；
+            # 填了加速源：先剥掉镜像自带的那层再套，不会叠出两层壳
+            file_url = StrmRelinkService.compose_link(entry["link"], accelerator)
 
             status = self._strm_service.touch_strm_file(
                 storage_path=self._storageplace,
@@ -488,9 +479,13 @@ class ANiStrmHub(_PluginBase):
         return stats
 
     def __refresh_subscription_task(self):
-        """用当前配置的这一个订阅源重建本地已有 strm 的直链：标题还在 RSS 窗口
-        内的直接换成最新直链，不在窗口内的按路径迁移公式换成这个订阅源的域名
-        前缀。只有一个订阅源可选，不需要"目标订阅源"这种选择器概念。"""
+        """按当前的「订阅源 + 加速源」重建本地全部 strm 的链接，结果与订阅同步
+        新生成的strm完全一致——换了订阅源、换了加速源、清空了加速源，都跑这
+        一个任务：
+        - 标题还在 RSS 窗口内：直接用订阅源给出的最新链接；
+        - 不在窗口内：取原文件的资源路径("季度/文件名?query"，与线路无关)，
+          接到当前订阅源的线路前缀上；
+        - 最后经compose_link：加速源留空保持订阅源线路，填了就换成该加速源。"""
         self.__save_task_status("refresh_subscription", "running", "进行中")
         # 先确认目录存在再抓RSS：目录都不在就没必要白发一次网络请求
         directory = Path(self._storageplace) if self._storageplace else None
@@ -512,59 +507,24 @@ class ANiStrmHub(_PluginBase):
             return
 
         title_map = {entry["title"]: entry["link"] for entry in entries}
-        domain_prefix = StrmRelinkService.derive_prefix(entries[0]["link"])
+        source_prefix = StrmRelinkService.derive_prefix(entries[0]["link"]) or f"{OFFICIAL_BASE_URL}/"
         accelerator = (self._accelerator_prefix or "").strip()
 
         def resolve(strm_file: Path, old_content: str) -> Tuple[Optional[str], str]:
             matched_link = title_map.get(strm_file.stem)
             if matched_link:
-                bare_link = matched_link
-                match_kind = "标题精确匹配更新"
-            elif domain_prefix:
-                # extract_resource_path 对 URL 末尾的"季度/文件名?query"定位，
-                # 不管 old_content 当前有没有被套壳、被谁套壳都能定位到，不需要
-                # 先剥壳——这一段本身就跟域名/加速源无关
+                source_link, match_kind = matched_link, "标题精确匹配更新"
+            else:
                 resource_path = StrmRelinkService.extract_resource_path(old_content)
                 if not resource_path:
                     return None, "无法识别(保留原文件)"
-                bare_link = domain_prefix + resource_path
-                match_kind = "路径迁移更新"
-            else:
-                return None, "无法识别(保留原文件)"
-            final_link = StrmRelinkService.build_proxied_url(bare_link, accelerator) if accelerator else bare_link
-            return final_link, match_kind
+                source_link, match_kind = source_prefix + resource_path, "路径迁移更新"
+            return StrmRelinkService.compose_link(source_link, accelerator), match_kind
 
         self.__rewrite_local_strm(
             "refresh_subscription",
             "重建直链",
             ["标题精确匹配更新", "路径迁移更新"],
-            resolve,
-        )
-
-    def __apply_accelerator_task(self):
-        """用当前配置的这一个加速源(留空=不加速)重新套用/还原本地全部 strm。
-        "套上"和"去掉"是同一个操作，依据 accelerator_prefix 是否为空决定。
-
-        不管 strm 当前内容有没有被套壳、被谁套壳，都先用 extract_resource_path
-        定位出跟域名无关的"季度/文件名?query"这一段，配上官方域名重建裸直链，
-        再按需要套用当前加速源——这样加速源字段从 A 改成 B、或者直接清空，都能
-        正确处理，不需要"记住"当初到底是哪个加速源套的壳。"""
-        self.__save_task_status("apply_accelerator", "running", "进行中")
-        accelerator = (self._accelerator_prefix or "").strip()
-        applied_kind = "已套上加速源" if accelerator else "已还原为裸链接"
-
-        def resolve(strm_file: Path, old_content: str) -> Tuple[Optional[str], str]:
-            resource_path = StrmRelinkService.extract_resource_path(old_content)
-            if not resource_path:
-                return None, "无法识别(保留原文件)"
-            bare_link = f"{OFFICIAL_BASE_URL}/{resource_path}"
-            final_link = StrmRelinkService.build_proxied_url(bare_link, accelerator) if accelerator else bare_link
-            return final_link, applied_kind
-
-        self.__rewrite_local_strm(
-            "apply_accelerator",
-            "应用加速源",
-            [applied_kind],
             resolve,
         )
 
@@ -771,65 +731,168 @@ class ANiStrmHub(_PluginBase):
         self.__save_task_status("backfill", "done", summary)
 
     def __detect_task(self):
-        """探测当前配置的订阅源(以及内置容灾候选池，仅作只读诊断展示，不是
-        需要维护的配置项)分别的直连情况，以及套上当前配置加速源之后的
-        连通情况，顺带统计本地strm按"订阅源+加速源"分类的分布。"""
-        self.__save_task_status("detect", "running", "进行中")
-        primary = (self._subscription_source or "").strip() or DEFAULT_SUBSCRIPTION_SOURCE
-        candidates = self.__subscription_candidates(primary)
-        accelerator = (self._accelerator_prefix or "").strip()
+        """分两层检测，两层回答的是不同问题：
+        1. 订阅源：RSS(XML)能不能拿到。只决定"能不能发现新番"，跟播放快慢无关；
+        2. 播放线路：取一条真实视频直链，分别测官方直链、各内置加速节点和用户
+           自定义的加速源，每条线路测首包耗时和持续下载速度——这才决定媒体
+           服务器起播快慢、播放卡不卡。
+        内置订阅源和加速节点只作为参照一起测，结果标注"当前使用"和"最快"，
+        换不换由用户在配置里决定，插件不自动切换。
 
-        rows = []
-        domain_to_label: Dict[str, str] = {}
-        for idx, url in enumerate(candidates):
-            label = "当前配置" if idx == 0 else f"内置容灾候选{idx}"
+        视频探测不走MP代理(播放器本身不经过它)。只手动触发不进定时任务，每条
+        线路只下载开头几MB、线路之间间隔请求，避免被目标站点风控。"""
+        self.__save_task_status("detect", "running", "进行中")
+        configured = (self._subscription_source or "").strip() or DEFAULT_SUBSCRIPTION_SOURCE
+        accelerator = (self._accelerator_prefix or "").strip().rstrip("/")
+        builtin_names = dict(BUILTIN_SUBSCRIPTIONS)
+
+        subscriptions: List[Dict[str, Any]] = []
+        configured_sample: Optional[Dict[str, str]] = None
+        fallback_sample: Optional[Dict[str, str]] = None
+        extra_nodes: List[str] = []
+        for url in dict.fromkeys([configured] + [u for u, _ in BUILTIN_SUBSCRIPTIONS]):
             row: Dict[str, Any] = {
-                "subscription": url,
-                "label": label,
-                "rss_ok": False,
+                "url": url,
+                "label": builtin_names.get(url, "自定义订阅源"),
+                "current": url == configured,
+                "ok": False,
+                "entries": 0,
+                "elapsed_ms": None,
                 "error": None,
-                "columns": [],
             }
+            start = time.monotonic()
             try:
                 entries = self._client.fetch_one_source(url)
             except Exception as err:
                 row["error"] = str(err)
-                rows.append(row)
-                logger.warning(f"ANiStrmHub连通性检测：{url} RSS抓取失败 - {err}")
+                subscriptions.append(row)
+                logger.warning(f"ANiStrmHub连通性检测：订阅源{url}抓取失败 - {err}")
                 continue
-
-            row["rss_ok"] = True
-            if not entries:
+            row["ok"] = True
+            row["elapsed_ms"] = round((time.monotonic() - start) * 1000, 1)
+            row["entries"] = len(entries)
+            if entries:
+                if url == configured:
+                    configured_sample = entries[0]
+                elif fallback_sample is None:
+                    fallback_sample = entries[0]
+                embedded = StrmRelinkService.embedded_accelerator(entries[0]["link"])
+                if embedded:
+                    extra_nodes.append(embedded)
+            else:
                 row["error"] = "RSS无条目"
-                rows.append(row)
-                continue
+            subscriptions.append(row)
 
-            sample_link = entries[0]["link"]
-            domain_to_label[urlparse(sample_link).netloc] = label
-
-            time.sleep(0.3)
-            latency_ms, fail_reason = self._relink_service.probe_latency_ms(sample_link)
-            row["columns"].append({"label": "直连", "latency_ms": latency_ms, "error": fail_reason})
-
-            if accelerator:
-                candidate = StrmRelinkService.build_proxied_url(sample_link, accelerator)
-                time.sleep(0.3)
-                latency_ms, fail_reason = self._relink_service.probe_latency_ms(candidate)
-                row["columns"].append({"label": "加速后", "latency_ms": latency_ms, "error": fail_reason})
-
-            rows.append(row)
-
-        checked_at = datetime.now(tz=pytz.timezone(settings.TZ)).strftime("%Y-%m-%d %H:%M:%S")
-        self.save_data("connectivity_matrix", {"checked_at": checked_at, "rows": rows})
-
-        distribution = StrmRelinkService.scan_local_distribution(
-            self._storageplace, domain_to_label, [accelerator] if accelerator else []
+        sample = configured_sample or fallback_sample
+        # 当前实际使用的线路：填了加速源就是加速源；没填就是当前订阅源自带的线路
+        # (镜像源是镜像的加速节点，官方源是官方直链)
+        if accelerator:
+            current_prefix: Optional[str] = accelerator
+        elif configured_sample:
+            current_prefix = StrmRelinkService.embedded_accelerator(configured_sample["link"])
+        else:
+            current_prefix = "unknown"
+        source_is_official = bool(configured_sample) and (
+            StrmRelinkService.embedded_accelerator(configured_sample["link"]) is None
         )
+
+        routes: List[Dict[str, Any]] = []
+        if sample:
+            accelerator_names = dict(BUILTIN_ACCELERATORS)
+            plan: List[Tuple[str, Optional[str]]] = [("官方直链", None)]
+            for prefix in dict.fromkeys([p for p, _ in BUILTIN_ACCELERATORS] + ([accelerator] if accelerator else []) + extra_nodes):
+                if prefix is None or any(prefix == existing for _, existing in plan):
+                    continue
+                label = accelerator_names.get(prefix) or ("自定义加速源" if prefix == accelerator else "镜像节点")
+                plan.append((label, prefix))
+            for label, prefix in plan:
+                url = StrmRelinkService.compose_link(sample["link"], prefix) if prefix else StrmRelinkService.to_official_link(sample["link"])
+                time.sleep(0.5)
+                measured = self._relink_service.measure_playback(url)
+                routes.append(
+                    {
+                        "label": label,
+                        "prefix": prefix,
+                        "display": prefix or OFFICIAL_BASE_URL,
+                        "current": prefix == current_prefix,
+                        **measured,
+                    }
+                )
+                logger.info(
+                    f"ANiStrmHub连通性检测：{label} {prefix or OFFICIAL_BASE_URL} - "
+                    + (
+                        f"首包{measured['first_byte_ms']}ms，速度{measured['speed_kbps']}KB/s"
+                        if measured.get("error") is None
+                        else f"不可达({measured['error']})"
+                    )
+                )
+
+        verdict_level, verdict = self.__judge_routes(routes, bool(accelerator), source_is_official)
+        checked_at = datetime.now(tz=pytz.timezone(settings.TZ)).strftime("%Y-%m-%d %H:%M:%S")
+        self.save_data(
+            "detect_result",
+            {
+                "checked_at": checked_at,
+                "subscriptions": subscriptions,
+                "sample_title": (sample or {}).get("title"),
+                "routes": routes,
+                "verdict": verdict,
+                "verdict_level": verdict_level,
+            },
+        )
+
+        if accelerator:
+            expected_route: Optional[str] = StrmRelinkService.describe_route(
+                StrmRelinkService.compose_link(f"{OFFICIAL_BASE_URL}/2000-1/sample", accelerator), accelerator
+            )
+        elif configured_sample:
+            expected_route = StrmRelinkService.describe_route(configured_sample["link"])
+        else:
+            expected_route = None
+        distribution = StrmRelinkService.scan_local_distribution(self._storageplace, accelerator, expected_route)
         self.save_data("local_distribution", {"checked_at": checked_at, **distribution})
 
-        summary = f"{len(candidates)}个候选订阅源，本地strm共{distribution.get('total', 0)}个"
+        ok_subscriptions = sum(1 for row in subscriptions if row["ok"] and row["entries"])
+        ok_routes = sum(1 for route in routes if route.get("error") is None)
+        summary = (
+            f"订阅源可用{ok_subscriptions}/{len(subscriptions)}，播放线路可达{ok_routes}/{len(routes)}，"
+            f"本地strm共{distribution.get('total', 0)}个；{verdict}"
+        )
         logger.info(f"ANiStrmHub连通性检测完成：{summary}")
         self.__save_task_status("detect", "done", summary)
+
+    @staticmethod
+    def __judge_routes(routes: List[Dict[str, Any]], has_accelerator: bool, source_is_official: bool) -> Tuple[str, str]:
+        """根据测速结果给出一句可执行的建议，只建议不自动改。其他线路快出30%
+        以上才建议更换，避免单次测速的波动导致来回改配置。"""
+        if not routes:
+            return "error", "当前订阅源和内置订阅源都没有拿到样本直链，无法测试播放线路"
+        reachable = [r for r in routes if r.get("error") is None and r.get("speed_kbps")]
+        if not reachable:
+            return "error", "所有播放线路均不可达，请检查网络"
+        best = max(reachable, key=lambda r: r["speed_kbps"])
+        current = next((r for r in routes if r.get("current")), None)
+
+        def advice(route: Dict[str, Any]) -> str:
+            if route["prefix"]:
+                return f"可将加速源改为 {route['prefix']}"
+            steps = []
+            if has_accelerator:
+                steps.append("清空加速源")
+            if not source_is_official:
+                steps.append("将订阅源改为「ANi 官方（未加速）」")
+            return "可" + "，并".join(steps) + "，直接使用官方直链"
+
+        if not current:
+            return "warning", f"当前订阅源未取到样本，无法判断当前线路；最快的是{best['label']}"
+        if current.get("error") is not None or not current.get("speed_kbps"):
+            return "error", f"当前线路不可达，{advice(best)}"
+        if best is not current and best["speed_kbps"] >= current["speed_kbps"] * 1.3:
+            ratio = best["speed_kbps"] / current["speed_kbps"]
+            return "warning", f"{best['label']}比当前线路快{ratio:.1f}倍，{advice(best)}"
+        if current["speed_kbps"] < PLAYBACK_BITRATE_KBPS:
+            return "warning", "当前线路已是最快，但速度低于1080P码率，播放可能卡顿"
+        return "success", "当前线路速度正常，保持现有配置即可"
 
     def __save_task_status(self, task_key: str, status: str, summary: str = ""):
         """记录一次性任务的运行状态，供详情页展示进度，也用来防止上一次
@@ -903,7 +966,7 @@ class ANiStrmHub(_PluginBase):
                                 [
                                     (4, {"component": "VSwitch", "props": {"model": "enabled", "label": "启用插件"}}),
                                     (4, {"component": "VSwitch", "props": {"model": "onlyonce", "label": "立即运行一次"}}),
-                                    (4, {"component": "VSwitch", "props": {"model": "use_proxy", "label": "使用代理"}}),
+                                    (4, {"component": "VSwitch", "props": {"model": "use_proxy", "label": "订阅源走代理"}}),
                                 ]
                             ),
                             self.__row(
@@ -958,12 +1021,13 @@ class ANiStrmHub(_PluginBase):
                                     (
                                         8,
                                         {
-                                            "component": "VTextField",
+                                            "component": "VCombobox",
                                             "props": {
                                                 "model": "subscription_source",
                                                 "label": "订阅源",
+                                                "items": [url for url, _ in BUILTIN_SUBSCRIPTIONS],
                                                 "placeholder": DEFAULT_SUBSCRIPTION_SOURCE,
-                                                "hint": "抓取失败时自动尝试内置备用镜像",
+                                                "hint": "可选内置源或填写自定义地址；镜像源的视频链接已自带加速",
                                                 "persistent-hint": True,
                                             },
                                         },
@@ -989,14 +1053,27 @@ class ANiStrmHub(_PluginBase):
                                     (
                                         8,
                                         {
-                                            "component": "VTextField",
+                                            "component": "VCombobox",
                                             "props": {
                                                 "model": "accelerator_prefix",
                                                 "label": "加速源",
-                                                "placeholder": "https://pro.pili.cc.cd",
-                                                "hint": "留空=不加速；每次拉取前自动验证可用性",
+                                                "items": [prefix for prefix, _ in BUILTIN_ACCELERATORS],
+                                                "clearable": True,
+                                                "placeholder": "留空不加速",
+                                                "hint": "留空=使用订阅源自带线路；填写后改用该加速源",
                                                 "persistent-hint": True,
                                             },
+                                        },
+                                    ),
+                                    (
+                                        4,
+                                        {
+                                            "component": "div",
+                                            "props": {"class": "text-caption", "style": "white-space: pre-line;"},
+                                            "text": "内置订阅源："
+                                            + "、".join(name for _, name in BUILTIN_SUBSCRIPTIONS)
+                                            + "\n内置加速源："
+                                            + "、".join(f"{name} {prefix}" for prefix, name in BUILTIN_ACCELERATORS),
                                         },
                                     ),
                                 ]
@@ -1017,60 +1094,23 @@ class ANiStrmHub(_PluginBase):
                                 "content": [
                                     self.__row(
                                         [
-                                            (
-                                                4,
-                                                {
-                                                    "component": "VSwitch",
-                                                    "props": {
-                                                        "model": "refresh_subscription_once",
-                                                        "label": "重建直链",
-                                                    },
-                                                },
-                                            ),
-                                            (
-                                                4,
-                                                {
-                                                    "component": "VSwitch",
-                                                    "props": {
-                                                        "model": "apply_accelerator_once",
-                                                        "label": "应用加速源",
-                                                    },
-                                                },
-                                            ),
-                                            (
-                                                4,
-                                                {
-                                                    "component": "VSwitch",
-                                                    "props": {"model": "regroup_once", "label": "重建目录结构"},
-                                                },
-                                            ),
-                                        ]
-                                    ),
-                                    self.__row(
-                                        [
-                                            (
-                                                4,
-                                                {
-                                                    "component": "VSwitch",
-                                                    "props": {"model": "backfill_once", "label": "补全历史剧集"},
-                                                },
-                                            ),
-                                            (
-                                                4,
-                                                {
-                                                    "component": "VSwitch",
-                                                    "props": {"model": "detect_once", "label": "连通性检测"},
-                                                },
-                                            ),
+                                            (3, {"component": "VSwitch", "props": {"model": model, "label": label}})
+                                            for model, label in (
+                                                ("refresh_subscription_once", "重建直链"),
+                                                ("regroup_once", "重建目录结构"),
+                                                ("backfill_once", "补全历史剧集"),
+                                                ("detect_once", "连通性检测"),
+                                            )
                                         ]
                                     ),
                                     {
                                         "component": "div",
                                         "props": {"class": "text-caption", "style": "white-space: pre-line;"},
                                         "text": "手动触发，多选时按顺序依次执行，运行状态见详情页\n"
-                                        "重建直链 / 应用加速源：改写 strm 链接，实测可达才覆盖\n"
+                                        "重建直链：按当前订阅源与加速源重写全部 strm 链接，实测可达才覆盖\n"
                                         "重建目录结构：按「strm 存放方式」移动文件，不改内容\n"
-                                        "补全历史剧集：回溯 RSS 窗口之外的早期集数，串行限流探测",
+                                        "补全历史剧集：回溯 RSS 窗口之外的早期集数，串行限流探测\n"
+                                        "连通性检测：检查订阅源，并实测各播放线路的首包耗时与下载速度",
                                     },
                                 ],
                             },
@@ -1102,7 +1142,6 @@ class ANiStrmHub(_PluginBase):
             "subscription_source": DEFAULT_SUBSCRIPTION_SOURCE,
             "accelerator_prefix": "",
             "refresh_subscription_once": False,
-            "apply_accelerator_once": False,
             "regroup_once": False,
             "backfill_once": False,
             "detect_once": False,
@@ -1122,7 +1161,6 @@ class ANiStrmHub(_PluginBase):
                 "subscription_source": self._subscription_source,
                 "accelerator_prefix": self._accelerator_prefix,
                 "refresh_subscription_once": self._refresh_subscription_once,
-                "apply_accelerator_once": self._apply_accelerator_once,
                 "regroup_once": self._regroup_once,
                 "backfill_once": self._backfill_once,
                 "detect_once": self._detect_once,
@@ -1132,11 +1170,161 @@ class ANiStrmHub(_PluginBase):
     TASK_LABELS = {
         "task": "订阅同步",
         "refresh_subscription": "重建直链",
-        "apply_accelerator": "应用加速源",
         "regroup": "重建目录结构",
         "backfill": "补全历史剧集",
         "detect": "连通性检测",
     }
+
+    @staticmethod
+    def __chip(text: str, color: str) -> dict:
+        return {"component": "VChip", "props": {"color": color, "size": "small", "class": "ma-1"}, "text": text}
+
+    @staticmethod
+    def __format_speed(kbps: float) -> str:
+        return f"{kbps / 1024:.1f} MB/s" if kbps >= 1024 else f"{kbps:.0f} KB/s"
+
+    @staticmethod
+    def __speed_color(kbps: float) -> str:
+        if kbps >= PLAYBACK_BITRATE_KBPS * 2:
+            return "success"
+        if kbps >= PLAYBACK_BITRATE_KBPS:
+            return "warning"
+        return "error"
+
+    def __subscription_card(self, detect_result: Dict[str, Any]) -> dict:
+        rows = []
+        for row in detect_result.get("subscriptions", []):
+            if row.get("ok") and row.get("entries"):
+                chips = [
+                    self.__chip("✅ 可用", "success"),
+                    self.__chip(f"{row['entries']} 条", "default"),
+                    self.__chip(f"{row['elapsed_ms']:.0f} ms", "default"),
+                ]
+            elif row.get("ok"):
+                chips = [self.__chip("⚠️ RSS无条目", "warning")]
+            else:
+                chips = [self.__chip(f"❌ {row.get('error') or '抓取失败'}", "error")]
+            if row.get("current"):
+                chips.append(self.__chip("当前使用", "primary"))
+            rows.append(
+                self.__row(
+                    [
+                        (5, {"component": "span", "props": {"class": "text-body-2"}, "text": f"{row.get('label', '')}　{row.get('url', '')}"}),
+                        (7, {"component": "div", "content": chips}),
+                    ]
+                )
+            )
+        return {
+            "component": "VCard",
+            "props": {"class": "mb-4"},
+            "content": [
+                {"component": "VCardTitle", "text": "订阅源"},
+                {
+                    "component": "VCardSubtitle",
+                    "props": {"style": "white-space: normal;"},
+                    "text": "只检测订阅列表(RSS)能否获取，决定能否发现新番，与播放速度无关；内置订阅源一并列出供参考",
+                },
+                {"component": "VCardText", "content": rows or [{"component": "span", "text": "无数据"}]},
+            ],
+        }
+
+    def __route_card(self, detect_result: Dict[str, Any]) -> dict:
+        routes = detect_result.get("routes", [])
+        reachable = [r for r in routes if r.get("error") is None and r.get("speed_kbps")]
+        best = max(reachable, key=lambda r: r["speed_kbps"]) if reachable else None
+
+        rows = []
+        for route in routes:
+            chips = []
+            if route.get("error") is None and route.get("speed_kbps"):
+                chips.append(self.__chip(f"首包 {route['first_byte_ms']:.0f} ms", "default"))
+                chips.append(self.__chip(self.__format_speed(route["speed_kbps"]), self.__speed_color(route["speed_kbps"])))
+            else:
+                chips.append(self.__chip(f"❌ {route.get('error') or '不可达'}", "error"))
+            if route.get("current"):
+                chips.append(self.__chip("当前使用", "primary"))
+            if best is route and len(reachable) > 1:
+                chips.append(self.__chip("最快", "success"))
+            rows.append(
+                self.__row(
+                    [
+                        (5, {"component": "span", "props": {"class": "text-body-2"}, "text": f"{route.get('label', '')}　{route.get('display') or route.get('prefix') or ''}"}),
+                        (7, {"component": "div", "content": chips}),
+                    ]
+                )
+            )
+
+        body: List[dict] = rows or [{"component": "span", "text": "没有拿到样本直链，未测试播放线路"}]
+        if detect_result.get("verdict"):
+            body.append(
+                {
+                    "component": "VAlert",
+                    "props": {
+                        "type": detect_result.get("verdict_level") or "info",
+                        "variant": "tonal",
+                        "density": "compact",
+                        "class": "mt-3",
+                        "text": detect_result["verdict"],
+                    },
+                }
+            )
+        sample_title = detect_result.get("sample_title") or "无"
+        return {
+            "component": "VCard",
+            "props": {"class": "mb-4"},
+            "content": [
+                {"component": "VCardTitle", "text": f"播放线路测速（{detect_result.get('checked_at', '未知时间')}）"},
+                {
+                    "component": "VCardSubtitle",
+                    "props": {"style": "white-space: normal;"},
+                    "text": f"样本：{sample_title}。从 MoviePilot 主机直接访问视频直链(不经过 MP 代理)，内置加速节点一并列出供参考，"
+                    f"下载开头 {SPEED_TEST_BYTES // 1024 // 1024}MB；1080P 流畅播放约需 "
+                    f"{PLAYBACK_BITRATE_KBPS}KB/s，单次测速存在波动，仅供参考",
+                },
+                {"component": "VCardText", "content": body},
+            ],
+        }
+
+    def __distribution_card(self, local_distribution: Dict[str, Any]) -> dict:
+        by_category = local_distribution.get("by_category", {})
+        total = local_distribution.get("total", 0)
+        rows = []
+        for category, count in sorted(by_category.items(), key=lambda kv: kv[1], reverse=True):
+            percent = f"{count / total * 100:.1f}%" if total else "0%"
+            rows.append(
+                self.__row(
+                    [
+                        (6, {"component": "span", "props": {"class": "text-body-2"}, "text": category}),
+                        (3, {"component": "span", "text": f"{count} 个"}),
+                        (3, {"component": "span", "text": percent}),
+                    ]
+                )
+            )
+        body: List[dict] = rows or [{"component": "span", "text": "存储目录下没有strm文件"}]
+        mismatched = local_distribution.get("mismatched", 0)
+        if mismatched:
+            body.append(
+                {
+                    "component": "VAlert",
+                    "props": {
+                        "type": "warning",
+                        "variant": "tonal",
+                        "density": "compact",
+                        "class": "mt-3",
+                        "text": f"{mismatched} 个strm的线路与当前加速源配置不一致，运行「重建直链」可统一",
+                    },
+                }
+            )
+        return {
+            "component": "VCard",
+            "content": [
+                {
+                    "component": "VCardTitle",
+                    "text": f"本地strm线路分布（共{total}个，{local_distribution.get('checked_at', '未知时间')}）",
+                },
+                {"component": "VCardText", "content": body},
+            ],
+        }
 
     def get_page(self) -> List[dict]:
         content: List[dict] = []
@@ -1200,142 +1388,29 @@ class ANiStrmHub(_PluginBase):
                 }
             )
 
-        connectivity_matrix = self.get_data("connectivity_matrix") or {}
+        detect_result = self.get_data("detect_result") or {}
         local_distribution = self.get_data("local_distribution") or {}
 
-        if not connectivity_matrix and not local_distribution:
+        if not detect_result and not local_distribution:
             content.append(
                 {
                     "component": "VAlert",
                     "props": {
                         "type": "info",
                         "variant": "tonal",
-                        "text": "还没有探测数据。去插件配置页勾选「立即探测连通性」跑一次，这里会显示"
-                        "订阅源直连、套上加速源之后能不能连，还有本地已生成的strm按订阅源+加速源的分布。",
+                        "text": "还没有检测数据。在配置页勾选「连通性检测」运行一次，这里会显示订阅源状态、"
+                        "各播放线路的首包耗时与下载速度，以及本地strm的线路分布。",
                     },
                 }
             )
             return content
 
-        if connectivity_matrix:
-            rows_content = []
-            for row in connectivity_matrix.get("rows", []):
-                chips: List[dict] = []
-                if not row.get("rss_ok"):
-                    chips.append(
-                        {
-                            "component": "VChip",
-                            "props": {"color": "error", "size": "small", "class": "ma-1"},
-                            "text": f"RSS抓取失败：{row.get('error')}",
-                        }
-                    )
-                elif not row.get("columns"):
-                    chips.append(
-                        {
-                            "component": "VChip",
-                            "props": {"color": "warning", "size": "small", "class": "ma-1"},
-                            "text": row.get("error") or "RSS无条目",
-                        }
-                    )
-                else:
-                    for col in row["columns"]:
-                        if col.get("latency_ms") is not None:
-                            chips.append(
-                                {
-                                    "component": "VChip",
-                                    "props": {"color": "success", "size": "small", "class": "ma-1"},
-                                    "text": f"{col['label']}：✅ {col['latency_ms']:.0f}ms",
-                                }
-                            )
-                        else:
-                            chips.append(
-                                {
-                                    "component": "VChip",
-                                    "props": {"color": "error", "size": "small", "class": "ma-1"},
-                                    "text": f"{col['label']}：❌ {col.get('error') or ''}",
-                                }
-                            )
-                rows_content.append(
-                    {
-                        "component": "VRow",
-                        "props": {"class": "align-center mb-1"},
-                        "content": [
-                            {
-                                "component": "VCol",
-                                "props": {"cols": 12, "md": 3},
-                                "content": [
-                                    {"component": "span", "text": f"{row.get('label')}：{row.get('subscription')}"}
-                                ],
-                            },
-                            {
-                                "component": "VCol",
-                                "props": {"cols": 12, "md": 9},
-                                "content": chips,
-                            },
-                        ],
-                    }
-                )
-            content.append(
-                {
-                    "component": "VCard",
-                    "props": {"class": "mb-4"},
-                    "content": [
-                        {
-                            "component": "VCardTitle",
-                            "text": f"连通性检测（检测于 {connectivity_matrix.get('checked_at', '未知时间')}）",
-                        },
-                        {
-                            "component": "VCardText",
-                            "content": rows_content or [{"component": "span", "text": "无数据"}],
-                        },
-                    ],
-                }
-            )
+        if detect_result:
+            content.append(self.__subscription_card(detect_result))
+            content.append(self.__route_card(detect_result))
 
         if local_distribution:
-            by_category = local_distribution.get("by_category", {})
-            total = local_distribution.get("total", 0)
-            rows = []
-            for category, count in sorted(by_category.items(), key=lambda kv: kv[1], reverse=True):
-                percent = f"{count / total * 100:.1f}%" if total else "0%"
-                rows.append(
-                    {
-                        "component": "VRow",
-                        "content": [
-                            {
-                                "component": "VCol",
-                                "props": {"cols": 12, "md": 6},
-                                "content": [{"component": "span", "text": category}],
-                            },
-                            {
-                                "component": "VCol",
-                                "props": {"cols": 12, "md": 3},
-                                "content": [{"component": "span", "text": f"{count} 个"}],
-                            },
-                            {
-                                "component": "VCol",
-                                "props": {"cols": 12, "md": 3},
-                                "content": [{"component": "span", "text": percent}],
-                            },
-                        ],
-                    }
-                )
-            content.append(
-                {
-                    "component": "VCard",
-                    "content": [
-                        {
-                            "component": "VCardTitle",
-                            "text": f"本地strm分布（共{total}个，统计于 "
-                            f"{local_distribution.get('checked_at', '未知时间')}）",
-                        },
-                        {
-                            "component": "VCardText",
-                            "content": rows or [{"component": "span", "text": "storageplace目录下没有strm文件"}],
-                        },
-                    ],
-                }
-            )
+            content.append(self.__distribution_card(local_distribution))
 
         return content
 
@@ -1371,6 +1446,12 @@ class AniRssAggregator:
             proxies=settings.PROXY if self._use_proxy and settings.PROXY else None,
         )
 
+    def build_direct_request_utils(self) -> RequestUtils:
+        """视频直链探测专用，不走MoviePilot代理：strm最终由Emby/Jellyfin/播放器
+        直接访问，它们不经过MP的代理。探测必须站在同样的网络视角，否则会出现
+        "插件测得通、播放器播不了"的假阳性。"""
+        return RequestUtils(ua=settings.USER_AGENT if settings.USER_AGENT else None)
+
     def fetch_one_source(self, url: str) -> List[Dict[str, str]]:
         """抓取单个数据源，不吞异常，抓取失败会直接抛出，由调用方决定要不要
         区分"RSS连不上"和"RSS通了但没内容"两种情况"""
@@ -1379,8 +1460,10 @@ class AniRssAggregator:
     def _fetch_one(self, url: str) -> List[Dict[str, str]]:
         def operation():
             response = self.build_request_utils().get_res(url)
-            if not response or response.status_code != 200:
-                status = response.status_code if response else "无响应"
+            # 必须用 is None 判断：requests.Response 的布尔值等于 response.ok，
+            # 4xx/5xx 响应本身就是 False，用 not response 会把"HTTP 403"误报成"无响应"
+            if response is None or response.status_code != 200:
+                status = response.status_code if response is not None else "无响应"
                 raise ValueError(f"HTTP状态异常：{status}")
             # 用response.content交给ET解析：RSS xml声明里自带encoding，
             # 比依赖requests根据HTTP头猜的response.text更准，避免个别源
@@ -1504,21 +1587,21 @@ class StrmFileService:
 class StrmRelinkService:
     """本地strm链接的构造/探测/归类工具集。
 
-    核心转换公式：
-    1. 域名替换（derive_prefix + extract_resource_path）：ANi各镜像的直链
-       结构是 {前缀}/{季度}/{文件名}?d=mp4，其中"季度/文件名?d=mp4"这一段
-       在所有镜像间完全一致，只有前缀（域名）不同。"重建直链"用的就是
-       这个公式。
-    2. 前缀拼接（build_proxied_url）：把原始链接整体包一层反代前缀，格式仿
-       "Proxy Everything"这类通用反代工具的用法，保留原host不做域名替换。
-       加速源套壳用的是这个公式，两者不要混用。
-    3. strip_known_accelerator是build_proxied_url的逆运算。
-    4. build_season_variant_link/build_episode_variant_link是补全历史剧集用的
-       候选构造：分别替换季度目录和集数数字，其余部分原样保留。
+    链接模型：ANi 全部直链都是 {线路前缀}/{季度}/{文件名}?d=mp4，其中
+    "季度/文件名?d=mp4"这一段(资源路径)在所有镜像、所有加速节点之间完全
+    一致。订阅镜像下发的直链往往已经自带一层加速(如 pili 镜像下发的是
+    https://pro.pili.cc.cd/resources.ani.rip/...)，所以生成strm时不能在
+    RSS原链接上直接叠加速源，否则会叠出两层壳。相关工具：
+    1. to_official_link：用资源路径重建官方直链，剥掉所有加速层；
+    2. compose_link：生成/改写strm的唯一入口。加速源留空时原样使用订阅源的
+       线路，填了加速源时先还原官方直链再套加速源；
+    3. build_proxied_url：前缀拼接公式，新地址 = 加速源 + / + 原host + path + query；
+    4. describe_route：compose_link的逆向归类，用于本地strm分布统计；
+    5. build_season_variant_link/build_episode_variant_link：补全历史剧集的
+       候选构造，分别替换季度目录和集数数字，其余部分原样保留。
     """
 
     SEASON_PATH_RE = re.compile(r"(\d{4}-\d{1,2}/.+)$")
-    DEFAULT_SPEED_TEST_BYTES = 1_048_576  # 1MB，够估算网速又不会跑太久/太费流量
 
     def __init__(self, request_factory):
         self._request_factory = request_factory
@@ -1529,11 +1612,74 @@ class StrmRelinkService:
         return match.group(1) if match else None
 
     @classmethod
+    def to_official_link(cls, link: str) -> str:
+        """剥掉链接上的所有加速层，用资源路径重建官方直链；识别不出资源路径
+        (非ANi格式)时原样返回，不做猜测。"""
+        resource_path = cls.extract_resource_path(link)
+        if not resource_path:
+            return link
+        return f"{OFFICIAL_BASE_URL}/{resource_path}"
+
+    @classmethod
+    def compose_link(cls, link: str, accelerator: Optional[str]) -> str:
+        """生成/改写strm内容的唯一入口。
+        - 加速源留空：原样返回，线路就是订阅源给出的线路(镜像源自带加速，
+          官方源是官方直链)；
+        - 填了加速源：先剥掉链接上已有的所有加速层还原官方直链，再套这个加速源。
+          镜像下发的链接本身带一层壳，直接叠会变成两层。"""
+        accelerator = (accelerator or "").strip()
+        if not accelerator:
+            return link
+        return cls.build_proxied_url(cls.to_official_link(link), accelerator)
+
+    @classmethod
     def derive_prefix(cls, url: str) -> Optional[str]:
+        """订阅源的线路前缀，如 https://pro.pili.cc.cd/resources.ani.rip/ ；
+        重建直链时把本地文件的资源路径接到这个前缀上，改成当前订阅源的线路。"""
         resource_path = cls.extract_resource_path(url)
         if not resource_path:
             return None
         return url[: url.index(resource_path)]
+
+    @classmethod
+    def route_hops(cls, link: str) -> Optional[List[str]]:
+        """把链接的线路前缀拆成逐跳主机列表，如
+        https://pro.pili.cc.cd/resources.ani.rip/2026-7/x -> [pro.pili.cc.cd, resources.ani.rip]"""
+        resource_path = cls.extract_resource_path(link)
+        if not resource_path:
+            return None
+        parsed = urlparse(link[: link.index(resource_path)])
+        if not parsed.netloc:
+            return None
+        return [parsed.netloc] + [seg for seg in parsed.path.split("/") if seg]
+
+    @classmethod
+    def embedded_accelerator(cls, link: str) -> Optional[str]:
+        """订阅镜像下发链接自带的那一层加速前缀(如 https://pro.pili.cc.cd)，
+        作为测速的候选线路；官方直链或结构不是"单层加速+官方域名"时返回None。"""
+        hops = cls.route_hops(link)
+        if not hops or len(hops) != 2 or hops[-1] != OFFICIAL_HOST:
+            return None
+        return f"{urlparse(link).scheme or 'https'}://{hops[0]}"
+
+    @classmethod
+    def describe_route(cls, link: str, accelerator: Optional[str] = None) -> str:
+        """compose_link的逆向归类：这条strm实际走的是哪条线路。"""
+        accelerator = (accelerator or "").strip().rstrip("/")
+        if accelerator and link.startswith(accelerator + "/"):
+            remainder = link[len(accelerator) + 1:]
+            if cls.route_hops("https://" + remainder) == [OFFICIAL_HOST]:
+                return f"加速源 {urlparse(accelerator).netloc or accelerator}（当前配置）"
+        hops = cls.route_hops(link)
+        if not hops:
+            return "无法识别"
+        if hops == [OFFICIAL_HOST]:
+            return "官方直链"
+        if hops[-1] != OFFICIAL_HOST:
+            return f"其他来源 {hops[0]}"
+        if len(hops) == 2:
+            return f"加速源 {hops[0]}"
+        return "多层套壳 " + " → ".join(hops)
 
     @staticmethod
     def build_proxied_url(original_link: str, proxy_prefix: str) -> str:
@@ -1551,18 +1697,6 @@ class StrmRelinkService:
         if parsed.query:
             suffix += "?" + parsed.query
         return f"{proxy_prefix}/{suffix}"
-
-    @staticmethod
-    def strip_known_accelerator(link: str, accelerator_prefixes: List[str]) -> Tuple[str, Optional[str]]:
-        """build_proxied_url的逆运算：如果link是用某个已知加速源前缀套壳的，
-        剥掉这层壳，还原成推测的裸直链(重新补回https://让netloc+path+query
-        变成可用URL)，同时返回匹配到的那个前缀；不匹配任何已知加速源则原样
-        返回link，第二个值为None(视为本来就是裸链接)。"""
-        for prefix in accelerator_prefixes:
-            marker = prefix.rstrip("/") + "/"
-            if link.startswith(marker):
-                return "https://" + link[len(marker):], prefix
-        return link, None
 
     @staticmethod
     def build_title_variant(original_title: str, new_episode: int) -> Optional[str]:
@@ -1614,7 +1748,10 @@ class StrmRelinkService:
         数据——只看HTTP状态码不够：服务器完全可能返回200/206但吐的是错误页
         (html/json)，这个坑已经在真实排查中确认过。返回(延迟ms, None)表示
         成功；返回(None, 失败原因)表示不可达——原因写清楚具体HTTP状态码/
-        内容校验失败/异常信息，不能只留一句"不可达"就没了。"""
+        内容校验失败/异常信息，不能只留一句"不可达"就没了。
+
+        只下载64字节，适合"这条链接存不存在"这类批量校验；衡量线路快慢用
+        measure_playback。"""
         try:
             # 注意：get_res(url, headers=...)里的headers会整体替换掉RequestUtils构造时
             # 设置的默认header(包括UA)，不是合并。必须用update_headers()把Range头合并
@@ -1625,7 +1762,9 @@ class StrmRelinkService:
             start = time.monotonic()
             response = request_utils.get_res(url)
             elapsed_ms = (time.monotonic() - start) * 1000
-            if not response:
+            # 必须用 is None：requests.Response 的布尔值等于 response.ok，4xx/5xx
+            # 响应本身就是 False，用 not response 会把"HTTP 403"误报成"无响应"
+            if response is None:
                 return None, "无响应(连接失败或超时)"
             if response.status_code not in (200, 206):
                 return None, f"HTTP {response.status_code}"
@@ -1636,49 +1775,93 @@ class StrmRelinkService:
             return None, f"异常:{err}"
 
     @staticmethod
-    def _looks_like_video(response: Any) -> bool:
-        """两层校验：1. Content-Type声明的类型不是网页/JSON这类格式；
-        2. 内容开头不是明显的错误页标记，且尽量匹配已知视频容器的魔数字节
-        (mp4/mov的'ftyp'box在偏移4字节处，webm/mkv的EBML头在开头)。ANi的
-        直链固定是mp4容器，遇到不认识的格式但也没有错误页特征时保守放行，
-        避免对没见过的容器类型误杀。"""
+    def _content_type(response: Any) -> str:
         try:
-            content_type = str(response.headers.get("Content-Type", "") or "").split(";")[0].strip().lower()
+            return str(response.headers.get("Content-Type", "") or "").split(";")[0].strip().lower()
         except Exception:
-            content_type = ""
+            return ""
+
+    @classmethod
+    def _looks_like_video(cls, response: Any) -> bool:
+        return cls._looks_like_video_bytes(cls._content_type(response), response.content or b"")
+
+    @staticmethod
+    def _looks_like_video_bytes(content_type: str, content: bytes) -> bool:
+        """两层校验：1. Content-Type声明的类型不是网页/JSON这类格式；
+        2. 内容开头不是html/xml/json这类错误页标记。ANi直链固定是mp4容器
+        (偏移4字节处是'ftyp')，但不强制匹配魔数，没有错误页特征就放行，
+        避免对没见过的容器类型误杀。"""
         if content_type in NON_VIDEO_CONTENT_TYPES:
             return False
-
-        content = response.content or b""
         if not content:
             return False
         stripped = content.lstrip()[:20].lower()
         if any(stripped.startswith(marker) for marker in HTML_LIKE_PREFIXES):
             return False
-        if content[4:8] == b"ftyp":
-            return True
-        if content[:4] == b"\x1a\x45\xdf\xa3":
-            return True
         return True
 
-    def probe_speed_kbps(self, url: str, chunk_bytes: Optional[int] = None) -> Optional[float]:
-        """下载一小段(默认1MB)实测网速，不是下载整部视频。只应该在已经确认
-        probe_latency_ms可达之后再调用，避免对本来就连不上的链接白跑一次。"""
-        chunk_bytes = chunk_bytes or self.DEFAULT_SPEED_TEST_BYTES
+    def measure_playback(self, url: str) -> Dict[str, Any]:
+        """模拟播放器起播：流式下载视频开头一段，得到两个指标——
+        首包耗时(从发起请求到收到第一块视频数据，含跳转，决定起播等待)和
+        持续下载速度(首包之后的吞吐，决定播放会不会卡)。64字节的连通性探测
+        只能回答"通不通"，回答不了"快不快"，测线路必须用这个。
+
+        下载量和时长双重封顶(SPEED_TEST_BYTES / SPEED_TEST_MAX_SECONDS)，
+        读够就主动断开，不会下载整集。返回
+        {"first_byte_ms": float|None, "speed_kbps": float|None, "error": str|None}。"""
+        result: Dict[str, Any] = {"first_byte_ms": None, "speed_kbps": None, "error": None}
+        response = None
         try:
             request_utils = self._request_factory()
-            request_utils.update_headers({"Range": f"bytes=0-{chunk_bytes - 1}"})
+            request_utils.update_headers({"Range": f"bytes=0-{SPEED_TEST_BYTES - 1}"})
             start = time.monotonic()
-            response = request_utils.get_res(url)
-            elapsed = time.monotonic() - start
-            if not response or response.status_code not in (200, 206):
-                return None
-            downloaded = len(response.content or b"")
-            if downloaded <= 0 or elapsed <= 0:
-                return None
-            return round(downloaded / 1024 / elapsed, 1)
-        except Exception:
-            return None
+            response = request_utils.get_res(url, stream=True)
+            if response is None:
+                result["error"] = "无响应(连接失败或超时)"
+                return result
+            if response.status_code not in (200, 206):
+                result["error"] = f"HTTP {response.status_code}"
+                return result
+
+            received = 0
+            first_chunk_bytes = 0
+            first_at: Optional[float] = None
+            for chunk in response.iter_content(chunk_size=SPEED_TEST_CHUNK_BYTES):
+                if not chunk:
+                    continue
+                now = time.monotonic()
+                if first_at is None:
+                    first_at = now
+                    first_chunk_bytes = len(chunk)
+                    if not self._looks_like_video_bytes(self._content_type(response), chunk[:PROBE_RANGE_BYTES]):
+                        result["error"] = "响应内容不是视频数据(HTTP状态码正常但可能是错误页)"
+                        return result
+                received += len(chunk)
+                if received >= SPEED_TEST_BYTES or now - start >= SPEED_TEST_MAX_SECONDS:
+                    break
+            end = time.monotonic()
+
+            if first_at is None:
+                result["error"] = "响应体为空"
+                return result
+            result["first_byte_ms"] = round((first_at - start) * 1000, 1)
+            transfer_bytes = received - first_chunk_bytes
+            transfer_sec = end - first_at
+            if transfer_bytes > 0 and transfer_sec > 0:
+                speed = transfer_bytes / 1024 / transfer_sec
+            else:
+                speed = received / 1024 / max(end - start, 1e-3)
+            result["speed_kbps"] = round(speed, 1)
+            return result
+        except Exception as err:
+            result["error"] = f"异常:{err}"
+            return result
+        finally:
+            if response is not None:
+                try:
+                    response.close()
+                except Exception:
+                    pass
 
     def _verify_reachable(self, url: str) -> bool:
         latency_ms, _ = self.probe_latency_ms(url)
@@ -1686,31 +1869,27 @@ class StrmRelinkService:
 
     @staticmethod
     def scan_local_distribution(
-        storage_path: str,
-        domain_to_source: Dict[str, str],
-        accelerator_prefixes: List[str],
+        storage_path: str, accelerator: Optional[str], expected_route: Optional[str] = None
     ) -> Dict[str, Any]:
-        """扫描本地strm，对每个文件归类成"订阅源X + 加速源Y"或"订阅源X 裸链"，
-        用于详情页展示分布。domain_to_source是"样本域名 -> 标签"的映射，
-        来自__detect_task当次探测各候选订阅源拿到的样本直链——不认识的域名
-        直接用域名本身当标签。"""
+        """扫描本地strm，按实际线路归类(官方直链/加速源X/多层套壳/其他来源)。
+        给出expected_route(按当前「订阅源+加速源」新生成的strm应属的类别)时，
+        统计有多少个跟它不一致——不一致的可以用「重建直链」一次性统一。"""
         directory = Path(storage_path) if storage_path else None
+        if not directory or not directory.exists():
+            return {"total": 0, "by_category": {}, "mismatched": 0}
+
         by_category: Dict[str, int] = {}
         total = 0
-        if not directory or not directory.exists():
-            return {"total": 0, "by_category": {}}
-
+        mismatched = 0
         for strm_file in directory.rglob("*.strm"):
             try:
                 content = strm_file.read_text(encoding="utf-8").strip()
             except Exception:
                 continue
             total += 1
-
-            remaining, accelerator_label = StrmRelinkService.strip_known_accelerator(content, accelerator_prefixes)
-            domain = urlparse(remaining).netloc or "无法识别"
-            source_label = domain_to_source.get(domain, domain)
-            category = f"{source_label} + {accelerator_label}" if accelerator_label else f"{source_label} 裸链"
+            category = StrmRelinkService.describe_route(content, accelerator)
             by_category[category] = by_category.get(category, 0) + 1
+            if expected_route and category != expected_route:
+                mismatched += 1
 
-        return {"total": total, "by_category": by_category}
+        return {"total": total, "by_category": by_category, "mismatched": mismatched}
