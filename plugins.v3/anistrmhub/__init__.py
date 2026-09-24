@@ -132,7 +132,7 @@ class ANiStrmHub(_PluginBase):
     plugin_name = "ANiStrmHub"
     plugin_desc = "开箱即用的ANi新番strm生成：内置已加速订阅源，也可选官方源自配加速或本地中转；mp刮削入库，媒体服务器直连播放"
     plugin_icon = "https://raw.githubusercontent.com/oiloveio/MoviePilot-Plugins/main/icons/anistrmhub.png"
-    plugin_version = "0.13.0"
+    plugin_version = "0.13.1"
     plugin_author = "oiloveio"
     author_url = "https://github.com/oiloveio"
     plugin_config_prefix = "anistrmhub_"
@@ -1140,13 +1140,13 @@ class ANiStrmHub(_PluginBase):
         ]
 
     def relay_prefix(self) -> Optional[str]:
-        """本地中转作为加速源时的前缀。一个 strm 只能写一个地址，所以由「中转访问地址」
+        """本地中转作为加速源时的前缀。一个 strm 只能写一个地址，所以由「strm 访问地址」
         决定链接形态：
         - 局域网地址：http://192.168.1.10:3000/api/v1/plugin/ANiStrmHub/relay
           不带任何凭证，只有局域网设备能用；
         - 公网地址：https://mp.example.com/api/v1/plugin/ANiStrmHub/relay/{密钥}
           自动带密钥，内外网都能直接播放。
-        未启用或未填写中转访问地址时返回 None"""
+        未启用或未填写 strm 访问地址时返回 None"""
         address = (self._relay_address or "").strip().rstrip("/")
         if not self._relay_enabled or not address.lower().startswith(("http://", "https://")):
             return None
@@ -1266,6 +1266,11 @@ class ANiStrmHub(_PluginBase):
                 self._relay_redirects[target] = (final_url, time.time())
         return response
 
+    @staticmethod
+    def __deny(message: str, status_code: int = 403) -> Response:
+        # 明确声明 UTF-8：没有字符集声明时，部分浏览器和播放器会把中文提示显示成乱码
+        return Response(status_code=status_code, content=message, media_type="text/plain; charset=utf-8")
+
     def relay_video(self, request: Request, path: str):
         """本地中转接口：媒体服务器请求局域网地址，MoviePilot 经代理向上游拉取
         视频并流式转发。Range 原样转发以支持拖动进度；上游的跳转(resources.ani.rip
@@ -1283,18 +1288,25 @@ class ANiStrmHub(_PluginBase):
         first_segment, _, rest = raw_path.partition("/")
         if self._relay_token and secrets.compare_digest(first_segment, self._relay_token):
             raw_path = rest
+        elif first_segment != OFFICIAL_HOST and RELAY_TOKEN_RE.match(first_segment):
+            logger.warning("ANiStrmHub本地中转：拒绝密钥已失效的请求")
+            return self.__deny("拒绝访问：中转链接的密钥已失效（可能已重置密钥）。请在插件详情页点击「本地中转」重建直链，更新 strm")
         else:
             from_lan, basis = self.request_is_lan(request)
             if not from_lan:
                 logger.warning(f"ANiStrmHub本地中转：拒绝外网的无密钥请求（{basis}）")
-                return Response(
-                    status_code=403,
-                    content="拒绝访问：外网访问需要带密钥的中转链接。请把「中转访问地址」设为公网地址，再在插件详情页重建直链",
+                if self.relay_address_is_lan():
+                    return self.__deny(
+                        "拒绝访问：该中转链接只能在局域网内使用。需要在外网播放，请把插件的「strm 访问地址」改为公网地址，"
+                        "再在插件详情页点击「本地中转」重建直链"
+                    )
+                return self.__deny(
+                    "拒绝访问：该中转链接缺少密钥，外网无法使用。请在插件详情页点击「本地中转」重建直链，strm 会换成带密钥的新链接"
                 )
 
         target = self.relay_target(raw_path, request.url.query)
         if not target:
-            return Response(status_code=403, content="仅转发 ANi 官方视频地址")
+            return self.__deny("拒绝访问：本地中转只转发 ANi 官方视频地址")
 
         # 上游(Cloudflare 后的对象存储)对 Range 请求只返回 Content-Range，不带
         # Content-Length/Accept-Ranges，媒体服务器因此拿不到文件大小。所以上游一律按
@@ -1307,7 +1319,7 @@ class ANiStrmHub(_PluginBase):
         upstream = self.__fetch_upstream(target, forward)
         if upstream is None:
             logger.warning(f"ANiStrmHub本地中转：上游无响应（检查中转代理是否可用）{target}")
-            return Response(status_code=502, content="上游无响应，检查中转代理是否可用")
+            return self.__deny("上游无响应，请检查插件的「中转代理」是否可用", status_code=502)
 
         headers = {name: upstream.headers[name] for name in RELAY_RESPONSE_HEADERS if upstream.headers.get(name)}
         status_code = upstream.status_code

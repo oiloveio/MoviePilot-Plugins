@@ -2235,3 +2235,33 @@ class TestSpeedMeasurementTiming:
         assert result["first_byte_ms"] == 13000.0
         # 首包后 2 秒读完 4 块共 256KB，约 128KB/s；按旧逻辑只会读到首块就停
         assert result["speed_kbps"] == pytest.approx(128.0, rel=0.05)
+
+
+class TestRelayDenyMessages(_RelayHarness):
+    """拒绝访问时的提示要能直接指出该做什么，且声明 UTF-8 编码"""
+
+    PUBLIC = "https://mp.example.com:8443"
+
+    def _get(self, monkeypatch, url, host="mp.example.com:8443", **config):
+        client = self._client(self._plugin(**config), monkeypatch, _FakeUpstream(), client_ip="127.0.0.1")
+        return client.get(url, headers={"Host": host, "X-Real-IP": "192.168.1.1"})
+
+    def test_tokenless_link_with_public_address_says_rebuild(self, monkeypatch):
+        # 用户实测：strm 访问地址已是公网地址，旧提示却让「设为公网地址」，属于误导
+        response = self._get(monkeypatch, self._url(token=None), relay_address=self.PUBLIC)
+        assert response.status_code == 403
+        assert "缺少密钥" in response.text and "重建直链" in response.text and "设为公网地址" not in response.text
+        assert response.headers["content-type"] == "text/plain; charset=utf-8"
+
+    def test_tokenless_link_with_lan_address_says_change_to_public(self, monkeypatch):
+        response = self._get(monkeypatch, self._url(token=None))
+        assert response.status_code == 403 and "只能在局域网内使用" in response.text and "strm 访问地址" in response.text
+
+    def test_outdated_token_says_key_invalid_even_from_lan(self, monkeypatch):
+        response = self._get(monkeypatch, self._url(token="OldKey123456789ab"), host="192.168.1.10:3000")
+        assert response.status_code == 403 and "密钥已失效" in response.text
+
+    def test_no_stale_field_name_in_messages(self):
+        import app.plugins.anistrmhub as module
+
+        assert "中转访问地址" not in Path(module.__file__).read_text(encoding="utf-8")
